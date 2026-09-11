@@ -36,18 +36,20 @@ whole milestone complete because only its first component works.
 
 | Area | Status | Current evidence |
 | --- | --- | --- |
-| Repository and backend foundation | **In progress** | Python package, shared models, and FastAPI health endpoint exist. The React application and local frontend/backend connection do not exist yet. |
-| Playwright observations | **In progress** | A browser can record redacted observations and execute all validated `BrowserAction` types. Evidence still needs to be associated with individual action IDs and observable changes. |
+| Repository and backend foundation | **Done** | Python package, shared models, FastAPI, React, packaged frontend/backend connection, Playwright, bounded Bedrock request, and project-wide quality commands work locally. |
+| Playwright observations | **In progress** | A browser records redacted observations, executes every validated `BrowserAction` type, associates action-time traffic with action IDs, and reports observable page changes. Complete multi-step flow orchestration is still pending. |
 | Verified authentication information | **In progress** | A profile builder enforces authenticated and anonymous account-marker evidence. A complete login flow has not yet produced and replayed a verified profile. |
-| Bedrock integration | **Not started** | No Converse API request or cost guard exists. |
+| Bedrock integration | **In progress** | The structured Converse client, sanitization, validation, and pre-call cost guard are implemented. A live Nova Micro request returned a validated `fill` action within the configured cost cap. Automatic action selection is not connected to browser execution yet. |
 | Security checks | **Not started** | No complete runner/analyser pair exists. |
 | Evidence persistence and reports | **Not started** | Models exist, but scan directories, append-only logs, result versioning, HTML reports, and JSON exports are not implemented. |
-| Interface | **Not started** | No React/Vite application exists. |
+| Interface | **In progress** | The four-view React shell and Setup form exist. Live scan state, guidance, results, and report actions are not connected yet. |
 | Evaluation and release | **Not started** | Evaluation applications, reliability measurements, installation test, and demonstration are pending. |
 
-Current automated verification: **14 tests passing**, including real Chromium
-tests against controlled local pages. There is one non-blocking
-deprecation warning from Starlette's test client.
+Current automated verification: **53 tests passing**: 46 backend tests and 7
+React behavior tests. The backend suite includes real Chromium tests against
+controlled local pages, adversarial scope and privacy cases, strict Bedrock
+response validation, and authentication-proof rejection cases. There is one
+non-blocking deprecation warning from Starlette's test client.
 
 ## 3. Delivery Milestones
 
@@ -56,7 +58,7 @@ plan.
 
 | Milestone | Target dates | Status | Completion condition |
 | --- | --- | --- | --- |
-| **M0 — Working foundation** | 10–12 Sep | **In progress** | Shared models, backend, React connection, Playwright worker, and one bounded Bedrock request all work locally. |
+| **M0 — Working foundation** | 10–12 Sep | **Done** | Shared models, backend, React connection, Playwright worker, and one bounded Bedrock request all work locally. |
 | **M1 — Verified authentication** | 13–16 Sep | **In progress** | Automatic login discovery, guided fallback, authentication proof, and fresh-context replay work on a controlled application. |
 | **M2 — First complete security check** | 13–16 Sep | **Not started** | One runner produces evidence, its offline analyser produces a repeatable result, and HTML/JSON reporting presents it. |
 | **M3 — All six checks integrated** | 17–21 Sep | **Not started** | All six runner/analyser pairs use the common evidence and result pipeline. |
@@ -73,13 +75,13 @@ Member 4 owns the frontend connection.
 | --- | --- | --- | --- | --- |
 | FND-001 | Establish the separate repository and Python project structure. | **Done** | — | `pyproject.toml` and `backend/authflowguard/` |
 | FND-002 | Record the requirement for simple, explicit, understandable code. | **Done** | — | Project plan Section 2.7 |
-| FND-003 | Define the six shared Pydantic contracts and supporting types. | **Done** | FND-001 | `backend/authflowguard/models.py`; serialization and validation tests |
+| FND-003 | Define the six shared Pydantic contracts and supporting types. | **Done** | FND-001 | `backend/authflowguard/models.py`; round-trip, boundary, contradictory-field, unknown-field, and secret-exclusion tests |
 | FND-004 | Create a minimal FastAPI application and health endpoint. | **Done** | FND-001 | `backend/authflowguard/app.py`; `backend/tests/test_app.py` |
-| FND-005 | Create the React, TypeScript, and Vite application. | **Not started** | FND-001 | Must build successfully from a clean installation. |
-| FND-006 | Connect the local React interface to the FastAPI health endpoint. | **Not started** | FND-004, FND-005 | Browser test or documented repeatable check required. |
-| FND-007 | Make Playwright and Chromium installation reproducible. | **In progress** | FND-001 | Python dependency is declared and Chromium works locally; installation instructions or setup automation are still required. |
-| FND-008 | Perform one structured Bedrock Converse API action request. | **Not started** | FND-001 | Must use explicit profile, region, model ID, sanitized input, and a small cost limit. |
-| FND-009 | Add project-wide formatting, linting, and type-checking commands. | **Not started** | FND-001 | Checks should favor clear diagnostics and run locally. |
+| FND-005 | Create the React, TypeScript, and Vite application. | **Done** | FND-001 | `frontend/`; the TypeScript and Vite production build passes. |
+| FND-006 | Connect the local React interface to the FastAPI health endpoint. | **Done** | FND-004, FND-005 | The interface fetches `/api/health`; tests cover connected, invalid-response, and network-failure states; FastAPI serves the production build without shadowing API routes. |
+| FND-007 | Make Playwright and Chromium installation reproducible. | **Done** | FND-001 | Dependency and installation command are recorded in `pyproject.toml` and `Documentation/DEVELOPMENT.md`. |
+| FND-008 | Perform one structured Bedrock Converse API action request. | **Done** | FND-001 | Nova Micro returned a validated `fill` action: 652 input tokens, 51 output tokens, estimated cost `$0.00002996`, reserved maximum cost `$0.00006828`. Sanitization, validation, and pre-call cost-limit tests pass. |
+| FND-009 | Add project-wide formatting, linting, and type-checking commands. | **Done** | FND-001 | Ruff formatting/linting and mypy cover all backend source and test files. Prettier, ESLint, and TypeScript checks cover the frontend. Commands are documented in `Documentation/DEVELOPMENT.md`. |
 
 ## 5. Website Interaction and Authentication Tasks
 
@@ -88,11 +90,11 @@ authentication information.
 
 | ID | Task | Status | Depends on | Evidence or completion notes |
 | --- | --- | --- | --- | --- |
-| INT-001 | Enforce permitted origins and redact query strings and fragments. | **Done** | FND-003 | `scope.py`; scope and browser-level tests |
-| INT-002 | Record requests, responses, page controls, cookies, and browser storage without saving live secrets. | **Done** | FND-003, FND-007 | `playwright_worker.py`; controlled Chromium test |
+| INT-001 | Enforce permitted origins and redact query strings and fragments. | **Done** | FND-003 | Tests cover deceptive hosts, user-info URLs, ports, case normalization, query/fragment removal, and real browser blocking. |
+| INT-002 | Record requests, responses, page controls, cookies, and browser storage without saving live secrets. | **Done** | FND-003, FND-007 | A controlled Chromium test verifies blocked external requests, event relationships, cookie/local/session-storage fingerprints, and exclusion of live storage and input values. |
 | INT-003 | Implement validated execution for every `BrowserAction` type. | **Done** | INT-002 | `action_executor.py`; Chromium tests cover navigate, click, fill by secret reference, select, key press, wait, URL redaction, and scope rejection. |
-| INT-004 | Associate request and response evidence with scan and action identifiers. | **In progress** | INT-002, INT-003 | Actions now have stable IDs and execution results; browser evidence is not yet grouped by action. |
-| INT-005 | Detect and describe observable page changes after an action. | **Not started** | INT-003 | Must avoid treating a URL, cookie, or status code alone as login proof. |
+| INT-004 | Associate request and response evidence with scan and action identifiers. | **Done** | INT-002, INT-003 | `BrowserActionExecutor` emits redacted action-time request and response events with scan/action IDs; traffic references carry the action ID; browser tests verify the association. |
+| INT-005 | Detect and describe observable page changes after an action. | **Done** | INT-003 | Execution results and page-state evidence compare sanitized URLs, titles, visible controls, and a nonreversible visible-text fingerprint; browser tests verify URL and control-visibility changes. |
 | INT-006 | Implement automatic action selection through Bedrock. | **Not started** | FND-008, INT-003, INT-005 | The model returns validated structured actions, never executable code. |
 | INT-007 | Limit AI decisions, retry failed actions twice, and request guidance. | **Not started** | INT-006 | Enforce configured scan and cost limits. |
 | INT-008 | Record developer-guided actions with local credential references. | **Not started** | INT-003 | Guidance must not store credential values. |
@@ -163,12 +165,12 @@ Primary owner: **Member 4**.
 
 | ID | Task | Status | Depends on | Completion notes |
 | --- | --- | --- | --- | --- |
-| UI-001 | Build the Setup view. | **Not started** | FND-005, RUN-003 | Target, origins, references, policies, limits, and selected checks |
+| UI-001 | Build the Setup view. | **In progress** | FND-005, RUN-003 | Target, origins, accessible labels, and check selection are behavior-tested; credential references, policies, limits, and API submission remain. |
 | UI-002 | Build the Discovery view and guidance controls. | **Not started** | INT-007, INT-008, RUN-003 | Label automatic and guided flows separately. |
-| UI-003 | Build the Testing view with polling and cancellation. | **Not started** | RUN-003 | Poll once per second; show progress, requests, and outcomes. |
+| UI-003 | Build the Testing view with polling and cancellation. | **In progress** | RUN-003 | The six-check status layout exists; polling, live progress, request counts, outcomes, and cancellation remain. |
 | UI-004 | Build the Results view. | **Not started** | RPT-001, RPT-002 | Show evidence and incomplete coverage without an aggregate score. |
 | UI-005 | Add report downloads and offline reanalysis controls. | **Not started** | RUN-003, EVD-005 | Preserve and display result versions. |
-| UI-006 | Package the frontend for the local backend to serve. | **Not started** | UI-001–UI-005 | Production build runs without a separate development server. |
+| UI-006 | Package the frontend for the local backend to serve. | **Done** | FND-005, FND-006 | FastAPI serves `frontend/dist`; production build and backend static-serving test pass. |
 
 ## 9. Evaluation and Release Tasks
 
@@ -209,24 +211,20 @@ be linked here as they are created.
 | Session isolation | **Not started** | Observation uses a fresh context, but replay experiments are not implemented. |
 | Stateful flows | **Not started** | No changing-CSRF or changing-control test exists. |
 | Failure handling | **Not started** | No scan lifecycle or explicit failure outcomes are implemented. |
-| Privacy and scope | **In progress** | URL and session redaction plus origin blocking are tested; full export and Bedrock sanitization tests are pending. |
+| Privacy and scope | **In progress** | URL, embedded-credential, session, input-value, origin-blocking, and Bedrock sanitization cases are tested. Full evidence-export redaction remains pending. |
 | Installation | **In progress** | Local virtual environment and Chromium work; clean documented setup on another computer is pending. |
 
 ## 11. Immediate Execution Order
 
 Unless a dependency changes, implement the next work in this order:
 
-1. **INT-004 and INT-005:** Attach evidence to action IDs and measure observable
-   page changes.
-2. **AUTH-003 and AUTH-004:** Run a controlled login and prove protected access
+1. **AUTH-003 and AUTH-004:** Run a controlled login and prove protected access
    against an anonymous context.
-3. **INT-009 and AUTH-005:** Replay the saved flow in a fresh context and produce
+2. **INT-009 and AUTH-005:** Replay the saved flow in a fresh context and produce
    a verified profile.
-4. **FND-008:** Prove one bounded, sanitized Bedrock structured-action request.
-5. **FND-005 and FND-006:** Scaffold React and connect it to the local backend.
-6. **CHK-001, EVD-001–EVD-005, and RPT-001–RPT-002:** Complete the first
+3. **CHK-001, EVD-001–EVD-005, and RPT-001–RPT-002:** Complete the first
    runner-to-analyser-to-report slice.
 
-The first three items complete the project's first technical milestone. The
-sixth item completes the required second technical milestone and establishes
+Items one and two complete the project's first technical milestone. The
+third item completes the required second technical milestone and establishes
 the pattern for the remaining five checks.
