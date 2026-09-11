@@ -8,20 +8,48 @@ version = "0.1.0"
 description = "Local authentication security testing for developer-owned websites"
 requires-python = ">=3.12"
 dependencies = [
+    "boto3>=1.40,<2.0",
+    "botocore[crt]>=1.40,<2.0",
     "fastapi>=0.115,<1.0",
     "playwright>=1.55,<2.0",
     "pydantic>=2.10,<3.0",
+    "uvicorn[standard]>=0.30,<1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "httpx2>=2.0,<3.0",
+    "httpx>=0.27,<1.0",
+    "mypy>=1.18,<2.0",
     "pytest>=8.0,<9.0",
+    "ruff>=0.13,<1.0",
 ]
 
 [tool.setuptools.packages.find]
 where = ["backend"]
 
 [tool.pytest.ini_options]
+addopts = "--basetemp=.pytest-tmp"
 testpaths = ["backend/tests"]
 pythonpath = ["backend"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["backend/authflowguard", "backend/tests"]
+plugins = ["pydantic.mypy"]
+check_untyped_defs = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+no_implicit_optional = true
+warn_return_any = true
+warn_unused_ignores = true
+
+[tool.pydantic-mypy]
+init_typed = false
+warn_required_dynamic_aliases = true
