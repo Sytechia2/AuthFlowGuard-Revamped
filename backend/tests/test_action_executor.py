@@ -1,23 +1,27 @@
 """Browser-level tests for validated structured action execution."""
 
 import asyncio
+from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
+from uuid import uuid4
 
 import pytest
-from playwright.async_api import async_playwright
-from pydantic import ValidationError
-
-from authflowguard.action_executor import BrowserActionExecutor
+from authflowguard.action_executor import (
+    BrowserActionExecutor,
+    InvalidControlReferenceError,
+)
 from authflowguard.models import (
     ActionWaitCondition,
     BrowserAction,
     BrowserActionType,
+    EvidenceKind,
     TargetScope,
 )
 from authflowguard.secrets import RuntimeSecrets, SecretReferenceNotFoundError
-
+from playwright.async_api import async_playwright
+from pydantic import ValidationError
 
 LIVE_USERNAME = "developer@example.test"
 
@@ -36,10 +40,13 @@ class ActionPageHandler(BaseHTTPRequestHandler):
             return """<!doctype html>
             <html>
                 <head><title>Action Controls</title></head>
-                <body>
+                <body onkeydown="document.body.dataset.lastKey = event.key">
                     <input id="username" name="username">
                     <button id="continue" type="button"
-                            onclick="this.hidden = true; document.body.dataset.clicked = 'yes'">
+                            onclick="
+                                this.hidden = true;
+                                document.body.dataset.clicked = 'yes';
+                            ">
                         Continue
                     </button>
                     <select id="role" name="role">
@@ -51,12 +58,12 @@ class ActionPageHandler(BaseHTTPRequestHandler):
 
         return "<!doctype html><title>Destination</title><p>Arrived</p>"
 
-    def log_message(self, format: str, *args) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         return
 
 
 @contextmanager
-def run_action_server():
+def run_action_server() -> Iterator[str]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), ActionPageHandler)
     server_thread = Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
@@ -80,7 +87,7 @@ async def execute_all_action_types(origin: str) -> None:
         browser = await playwright.chromium.launch(headless=True)
         context = await browser.new_context()
         page = await context.new_page()
-        executor = BrowserActionExecutor(page, target, secrets)
+        executor = BrowserActionExecutor(page, target, secrets, scan_id=uuid4())
 
         try:
             navigate_result = await executor.execute(
@@ -92,8 +99,27 @@ async def execute_all_action_types(origin: str) -> None:
             )
             assert navigate_result.page_url_after == f"{origin}/controls"
             assert "one_time_code" not in str(navigate_result)
+            assert navigate_result.page_changes.url_changed
+            assert navigate_result.traffic
+            assert all(
+                event.action_id == navigate_result.action_id
+                for event in navigate_result.events
+            )
+            assert all(
+                reference.authentication_action_id == navigate_result.action_id
+                for reference in navigate_result.traffic
+            )
+            event_by_id = {event.event_id: event for event in navigate_result.events}
+            for reference in navigate_result.traffic:
+                request_event = event_by_id[reference.request_event_id]
+                assert reference.response_event_id is not None
+                response_event = event_by_id[reference.response_event_id]
+                assert request_event.kind is EvidenceKind.REQUEST
+                assert response_event.kind is EvidenceKind.RESPONSE
+                assert request_event.redacted_details["url"] == f"{origin}/controls"
+                assert response_event.redacted_details["url"] == f"{origin}/controls"
 
-            await executor.execute(
+            fill_result = await executor.execute(
                 BrowserAction(
                     action_type=BrowserActionType.FILL,
                     observed_control_id="control-1",
@@ -102,6 +128,8 @@ async def execute_all_action_types(origin: str) -> None:
                 )
             )
             assert await page.locator("#username").input_value() == LIVE_USERNAME
+            assert LIVE_USERNAME not in str(fill_result)
+            assert not fill_result.page_changes.changed
 
             await executor.execute(
                 BrowserAction(
@@ -112,7 +140,7 @@ async def execute_all_action_types(origin: str) -> None:
                 )
             )
 
-            await executor.execute(
+            select_result = await executor.execute(
                 BrowserAction(
                     action_type=BrowserActionType.SELECT,
                     observed_control_id="control-3",
@@ -120,7 +148,18 @@ async def execute_all_action_types(origin: str) -> None:
                     description="Select the administrator role",
                 )
             )
+
+            await executor.execute(
+                BrowserAction(
+                    action_type=BrowserActionType.PRESS_KEY,
+                    key="Escape",
+                    description="Send a key to the page",
+                )
+            )
+            assert await page.locator("body").get_attribute("data-last-key") == "Escape"
             assert await page.locator("#role").input_value() == "administrator"
+            assert select_result.page_changes.changed
+            assert select_result.page_changes.control_state_changed
 
             await executor.execute(
                 BrowserAction(
@@ -131,7 +170,19 @@ async def execute_all_action_types(origin: str) -> None:
                 )
             )
 
-            await executor.execute(
+            for load_state in [
+                ActionWaitCondition.LOAD,
+                ActionWaitCondition.DOM_CONTENT_LOADED,
+            ]:
+                await executor.execute(
+                    BrowserAction(
+                        action_type=BrowserActionType.WAIT,
+                        wait_for=load_state,
+                        description=f"Wait for {load_state.value}",
+                    )
+                )
+
+            click_result = await executor.execute(
                 BrowserAction(
                     action_type=BrowserActionType.CLICK,
                     observed_control_id="control-2",
@@ -139,6 +190,9 @@ async def execute_all_action_types(origin: str) -> None:
                 )
             )
             assert await page.locator("body").get_attribute("data-clicked") == "yes"
+            assert click_result.page_changes.changed
+            assert click_result.page_changes.visible_text_changed
+            assert click_result.page_changes.controls_became_hidden == ["control-2"]
 
             await executor.execute(
                 BrowserAction(
@@ -200,3 +254,58 @@ def test_runtime_secrets_can_be_discarded() -> None:
     assert len(secrets) == 0
     with pytest.raises(SecretReferenceNotFoundError):
         secrets.resolve("known-username")
+
+
+async def verify_executor_rejects_stale_references(origin: str) -> None:
+    target = TargetScope(
+        target_url=f"{origin}/controls",
+        permitted_origins=[origin],
+    )
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
+        executor = BrowserActionExecutor(
+            page,
+            target,
+            RuntimeSecrets({}),
+            scan_id=uuid4(),
+        )
+
+        try:
+            await executor.execute(
+                BrowserAction(
+                    action_type=BrowserActionType.NAVIGATE,
+                    url=f"{origin}/controls",
+                    description="Open the controlled page",
+                )
+            )
+
+            with pytest.raises(SecretReferenceNotFoundError):
+                await executor.execute(
+                    BrowserAction(
+                        action_type=BrowserActionType.FILL,
+                        observed_control_id="control-1",
+                        value_reference="missing-username",
+                        description="Attempt to use a missing secret",
+                    )
+                )
+
+            for invalid_control_id in ["control-99", "username", "control-0"]:
+                with pytest.raises(InvalidControlReferenceError):
+                    await executor.execute(
+                        BrowserAction(
+                            action_type=BrowserActionType.CLICK,
+                            observed_control_id=invalid_control_id,
+                            description="Attempt to use a stale control reference",
+                        )
+                    )
+        finally:
+            await context.close()
+            await browser.close()
+
+
+def test_executor_rejects_missing_secrets_and_stale_controls() -> None:
+    with run_action_server() as origin:
+        asyncio.run(verify_executor_rejects_stale_references(origin))

@@ -2,11 +2,16 @@
 
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Any
 from uuid import UUID, uuid4
 
-from playwright.async_api import BrowserContext, Page, Request, Response, Route
-from playwright.async_api import async_playwright
+from playwright.async_api import (
+    BrowserContext,
+    Page,
+    Request,
+    Response,
+    Route,
+    async_playwright,
+)
 
 from authflowguard.models import (
     EvidenceEvent,
@@ -30,7 +35,9 @@ class PlaywrightObservation:
 class PlaywrightWorker:
     """Open one page and convert browser observations into shared evidence."""
 
-    async def observe(self, scan_id: UUID, target: TargetScope) -> PlaywrightObservation:
+    async def observe(
+        self, scan_id: UUID, target: TargetScope
+    ) -> PlaywrightObservation:
         target_url = str(target.target_url)
         if not url_is_in_scope(target_url, target):
             raise ValueError("The target URL is not included in permitted_origins")

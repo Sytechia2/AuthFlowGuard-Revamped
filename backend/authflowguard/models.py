@@ -5,13 +5,12 @@ and bearer tokens therefore do not belong in this module. Runtime-only secret
 handling will use a separate component.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
-
 
 SCHEMA_VERSION = "1.0"
 
@@ -151,7 +150,9 @@ class BrowserAction(ContractModel):
             BrowserActionType.SELECT,
         }
         if self.action_type in control_actions and self.observed_control_id is None:
-            raise ValueError(f"A {self.action_type.value} action requires observed_control_id")
+            raise ValueError(
+                f"A {self.action_type.value} action requires observed_control_id"
+            )
 
         if self.action_type is BrowserActionType.FILL and self.value_reference is None:
             raise ValueError("A fill action requires value_reference")
@@ -174,6 +175,34 @@ class BrowserAction(ContractModel):
                 raise ValueError(
                     f"A {self.wait_for.value} wait requires observed_control_id"
                 )
+
+        fields_used_by_action = {
+            BrowserActionType.NAVIGATE: {"url"},
+            BrowserActionType.CLICK: {"observed_control_id"},
+            BrowserActionType.FILL: {"observed_control_id", "value_reference"},
+            BrowserActionType.SELECT: {"observed_control_id", "option_value"},
+            BrowserActionType.PRESS_KEY: {"observed_control_id", "key"},
+            BrowserActionType.WAIT: {"observed_control_id", "wait_for"},
+        }
+        action_fields = {
+            "observed_control_id",
+            "url",
+            "value_reference",
+            "option_value",
+            "key",
+            "wait_for",
+        }
+        allowed_fields = fields_used_by_action[self.action_type]
+        unexpected_fields = sorted(
+            field_name
+            for field_name in action_fields - allowed_fields
+            if getattr(self, field_name) is not None
+        )
+        if unexpected_fields:
+            unexpected_names = ", ".join(unexpected_fields)
+            raise ValueError(
+                f"A {self.action_type.value} action cannot use: {unexpected_names}"
+            )
 
         return self
 
@@ -227,7 +256,7 @@ class EvidenceEvent(ContractModel):
     scan_id: UUID
     check_id: CheckId | None = None
     action_id: UUID | None = None
-    recorded_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    recorded_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     kind: EvidenceKind
     summary: str = Field(min_length=1)
     redacted_details: dict[str, Any] = Field(default_factory=dict)
@@ -263,4 +292,4 @@ class CheckResult(ContractModel):
     explanation: str = Field(min_length=1)
     evidence_references: list[UUID] = Field(default_factory=list)
     coverage_limitations: list[str] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

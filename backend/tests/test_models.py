@@ -3,8 +3,6 @@
 from uuid import uuid4
 
 import pytest
-from pydantic import ValidationError
-
 from authflowguard.models import (
     AuthFeature,
     AuthProfile,
@@ -18,6 +16,7 @@ from authflowguard.models import (
     ScanRequest,
     TargetScope,
 )
+from pydantic import ValidationError
 
 
 def make_target_scope() -> TargetScope:
@@ -43,6 +42,15 @@ def test_scan_request_uses_references_instead_of_live_credentials() -> None:
 
     assert "primary-account-password" in saved_json
     assert "actual-secret-password" not in saved_json
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        CredentialReference.model_validate(
+            {
+                "reference_id": "primary-account-password",
+                "purpose": "Password for the primary test account",
+                "live_value": "actual-secret-password",
+            }
+        )
 
 
 def test_scan_request_rejects_duplicate_checks() -> None:
@@ -75,17 +83,49 @@ def test_auth_profile_round_trips_through_json() -> None:
     restored_profile = AuthProfile.model_validate_json(profile.model_dump_json())
 
     assert restored_profile == profile
-    assert restored_profile.authentication_steps[AuthFeature.LOGIN][0].value_reference == (
-        "primary-account-password"
-    )
+    assert restored_profile.authentication_steps[AuthFeature.LOGIN][
+        0
+    ].value_reference == ("primary-account-password")
 
 
 def test_contracts_reject_unknown_fields() -> None:
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        TargetScope(
-            target_url="https://test.example/login",
-            permitted_origins=["https://test.example"],
-            password="a secret that must not be stored",
+        TargetScope.model_validate(
+            {
+                "target_url": "https://test.example/login",
+                "permitted_origins": ["https://test.example"],
+                "password": "a secret that must not be stored",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("action_type", "extra_fields"),
+    [
+        (BrowserActionType.NAVIGATE, {"url": "https://test.example", "key": "Enter"}),
+        (
+            BrowserActionType.CLICK,
+            {"observed_control_id": "control-1", "value_reference": "secret"},
+        ),
+        (
+            BrowserActionType.FILL,
+            {
+                "observed_control_id": "control-1",
+                "value_reference": "secret",
+                "option_value": "admin",
+            },
+        ),
+    ],
+)
+def test_browser_action_rejects_fields_for_a_different_action_type(
+    action_type: BrowserActionType,
+    extra_fields: dict[str, str],
+) -> None:
+    with pytest.raises(ValidationError, match="action cannot use"):
+        BrowserAction(
+            action_type=action_type,
+            description="An action with contradictory fields",
+            **extra_fields,
         )
 
 

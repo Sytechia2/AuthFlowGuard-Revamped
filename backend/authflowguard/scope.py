@@ -9,9 +9,17 @@ def url_without_query_or_fragment(url: str) -> str:
     """Remove URL parts that commonly contain tokens or personal information."""
 
     parsed_url = urlsplit(url)
+    hostname = parsed_url.hostname or ""
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+
+    netloc = hostname
+    if parsed_url.port is not None:
+        netloc = f"{netloc}:{parsed_url.port}"
+
     redacted_url = SplitResult(
         scheme=parsed_url.scheme,
-        netloc=parsed_url.netloc,
+        netloc=netloc,
         path=parsed_url.path,
         query="",
         fragment="",

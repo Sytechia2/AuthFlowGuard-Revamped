@@ -1,5 +1,6 @@
 """AuthFlowGuard AI backend."""
 
+from authflowguard.action_executor import BrowserActionExecutor
 from authflowguard.models import (
     AuthProfile,
     BrowserAction,
@@ -8,7 +9,6 @@ from authflowguard.models import (
     ScanRequest,
     TestRunEvidence,
 )
-from authflowguard.action_executor import BrowserActionExecutor
 from authflowguard.playwright_worker import PlaywrightObservation, PlaywrightWorker
 
 __all__ = [
