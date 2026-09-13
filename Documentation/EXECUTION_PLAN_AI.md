@@ -10,7 +10,7 @@ that can be assigned, implemented, tested, and marked complete.
 
 **Target submission:** 28–29 September 2026
 
-**Last updated:** 10 September 2026
+**Last updated:** 13 September 2026
 
 ## 1. How to Maintain This Tracker
 
@@ -37,19 +37,20 @@ whole milestone complete because only its first component works.
 | Area | Status | Current evidence |
 | --- | --- | --- |
 | Repository and backend foundation | **Done** | Python package, shared models, FastAPI, React, packaged frontend/backend connection, Playwright, bounded Bedrock request, and project-wide quality commands work locally. |
-| Playwright observations | **In progress** | A browser records redacted observations, executes every validated `BrowserAction` type, associates action-time traffic with action IDs, and reports observable page changes. Complete multi-step flow orchestration is still pending. |
-| Verified authentication information | **In progress** | A profile builder enforces authenticated and anonymous account-marker evidence. A complete login flow has not yet produced and replayed a verified profile. |
-| Bedrock integration | **In progress** | The structured Converse client, sanitization, validation, and pre-call cost guard are implemented. A live Nova Micro request returned a validated `fill` action within the configured cost cap. Automatic action selection is not connected to browser execution yet. |
-| Security checks | **Not started** | No complete runner/analyser pair exists. |
-| Evidence persistence and reports | **Not started** | Models exist, but scan directories, append-only logs, result versioning, HTML reports, and JSON exports are not implemented. |
-| Interface | **In progress** | The four-view React shell and Setup form exist. Live scan state, guidance, results, and report actions are not connected yet. |
-| Evaluation and release | **Not started** | Evaluation applications, reliability measurements, installation test, and demonstration are pending. |
+| Playwright observations | **In progress** | A bounded Bedrock-driven loop now converts sanitized observations into validated browser actions, records action traffic and page changes, and completes the controlled login with an offline model double. Guided recording and fresh-context replay are covered by `authentication.py` and `test_authentication.py`; UI integration remains pending. |
+| Verified authentication information | **In progress** | Automatic and guided CSRF-safe login flows produce verified profiles from authenticated and isolated anonymous account-marker evidence, and saved flows replay in fresh contexts. The second authentication style and stale-flow revalidation remain pending. |
+| Bedrock integration | **In progress** | The structured Converse client and live CLI completed the controlled login in three model decisions within the configured cost cap. Sanitization, validation, limits, retry feedback, and guidance escalation are tested. Usage persistence across restarts remains pending. |
+| Security checks | **In progress** | `CHK-001` has a browser runner and deterministic offline analyser; the remaining five checks are pending. |
+| Evidence persistence and reports | **In progress** | `EvidenceStore` writes bounded redacted scan evidence, append-only events, and versioned results; offline JSON/HTML export and first-slice scan API integration are implemented. Worker-process separation remains pending. |
+| Interface | **In progress** | The four-view React shell now submits Setup data, starts a local scan, polls live status, lists persisted past runs, and keeps Scan ID search; guidance and full result controls remain pending. |
+| Evaluation and release | **In progress** | The first controlled evaluation application is complete. The second and withheld-layout applications, reliability measurements, installation test, and demonstration are pending. |
 
-Current automated verification: **53 tests passing**: 46 backend tests and 7
+Current automated verification: **98 tests passing**: 89 backend tests and 9
 React behavior tests. The backend suite includes real Chromium tests against
-controlled local pages, adversarial scope and privacy cases, strict Bedrock
-response validation, and authentication-proof rejection cases. There is one
-non-blocking deprecation warning from Starlette's test client.
+controlled local pages, secure and intentionally vulnerable form/cookie flows,
+adversarial scope and privacy cases, strict Bedrock response validation, and
+authentication-proof rejection cases. There is one non-blocking deprecation
+warning from Starlette's test client.
 
 ## 3. Delivery Milestones
 
@@ -95,16 +96,16 @@ authentication information.
 | INT-003 | Implement validated execution for every `BrowserAction` type. | **Done** | INT-002 | `action_executor.py`; Chromium tests cover navigate, click, fill by secret reference, select, key press, wait, URL redaction, and scope rejection. |
 | INT-004 | Associate request and response evidence with scan and action identifiers. | **Done** | INT-002, INT-003 | `BrowserActionExecutor` emits redacted action-time request and response events with scan/action IDs; traffic references carry the action ID; browser tests verify the association. |
 | INT-005 | Detect and describe observable page changes after an action. | **Done** | INT-003 | Execution results and page-state evidence compare sanitized URLs, titles, visible controls, and a nonreversible visible-text fingerprint; browser tests verify URL and control-visibility changes. |
-| INT-006 | Implement automatic action selection through Bedrock. | **Not started** | FND-008, INT-003, INT-005 | The model returns validated structured actions, never executable code. |
-| INT-007 | Limit AI decisions, retry failed actions twice, and request guidance. | **Not started** | INT-006 | Enforce configured scan and cost limits. |
-| INT-008 | Record developer-guided actions with local credential references. | **Not started** | INT-003 | Guidance must not store credential values. |
-| INT-009 | Replay a recorded flow in a fresh browser context. | **Not started** | INT-003, INT-008 | Required for guided fallback acceptance. |
+| INT-006 | Implement automatic action selection through Bedrock. | **Done** | FND-008, INT-003, INT-005 | `automatic_actions.py` and `agent_cli.py`; Nova Micro completed the controlled login in three live decisions: fill username, fill password, and submit. Local guards restrict actions to visible compatible controls, and the run completed below its `$0.001` cap. |
+| INT-007 | Limit AI decisions, retry failed actions twice, and request guidance. | **Done** | INT-006 | The controller enforces decision, active-time, and cumulative inference-cost limits; retries with fresh observations twice; and returns explicit guidance-required status after exhaustion. |
+| INT-008 | Record developer-guided actions with local credential references. | **Done** | INT-003 | `record_guided_flow` validates references, removes URL query/fragment data, redacts descriptions, and persists only structured actions; browser and privacy tests in `backend/tests/test_authentication.py`. |
+| INT-009 | Replay a recorded flow in a fresh browser context. | **Done** | INT-003, INT-008 | `replay_verified_auth_profile` executes saved steps in fresh authenticated and anonymous contexts and creates new proof evidence; Chromium replay test in `backend/tests/test_authentication.py`. |
 | INT-010 | Stop browser and HTTP work cleanly when cancellation is requested. | **Not started** | INT-003 | Preserve completed evidence and mark unfinished work cancelled. |
 | AUTH-001 | Define saved, nonsecret authentication-profile data. | **Done** | FND-003 | `AuthProfile` and supporting models |
 | AUTH-002 | Require an authenticated account marker and anonymous comparison. | **Done** | AUTH-001 | `auth_profiles.py`; positive and rejection tests |
-| AUTH-003 | Discover and execute a complete login flow on a controlled form application. | **Not started** | INT-003, INT-005 | Must include CSRF-safe browser form submission. |
-| AUTH-004 | Verify the protected resource in authenticated and isolated anonymous contexts. | **Not started** | AUTH-003 | Both evidence references must be saved in the profile. |
-| AUTH-005 | Produce and replay a verified `AuthProfile` in a fresh context. | **Not started** | AUTH-004, INT-009 | Completes the first technical milestone from the project plan. |
+| AUTH-003 | Discover and execute a complete login flow on a controlled form application. | **Done** | INT-003, INT-005, EVA-001 | `authentication.py`; a real Chromium test discovers conventional login controls and submits the live form with its changing CSRF token through validated structured actions. |
+| AUTH-004 | Verify the protected resource in authenticated and isolated anonymous contexts. | **Done** | AUTH-003 | The browser workflow records independent page-state evidence, proves the account marker present only in the authenticated context, and saves both evidence references in the verified profile. Tests also prove credentials, query data, cookie values, and marker text are excluded from persisted output. |
+| AUTH-005 | Produce and replay a verified `AuthProfile` in a fresh context. | **Done** | AUTH-004, INT-009 | Guided execution builds a verified profile and replay re-proves the account marker anonymously and authenticated in new contexts; `execute_guided_verified_login_flow`, `replay_verified_auth_profile`, and browser tests. |
 | AUTH-006 | Support two-step login and bearer-token sessions. | **Not started** | AUTH-005 | Verify on the controlled React/JSON application. |
 | AUTH-007 | Revalidate saved flows before reuse in a new scan. | **Not started** | AUTH-005 | Stale flows must request guidance or produce an explicit outcome. |
 | AUTH-008 | Keep live credentials in worker memory and discard them on completion or cancellation. | **In progress** | INT-003, INT-010 | `RuntimeSecrets` resolves and discards in-memory values. Cancellation, export, and model-request coverage remain pending. |
@@ -116,16 +117,16 @@ reporting.
 
 | ID | Task | Status | Depends on | Evidence or completion notes |
 | --- | --- | --- | --- | --- |
-| RUN-001 | Define the scan state machine, including awaiting-guidance and cancellation. | **Not started** | FND-003 | State transitions and invalid transitions need unit tests. |
-| RUN-002 | Run one scan at a time in a worker process separate from FastAPI. | **Not started** | RUN-001 | Server must remain responsive while the browser runs. |
-| RUN-003 | Add APIs for create, status, events, guidance, cancellation, downloads, and reanalysis. | **Not started** | RUN-001 | Validate all request and response models. |
-| EVD-001 | Create per-scan directories and metadata files. | **Not started** | RUN-001 | Paths must remain within the configured local data directory. |
-| EVD-002 | Implement the append-only evidence event log. | **Not started** | EVD-001 | Survive restart without corrupting completed evidence. |
-| EVD-003 | Implement central redaction before evidence is written. | **Not started** | EVD-002 | Test passwords, cookies, tokens, headers, URLs, and response bodies. |
-| EVD-004 | Save compact per-check evidence packages and explicit coverage. | **Not started** | EVD-002 | Packages must support offline analysis without target access. |
-| EVD-005 | Save versioned results without overwriting earlier analysis. | **Not started** | EVD-004 | Reanalysis creates a new result version. |
-| RPT-001 | Generate a JSON report offline. | **Not started** | EVD-005 | No browser, target, Bedrock, or credentials may be required. |
-| RPT-002 | Generate a readable and printable HTML report offline. | **Not started** | EVD-005 | Show evidence, limitations, and incomplete coverage clearly. |
+| RUN-001 | Define the scan state machine, including awaiting-guidance and cancellation. | **In progress** | FND-003 | `ScanState` and cancellation transitions are implemented; explicit invalid-transition coverage remains. |
+| RUN-002 | Run one scan at a time in a worker process separate from FastAPI. | **In progress** | RUN-001 | A single background executor currently keeps FastAPI responsive; a separate worker process remains. |
+| RUN-003 | Add APIs for create, status, events, guidance, cancellation, downloads, and reanalysis. | **In progress** | RUN-001 | Create/status/events/cancellation/download/reanalysis endpoints are implemented; guidance endpoint and full lifecycle integration remain. |
+| EVD-001 | Create per-scan directories and metadata files. | **Done** | RUN-001 | `EvidenceStore` creates UUID-bounded scan directories and metadata files; `test_evidence_reports.py`. |
+| EVD-002 | Implement the append-only evidence event log. | **Done** | EVD-001 | `EvidenceStore.append_event` writes NDJSON and survives reopening; `test_evidence_reports.py`. |
+| EVD-003 | Implement central redaction before evidence is written. | **Done** | EVD-002 | Secrets, query/fragment URL data, and sensitive evidence fields are redacted before disk writes; storage tests. |
+| EVD-004 | Save compact per-check evidence packages and explicit coverage. | **Done** | EVD-002 | `EvidenceStore.save_evidence` stores `TestRunEvidence` under per-check directories with coverage; storage tests. |
+| EVD-005 | Save versioned results without overwriting earlier analysis. | **Done** | EVD-004 | `EvidenceStore.save_result` writes incrementing result versions; storage tests. |
+| RPT-001 | Generate a JSON report offline. | **Done** | EVD-005 | `export_scan_reports` produces JSON from saved models without target, browser, AWS, or credentials. |
+| RPT-002 | Generate a readable and printable HTML report offline. | **Done** | EVD-005 | `export_scan_reports` produces escaped HTML with outcomes, OWASP references, and coverage limitations. |
 
 ## 7. Security Check Tasks
 
@@ -135,7 +136,7 @@ analyser. Every analyser must accept the equivalent of
 
 | ID | Check | Primary owner | Status | Required scenario set |
 | --- | --- | --- | --- | --- |
-| CHK-001 | Login account enumeration — WSTG-IDNT-04 | Member 3 | **Not started** | Vulnerable, secure, ambiguous, execution failure |
+| CHK-001 | Login account enumeration — WSTG-IDNT-04 | Member 3 | **Done** | `login_enumeration.py` compares three fresh known/nonexistent failure pairs; tests cover vulnerable, secure, ambiguous, and execution-failure outcomes. |
 | CHK-002 | Registration account enumeration — WSTG-IDNT-04 | Member 3 | **Not started** | Vulnerable, secure, ambiguous, execution failure |
 | CHK-003 | Reset-request account enumeration — WSTG-IDNT-04 | Member 3 | **Not started** | Vulnerable, secure, ambiguous, execution failure |
 | CHK-004 | Login throttling and lockout — WSTG-ATHN-03 | Member 5 | **Not started** | Vulnerable, secure, ambiguous, execution failure |
@@ -165,11 +166,11 @@ Primary owner: **Member 4**.
 
 | ID | Task | Status | Depends on | Completion notes |
 | --- | --- | --- | --- | --- |
-| UI-001 | Build the Setup view. | **In progress** | FND-005, RUN-003 | Target, origins, accessible labels, and check selection are behavior-tested; credential references, policies, limits, and API submission remain. |
+| UI-001 | Build the Setup view. | **In progress** | FND-005, RUN-003 | Target, origins, runtime credential inputs, accessible labels, check selection, and API submission are behavior-tested; policies and limits remain. |
 | UI-002 | Build the Discovery view and guidance controls. | **Not started** | INT-007, INT-008, RUN-003 | Label automatic and guided flows separately. |
-| UI-003 | Build the Testing view with polling and cancellation. | **In progress** | RUN-003 | The six-check status layout exists; polling, live progress, request counts, outcomes, and cancellation remain. |
-| UI-004 | Build the Results view. | **Not started** | RPT-001, RPT-002 | Show evidence and incomplete coverage without an aggregate score. |
-| UI-005 | Add report downloads and offline reanalysis controls. | **Not started** | RUN-003, EVD-005 | Preserve and display result versions. |
+| UI-003 | Build the Testing view with polling and cancellation. | **In progress** | RUN-003 | Live scan polling, scan ID, counters, completed-state navigation, and cancellation are connected; detailed live progress remains. |
+| UI-004 | Build the Results view. | **In progress** | RPT-001, RPT-002 | Results view lists persisted past runs, retains Scan ID search, displays outcomes and counts, and is reached from Testing after completion; live refresh remains. |
+| UI-005 | Add report downloads and offline reanalysis controls. | **In progress** | RUN-003, EVD-005 | Results view links JSON/HTML downloads; reanalysis control and result-version display remain. |
 | UI-006 | Package the frontend for the local backend to serve. | **Done** | FND-005, FND-006 | FastAPI serves `frontend/dist`; production build and backend static-serving test pass. |
 
 ## 9. Evaluation and Release Tasks
@@ -179,7 +180,7 @@ applications. All members contribute to integration and release checks.
 
 | ID | Task | Status | Depends on | Completion notes |
 | --- | --- | --- | --- | --- |
-| EVA-001 | Prepare the server-rendered form/cookie application with secure and vulnerable modes. | **Not started** | — | Include redirects and changing CSRF tokens. |
+| EVA-001 | Prepare the server-rendered form/cookie application with secure and vulnerable modes. | **Done** | — | `controlled_app.py`; unit and real-Chromium tests cover redirects, changing single-use CSRF tokens, cookie sessions, isolated anonymous access, account enumeration, registration, reset, throttling, session rotation, and logout invalidation. Explicit prerequisite for AUTH-003. |
 | EVA-002 | Prepare the React/JSON two-step bearer-token application. | **Not started** | — | Layout and API behavior must differ from EVA-001. |
 | EVA-003 | Independently prepare the withheld-layout evaluation application. | **Not started** | — | Discovery implementers must not tune against it. |
 | EVA-004 | Run each supported discovery flow five times per relevant application. | **Not started** | AUTH-006, EVA-001–EVA-003 | Report automatic and guided completion separately. |
@@ -200,17 +201,17 @@ be linked here as they are created.
 
 | Acceptance area | Status | Current gap |
 | --- | --- | --- |
-| Six checks and 24 scenarios | **Not started** | No runner/analyser pair exists. |
-| Runner/analyser separation | **Not started** | Shared models establish the boundary, but it is not implemented. |
-| Repeatable analysis | **Not started** | Result serialization is tested; analyser determinism is not. |
-| Offline reporting | **Not started** | No report generator exists. |
+| Six checks and 24 scenarios | **In progress** | `CHK-001` covers secure, vulnerable, ambiguous, and execution-failure scenarios; five checks remain. |
+| Runner/analyser separation | **In progress** | `CHK-001` keeps browser execution in the runner and analysis in an offline function; remaining checks are pending. |
+| Repeatable analysis | **In progress** | `CHK-001` analyser output is tested for repeatable outcome/explanation; versioned result storage is implemented. |
+| Offline reporting | **Done** | JSON and HTML reports are generated from local evidence/results without target, browser, AWS, or network access. |
 | Generality | **In progress** | Scope and observation logic contain no application-name or fixed-route branches. Discovery and checks remain untested. |
-| Discovery reliability | **Not started** | No action selection or repeated flow execution exists. |
-| Guided fallback | **Not started** | No guidance API or recorder exists. |
-| Authentication proof | **In progress** | Profile builder enforces authenticated/anonymous marker comparison; end-to-end login proof is pending. |
-| Session isolation | **Not started** | Observation uses a fresh context, but replay experiments are not implemented. |
+| Discovery reliability | **In progress** | One live Nova Micro run completed the controlled login in three decisions. The required five-run measurements on each relevant evaluation application remain pending. |
+| Guided fallback | **In progress** | Structured guided recording and replay work with local credential references; the guidance API and React controls remain pending. |
+| Authentication proof | **In progress** | End-to-end automatic and guided login proof passes on the controlled application, including saved-flow replay in fresh contexts; the second authentication style remains pending. |
+| Session isolation | **In progress** | Authentication-profile replay uses separate fresh authenticated and anonymous browser contexts; broader session replay for security checks remains pending. |
 | Stateful flows | **Not started** | No changing-CSRF or changing-control test exists. |
-| Failure handling | **Not started** | No scan lifecycle or explicit failure outcomes are implemented. |
+| Failure handling | **In progress** | Automatic action failures retry twice before an explicit guidance-required outcome, and decision, time, and cost limits stop cleanly. Scan lifecycle, cancellation, stale flows, and unsupported-authentication outcomes remain. |
 | Privacy and scope | **In progress** | URL, embedded-credential, session, input-value, origin-blocking, and Bedrock sanitization cases are tested. Full evidence-export redaction remains pending. |
 | Installation | **In progress** | Local virtual environment and Chromium work; clean documented setup on another computer is pending. |
 
@@ -218,13 +219,13 @@ be linked here as they are created.
 
 Unless a dependency changes, implement the next work in this order:
 
-1. **AUTH-003 and AUTH-004:** Run a controlled login and prove protected access
-   against an anonymous context.
-2. **INT-009 and AUTH-005:** Replay the saved flow in a fresh context and produce
-   a verified profile.
-3. **CHK-001, EVD-001–EVD-005, and RPT-001–RPT-002:** Complete the first
-   runner-to-analyser-to-report slice.
+1. **RUN-001–RUN-003:** Add scan lifecycle, worker, and API orchestration around
+   the completed browser/analyser/report slice.
+2. **UI-002–UI-005:** Connect discovery guidance, scan progress, results, report
+   downloads, and offline reanalysis to the backend.
+3. **CHK-002 and CHK-003:** Add registration and reset-request enumeration using
+   the established runner/analyser/evidence/report pattern.
 
-Items one and two complete the project's first technical milestone. The
-third item completes the required second technical milestone and establishes
-the pattern for the remaining five checks.
+The first three items extend the completed first runner-to-analyser-to-report
+slice into an actual scan workflow and then cover the remaining enumeration
+checks before session checks are added.

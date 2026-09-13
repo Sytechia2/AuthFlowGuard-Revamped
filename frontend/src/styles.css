@@ -117,8 +117,7 @@ nav {
 
 .nav-item {
   display: grid;
-  grid-template-columns: 2rem 1fr;
-  gap: 0.65rem;
+  grid-template-columns: 1fr;
   width: 100%;
   padding: 0.9rem;
   border: 1px solid transparent;
@@ -140,17 +139,10 @@ nav {
   color: var(--text);
 }
 
-.nav-step,
 .section-number,
 .eyebrow,
 .empty-code {
   font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
-}
-
-.nav-step {
-  padding-top: 0.1rem;
-  color: var(--cyan);
-  font-size: 0.75rem;
 }
 
 .nav-item strong,
@@ -296,8 +288,25 @@ h2 {
 
 .target-panel,
 .checks-panel,
-.status-table-panel {
+.status-table-panel,
+.credentials-panel {
   padding: clamp(1.25rem, 3vw, 2rem);
+}
+
+.credentials-panel {
+  grid-column: 1 / -1;
+}
+
+.panel-help {
+  margin: -0.75rem 0 1.25rem;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.credential-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 1rem;
 }
 
 .section-heading {
@@ -473,6 +482,180 @@ h2 {
   cursor: not-allowed;
 }
 
+.form-error {
+  color: var(--danger) !important;
+}
+
+.readiness-panel .form-error {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.scan-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-bottom: 1.25rem;
+}
+
+.scan-metrics span {
+  padding: 0.45rem 0.7rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 0.4rem;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+code {
+  color: var(--cyan);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.82em;
+}
+
+.secondary-button {
+  padding: 0.7rem 0.9rem;
+  border: 1px solid var(--cyan);
+  border-radius: 0.45rem;
+  background: transparent;
+  color: var(--cyan);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.secondary-button:hover {
+  background: var(--cyan-dark);
+}
+
+.results-layout {
+  display: grid;
+  gap: 1rem;
+}
+
+.results-history-panel,
+.results-panel {
+  padding: clamp(1.25rem, 3vw, 2rem);
+}
+
+.result-loader {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 0.65rem;
+  margin-bottom: 1.25rem;
+}
+
+.result-loader label {
+  grid-column: 1 / -1;
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+
+.result-loader input {
+  width: 100%;
+  min-width: 0;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 0.45rem;
+  outline: none;
+  background: #091522;
+  color: var(--text);
+}
+
+.result-loader input:focus {
+  border-color: var(--cyan);
+  box-shadow: 0 0 0 0.2rem rgba(53, 214, 199, 0.09);
+}
+
+.history-empty {
+  margin: 0;
+  color: var(--muted);
+}
+
+.scan-history {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.history-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  width: 100%;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.45rem;
+  background: rgba(8, 17, 28, 0.45);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.history-row:hover {
+  border-color: var(--cyan);
+  background: var(--cyan-dark);
+}
+
+.history-row > span:first-child,
+.history-meta {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.history-row small {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.history-row strong {
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.history-meta {
+  flex: 0 0 auto;
+  justify-items: end;
+}
+
+.history-meta em {
+  font-style: normal;
+}
+
+.result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  margin: 1.25rem 0;
+}
+
+.result-actions a {
+  color: var(--cyan);
+  font-weight: 700;
+}
+
+.result-list {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.result-card {
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: rgba(8, 17, 28, 0.45);
+}
+
+.result-card h3 {
+  margin: 0 0 0.35rem;
+  font-size: 1rem;
+}
+
+.result-card p:last-child {
+  margin: 0.5rem 0 0;
+  color: var(--muted);
+}
+
 .empty-workspace {
   display: grid;
   place-items: center;
@@ -560,7 +743,6 @@ h2 {
     display: block;
   }
 
-  .nav-step,
   .nav-item small {
     display: none;
   }
@@ -573,6 +755,10 @@ h2 {
   }
 
   .setup-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .credential-fields {
     grid-template-columns: 1fr;
   }
 }

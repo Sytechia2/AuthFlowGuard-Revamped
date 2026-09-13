@@ -109,3 +109,82 @@ tokens per minute for Amazon Nova Micro**, select it, and request an increase.
 AWS uses that adjustable quota request to review the related on-demand
 tokens-per-minute and daily-token quotas as well. Repeat the smoke test only
 after the applied quota values are nonzero.
+
+## 6. Controlled Evaluation Application
+
+Run the server-rendered form/cookie fixture in secure mode:
+
+```powershell
+.\.venv\Scripts\python -m authflowguard.controlled_app --mode secure --port 8001
+```
+
+Use `--mode vulnerable` on a different port to expose the intentionally weak
+comparison behaviours. The fixture includes changing, single-use CSRF tokens;
+login redirects; cookie sessions; authenticated and anonymous account views;
+registration and reset forms; login throttling; session rotation; and logout
+invalidation. Its built-in credentials are test data only:
+
+- Email: `developer@example.test`
+- Password: `correct-horse-battery-staple`
+
+This application binds to `127.0.0.1` by default and must not be deployed as a
+production service.
+
+## 7. Live Bedrock Browser Agent
+
+Start the controlled application in one terminal using the command in Section
+6. Sign in to AWS with the development profile, then run the bounded live agent
+from a second terminal:
+
+```powershell
+aws login --profile authflowguard-dev --region us-east-1
+
+.\.venv\Scripts\python -m authflowguard.agent_cli `
+  --target-url http://127.0.0.1:8001/login `
+  --account-marker-selector '[data-testid="account-marker"]' `
+  --profile authflowguard-dev `
+  --region us-east-1 `
+  --model-id amazon.nova-micro-v1:0 `
+  --maximum-ai-decisions 8 `
+  --maximum-cost-usd 0.01 `
+  --headed `
+  --confirm-live-calls
+```
+
+The CLI prompts for the username and password instead of accepting them as
+command-line arguments. Values remain in worker memory and are discarded when
+the session ends. Each successful model decision prints its action type,
+control reference, sanitized resulting page URL, token use, and estimated cost.
+The command exits with code 0 only when the account-marker selector becomes
+visible; limits and guidance-required outcomes exit with code 2.
+
+## 8. Run a Scan from the Interface
+
+Start the controlled application from Section 6, then start the backend and
+interface from Sections 1 and 2. In the browser, use **Setup** and enter the
+controlled application's values:
+
+- Target URL: `http://127.0.0.1:8001/login`
+- Permitted origins: `http://127.0.0.1:8001`
+- Known account username: `developer@example.test`
+- Known account password: `correct-horse-battery-staple`
+- Nonexistent account username: `missing@example.test`
+- Invalid password: `wrong-password`
+- Protected resource URL: `http://127.0.0.1:8001/account`
+- Authenticated marker selector: `[data-testid="account-marker"]`
+
+Select **Start local scan**. The interface switches to **Testing**, polls the
+scan, and shows the generated scan ID. When the state is `completed`, choose
+**Open results** to see the finding and download the offline JSON or HTML
+report. You can choose **Cancel scan** while execution is still running. Only the implemented login-account-enumeration check produces a result
+in this release; the other check selections are retained in the scan request
+but are not yet executed.
+
+The **Results** view lists saved local runs automatically. Select any listed
+run to load it, or continue using the Scan ID search field when you already
+have a specific ID. The list is restored from `.authflowguard-data` when the
+backend restarts.
+
+The username, passwords, and disposable identifier are sent only in the local
+start request. They are runtime inputs and are discarded by the backend after
+the scan; do not use production credentials.
