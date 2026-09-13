@@ -37,15 +37,15 @@ whole milestone complete because only its first component works.
 | Area | Status | Current evidence |
 | --- | --- | --- |
 | Repository and backend foundation | **Done** | Python package, shared models, FastAPI, React, packaged frontend/backend connection, Playwright, bounded Bedrock request, and project-wide quality commands work locally. |
-| Playwright observations | **In progress** | A bounded Bedrock-driven loop now converts sanitized observations into validated browser actions, records action traffic and page changes, and completes the controlled login with an offline model double. Guided recording and fresh-context replay are covered by `authentication.py` and `test_authentication.py`; UI integration remains pending. |
-| Verified authentication information | **In progress** | Automatic and guided CSRF-safe login flows produce verified profiles from authenticated and isolated anonymous account-marker evidence, and saved flows replay in fresh contexts. The second authentication style and stale-flow revalidation remain pending. |
+| Playwright observations | **In progress** | A bounded Bedrock-driven loop converts sanitized observations into validated browser actions, records action traffic and page changes, and completes the controlled login with an offline model double. Guided observation exposes safe control metadata through the API and Discovery UI; deterministic two-step JSON actions are now covered, while broader SPA layouts remain pending. |
+| Verified authentication information | **In progress** | Automatic and guided login flows produce verified profiles from authenticated and isolated anonymous account-marker evidence, and saved flows replay in fresh contexts. Conventional forms and a React/JSON bearer-token flow are covered; broader session replay remains pending. |
 | Bedrock integration | **In progress** | The structured Converse client and live CLI completed the controlled login in three model decisions within the configured cost cap. Sanitization, validation, limits, retry feedback, and guidance escalation are tested. Usage persistence across restarts remains pending. |
 | Security checks | **In progress** | `CHK-001` has a browser runner and deterministic offline analyser; the remaining five checks are pending. |
 | Evidence persistence and reports | **In progress** | `EvidenceStore` writes bounded redacted scan evidence, append-only events, and versioned results; offline JSON/HTML export and first-slice scan API integration are implemented. Worker-process separation remains pending. |
-| Interface | **In progress** | The four-view React shell now submits Setup data, starts a local scan, polls live status, lists persisted past runs, and keeps Scan ID search; guidance and full result controls remain pending. |
+| Interface | **In progress** | The four-view React shell submits Setup data, starts a local scan, pauses for guided discovery, presents plain-language control choices, submits guided flows, polls live status, lists persisted past runs, and keeps Scan ID search; full result controls remain pending. |
 | Evaluation and release | **In progress** | The first controlled evaluation application is complete. The second and withheld-layout applications, reliability measurements, installation test, and demonstration are pending. |
 
-Current automated verification: **98 tests passing**: 89 backend tests and 9
+Current automated verification: **106 tests passing**: 96 backend tests and 10
 React behavior tests. The backend suite includes real Chromium tests against
 controlled local pages, secure and intentionally vulnerable form/cookie flows,
 adversarial scope and privacy cases, strict Bedrock response validation, and
@@ -106,8 +106,8 @@ authentication information.
 | AUTH-003 | Discover and execute a complete login flow on a controlled form application. | **Done** | INT-003, INT-005, EVA-001 | `authentication.py`; a real Chromium test discovers conventional login controls and submits the live form with its changing CSRF token through validated structured actions. |
 | AUTH-004 | Verify the protected resource in authenticated and isolated anonymous contexts. | **Done** | AUTH-003 | The browser workflow records independent page-state evidence, proves the account marker present only in the authenticated context, and saves both evidence references in the verified profile. Tests also prove credentials, query data, cookie values, and marker text are excluded from persisted output. |
 | AUTH-005 | Produce and replay a verified `AuthProfile` in a fresh context. | **Done** | AUTH-004, INT-009 | Guided execution builds a verified profile and replay re-proves the account marker anonymously and authenticated in new contexts; `execute_guided_verified_login_flow`, `replay_verified_auth_profile`, and browser tests. |
-| AUTH-006 | Support two-step login and bearer-token sessions. | **Not started** | AUTH-005 | Verify on the controlled React/JSON application. |
-| AUTH-007 | Revalidate saved flows before reuse in a new scan. | **Not started** | AUTH-005 | Stale flows must request guidance or produce an explicit outcome. |
+| AUTH-006 | Support two-step login and bearer-token sessions. | **Done** | AUTH-005 | Deterministic discovery supports username → JSON verification step → bearer-token storage, and fresh-context proof records only storage fingerprints. Covered by `react_json_app.py` and browser/API tests. |
+| AUTH-007 | Revalidate saved flows before reuse in a new scan. | **Done** | AUTH-005 | Completed profiles retain nonsecret control signatures. A matching new scan revalidates the current login page before replay; missing, added, changed, or legacy unsigned controls return the scan to `awaiting_guidance`. |
 | AUTH-008 | Keep live credentials in worker memory and discard them on completion or cancellation. | **In progress** | INT-003, INT-010 | `RuntimeSecrets` resolves and discards in-memory values. Cancellation, export, and model-request coverage remain pending. |
 
 ## 6. Scan Execution, Evidence, and Reporting Tasks
@@ -119,7 +119,7 @@ reporting.
 | --- | --- | --- | --- | --- |
 | RUN-001 | Define the scan state machine, including awaiting-guidance and cancellation. | **In progress** | FND-003 | `ScanState` and cancellation transitions are implemented; explicit invalid-transition coverage remains. |
 | RUN-002 | Run one scan at a time in a worker process separate from FastAPI. | **In progress** | RUN-001 | A single background executor currently keeps FastAPI responsive; a separate worker process remains. |
-| RUN-003 | Add APIs for create, status, events, guidance, cancellation, downloads, and reanalysis. | **In progress** | RUN-001 | Create/status/events/cancellation/download/reanalysis endpoints are implemented; guidance endpoint and full lifecycle integration remain. |
+| RUN-003 | Add APIs for create, status, events, guidance, cancellation, downloads, and reanalysis. | **In progress** | RUN-001 | Create/status/events/cancellation/download/reanalysis and guidance observation/submission endpoints are implemented; broader lifecycle and worker-process hardening remain. |
 | EVD-001 | Create per-scan directories and metadata files. | **Done** | RUN-001 | `EvidenceStore` creates UUID-bounded scan directories and metadata files; `test_evidence_reports.py`. |
 | EVD-002 | Implement the append-only evidence event log. | **Done** | EVD-001 | `EvidenceStore.append_event` writes NDJSON and survives reopening; `test_evidence_reports.py`. |
 | EVD-003 | Implement central redaction before evidence is written. | **Done** | EVD-002 | Secrets, query/fragment URL data, and sensitive evidence fields are redacted before disk writes; storage tests. |
@@ -167,11 +167,93 @@ Primary owner: **Member 4**.
 | ID | Task | Status | Depends on | Completion notes |
 | --- | --- | --- | --- | --- |
 | UI-001 | Build the Setup view. | **In progress** | FND-005, RUN-003 | Target, origins, runtime credential inputs, accessible labels, check selection, and API submission are behavior-tested; policies and limits remain. |
-| UI-002 | Build the Discovery view and guidance controls. | **Not started** | INT-007, INT-008, RUN-003 | Label automatic and guided flows separately. |
+| UI-002 | Build the Discovery view and guidance controls. | **Done** | INT-007, INT-008, RUN-003 | Discovery pauses after automatic discovery failure, observes a selected in-scope page, maps structured navigate/fill/click actions to safe control references, and labels guided profiles separately. |
 | UI-003 | Build the Testing view with polling and cancellation. | **In progress** | RUN-003 | Live scan polling, scan ID, counters, completed-state navigation, and cancellation are connected; detailed live progress remains. |
 | UI-004 | Build the Results view. | **In progress** | RPT-001, RPT-002 | Results view lists persisted past runs, retains Scan ID search, displays outcomes and counts, and is reached from Testing after completion; live refresh remains. |
 | UI-005 | Add report downloads and offline reanalysis controls. | **In progress** | RUN-003, EVD-005 | Results view links JSON/HTML downloads; reanalysis control and result-version display remain. |
 | UI-006 | Package the frontend for the local backend to serve. | **Done** | FND-005, FND-006 | FastAPI serves `frontend/dist`; production build and backend static-serving test pass. |
+| UI-007 | Refine guided discovery into plain-language questions about missing login information. | **Done** | UI-002, RUN-003 | Discovery explains why the scan paused, reuses Setup credentials, offers recognizable username/password/button choices from fresh observations, clears stale selections after refresh, and keeps proof overrides under Advanced settings. Frontend behavior and submission tests pass. |
+
+### 8.1. Planned Guided Discovery Refinement
+
+**Status: Not started; documentation only.** The implemented UI-002 fallback
+remains the current behavior. This refinement records user feedback from
+13 September 2026 and does not represent a completed interface change.
+
+The user expects AuthFlowGuard to explain which part of logging in needs help,
+then ask for the information needed to continue. The current wording, especially
+"Observe target controls," is too technical. The initial design should support
+the familiar sequence of entering a username or email and password, selecting
+Sign in, and reaching an account page or dashboard.
+
+#### Proposed interaction
+
+1. **Explain the pause and the specific help needed.** Use a heading such as
+   "Help us log in." When supported by observations, say, for example, "We found
+   more than one possible sign-in button. Which one do you normally use?"
+   Distinguish missing fields, ambiguous choices, and a page that could not be
+   opened. If the cause is unknown, say so and start by checking the login page.
+   Keep raw diagnostics in expandable technical details.
+2. **Ask only for missing or uncertain information.** Reuse the login details
+   entered in Setup and retain information already identified reliably. Ask
+   "Which page do you use to log in?" when the page needs clarification, then
+   offer "Find login fields." Show one focused question at a time or a short
+   group of related questions, rather than a full action editor at the outset.
+3. **Offer recognizable field and button choices.** Ask "Which field is for
+   your username or email?", "Which field is for your password?", or "Which
+   button signs you in?" as needed. Present available labels and helpful page
+   context instead of requiring users to copy IDs such as `control-5`. Allow
+   "I can't find the right field or button" and explain how to check the URL or
+   refresh the choices. Do not silently guess when choices are ambiguous.
+4. **Explain how login success will be checked.** Reuse the check configured in
+   Setup, with a plain-language explanation that the account page must contain
+   something visible only after signing in. Put selector and URL overrides under
+   "Advanced: change how login is checked," with examples. Do not imply that a
+   dashboard URL or the word "Dashboard" alone proves a successful login.
+5. **Review and continue.** Summarize the proposed steps in everyday language:
+   open the login page, enter the test account details, and select the chosen
+   sign-in button. Use "Check login and continue" for submission. Explain that
+   AuthFlowGuard will try these steps, verify login, and then resume the scan.
+   If verification fails, explain what failed and what information to correct.
+
+These questions can use ordinary form inputs and selections; a conversational
+chat interface or live browser recorder is not required for this refinement.
+The current implementation also covers the controlled React/JSON two-step
+bearer-token flow; broader SPA layouts remain part of the generality evaluation.
+
+#### Wording direction
+
+| Current wording | Proposed user-facing wording |
+| --- | --- |
+| Guided discovery | Help us log in |
+| Page to observe | Login page address |
+| Observe target controls | Find login fields |
+| Observed controls | Fields and buttons found on this page |
+| Authentication flow | Steps to log in |
+| Credential references only | Use the test account details from Setup |
+| Protected-resource proof | How we check that login worked |
+| Save and verify guided flow | Check login and continue |
+
+#### Acceptance criteria for UI-007
+
+- A user can explain why the scan paused, what information is missing, and what
+  will happen after submission without knowing browser automation terminology.
+- The standard login path requires no manual control IDs, action types,
+  credential-reference names, or repeated entry of Setup credentials.
+- Reliably identified information is retained and reviewable; questions focus
+  on unresolved information. Backend status or observation data must support
+  any claim about what was found or what failed.
+- Missing, ambiguous, unnamed, and stale field/button choices have clear
+  recovery instructions. Refreshing or changing the page invalidates outdated
+  selections, and incomplete answers cannot be submitted as a valid flow.
+- Advanced verification settings remain available and explain the required
+  selector honestly. Login proof still checks separate signed-in and signed-out
+  sessions, and saved actions continue to exclude live credentials.
+- Verification includes frontend behavior tests for focused questions,
+  recognizable choices, Setup reuse, recovery, and submission; an end-to-end
+  guided login on the controlled application; and a user walkthrough to confirm
+  the wording is understandable. Update the development walkthrough after
+  implementation and record the evidence before marking UI-007 Done.
 
 ## 9. Evaluation and Release Tasks
 
@@ -181,7 +263,7 @@ applications. All members contribute to integration and release checks.
 | ID | Task | Status | Depends on | Completion notes |
 | --- | --- | --- | --- | --- |
 | EVA-001 | Prepare the server-rendered form/cookie application with secure and vulnerable modes. | **Done** | — | `controlled_app.py`; unit and real-Chromium tests cover redirects, changing single-use CSRF tokens, cookie sessions, isolated anonymous access, account enumeration, registration, reset, throttling, session rotation, and logout invalidation. Explicit prerequisite for AUTH-003. |
-| EVA-002 | Prepare the React/JSON two-step bearer-token application. | **Not started** | — | Layout and API behavior must differ from EVA-001. |
+| EVA-002 | Prepare the React/JSON two-step bearer-token application. | **Done** | — | `react_json_app.py` exposes secure/vulnerable modes, JSON start/verify endpoints, localStorage bearer sessions, and an account marker page with a deliberately different SPA layout. |
 | EVA-003 | Independently prepare the withheld-layout evaluation application. | **Not started** | — | Discovery implementers must not tune against it. |
 | EVA-004 | Run each supported discovery flow five times per relevant application. | **Not started** | AUTH-006, EVA-001–EVA-003 | Report automatic and guided completion separately. |
 | EVA-005 | Execute at least 24 required security-check scenarios. | **Not started** | CHK-001–CHK-006 | Four scenario types for each of six checks. |
@@ -205,13 +287,13 @@ be linked here as they are created.
 | Runner/analyser separation | **In progress** | `CHK-001` keeps browser execution in the runner and analysis in an offline function; remaining checks are pending. |
 | Repeatable analysis | **In progress** | `CHK-001` analyser output is tested for repeatable outcome/explanation; versioned result storage is implemented. |
 | Offline reporting | **Done** | JSON and HTML reports are generated from local evidence/results without target, browser, AWS, or network access. |
-| Generality | **In progress** | Scope and observation logic contain no application-name or fixed-route branches. Discovery and checks remain untested. |
+| Generality | **In progress** | Scope and observation logic contain no application-name or fixed-route branches. Guided observation/replay and the React/JSON bearer flow are tested on separate controlled applications; withheld-layout evaluation remains pending. |
 | Discovery reliability | **In progress** | One live Nova Micro run completed the controlled login in three decisions. The required five-run measurements on each relevant evaluation application remain pending. |
-| Guided fallback | **In progress** | Structured guided recording and replay work with local credential references; the guidance API and React controls remain pending. |
-| Authentication proof | **In progress** | End-to-end automatic and guided login proof passes on the controlled application, including saved-flow replay in fresh contexts; the second authentication style remains pending. |
+| Guided fallback | **Done** | Automatic discovery failures transition to `awaiting_guidance`; the guidance API and React Discovery UI observe safe controls, present plain-language choices, accept credential references, verify fresh authenticated/anonymous contexts, persist `auth-profile.json`, and label the profile source. The UI is a structured choice flow rather than live browser clicking. |
+| Authentication proof | **In progress** | End-to-end automatic and guided login proof passes on the controlled form and React/JSON applications, including saved-flow replay in fresh contexts; broader session replay remains pending. |
 | Session isolation | **In progress** | Authentication-profile replay uses separate fresh authenticated and anonymous browser contexts; broader session replay for security checks remains pending. |
 | Stateful flows | **Not started** | No changing-CSRF or changing-control test exists. |
-| Failure handling | **In progress** | Automatic action failures retry twice before an explicit guidance-required outcome, and decision, time, and cost limits stop cleanly. Scan lifecycle, cancellation, stale flows, and unsupported-authentication outcomes remain. |
+| Failure handling | **In progress** | Automatic action failures retry twice before an explicit guidance-required outcome, and decision, time, cost, and stale-flow limits stop cleanly. Scan lifecycle, cancellation, and unsupported-authentication outcomes remain. |
 | Privacy and scope | **In progress** | URL, embedded-credential, session, input-value, origin-blocking, and Bedrock sanitization cases are tested. Full evidence-export redaction remains pending. |
 | Installation | **In progress** | Local virtual environment and Chromium work; clean documented setup on another computer is pending. |
 
@@ -219,13 +301,9 @@ be linked here as they are created.
 
 Unless a dependency changes, implement the next work in this order:
 
-1. **RUN-001–RUN-003:** Add scan lifecycle, worker, and API orchestration around
-   the completed browser/analyser/report slice.
-2. **UI-002–UI-005:** Connect discovery guidance, scan progress, results, report
-   downloads, and offline reanalysis to the backend.
-3. **CHK-002 and CHK-003:** Add registration and reset-request enumeration using
+1. **CHK-002 and CHK-003:** Add registration and reset-request enumeration using
    the established runner/analyser/evidence/report pattern.
 
-The first three items extend the completed first runner-to-analyser-to-report
-slice into an actual scan workflow and then cover the remaining enumeration
-checks before session checks are added.
+This order first improves the guided login experience, then extends authentication
+support and covers the remaining enumeration checks before session checks are
+added.

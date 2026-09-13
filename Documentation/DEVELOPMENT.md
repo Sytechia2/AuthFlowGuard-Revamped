@@ -46,9 +46,10 @@ npm.cmd test
 npm.cmd run build
 ```
 
-These suites verify the foundation that currently exists. They do not count as
-evidence for authentication discovery, full scans, security checks, reporting,
-or cancellation until those features and their end-to-end tests are added.
+These suites cover the implemented foundation, guided discovery, authentication
+proof, scan lifecycle, the login-enumeration slice, reporting, and cancellation.
+They do not establish support for the not-yet-implemented authentication styles
+or security checks listed in the execution plan.
 
 ## 4. Code Quality
 
@@ -188,3 +189,107 @@ backend restarts.
 The username, passwords, and disposable identifier are sent only in the local
 start request. They are runtime inputs and are discarded by the backend after
 the scan; do not use production credentials.
+
+## 9. Guided Discovery Fallback
+
+This walkthrough describes the current interface. Discovery uses focused
+questions and recognizable choices instead of asking the user to type technical
+control IDs. The backend still receives safe structured references.
+
+The normal controlled `/login` page is discovered automatically. To exercise the
+guided fallback, use a page without conventional login controls as the scan
+target, then observe the actual login page from Discovery.
+
+Use these Setup values:
+
+- Target URL: `http://127.0.0.1:8001/account`
+- Permitted origin: `http://127.0.0.1:8001`
+- Known account username: `developer@example.test`
+- Known account password: `correct-horse-battery-staple`
+- Nonexistent account username: `missing@example.test`
+- Invalid password: `wrong-password`
+- Protected resource URL: `http://127.0.0.1:8001/account`
+- Authenticated marker selector: `[data-testid="account-marker"]`
+
+Select **Login account enumeration** and start the scan. When Testing shows
+`awaiting_guidance`, open **Discovery**. Set **Page to observe** to
+`http://127.0.0.1:8001/login`, then choose **Observe target controls**.
+
+For the bundled controlled application, the visible login controls are currently:
+
+```text
+control-5  username/email field
+control-6  password field
+control-7  submit button
+```
+
+Enter this four-step flow:
+
+```text
+Navigate → http://127.0.0.1:8001/login
+Fill     → control-5 → username
+Fill     → control-6 → password
+Click    → control-7
+```
+
+Choose **Save and verify guided flow**. AuthFlowGuard replays the actions in a
+fresh authenticated context, checks the account marker on `/account`, repeats
+the protected-resource request in a separate anonymous context, and then runs
+the selected check. Use port `8002` and vulnerable mode to expect
+`finding_confirmed` instead of `no_issue_observed`.
+
+Control IDs are generated from the page's current control order; they are not
+universal HTML IDs. Observe the page again if its layout changes. The current
+Discovery UI records structured actions and references rather than providing a
+live click-through browser recorder.
+
+## 10. React/JSON Two-Step Evaluation
+
+The second controlled application models a single-page login that requests a
+verification code through JSON, receives a bearer token through JSON, and stores
+that token in browser localStorage. Start it separately from the form fixture:
+
+```powershell
+.\.venv\Scripts\python -m authflowguard.react_json_app --mode secure --port 8003
+```
+
+Use these Setup values:
+
+- Target URL: `http://127.0.0.1:8003/login`
+- Permitted origin: `http://127.0.0.1:8003`
+- Known account username: `developer@example.test`
+- Known account password: `unused-for-json-login`
+- One-time verification code: `246810`
+- Nonexistent account username: `missing@example.test`
+- Invalid password: `wrong-password`
+- Protected resource URL: `http://127.0.0.1:8003/account`
+- Authenticated marker selector: `[data-testid="account-marker"]`
+
+The automatic discovery path identifies the username, first-step button,
+hidden one-time-code control, and second-step button. It executes the JSON
+requests through the page, then verifies the marker in an authenticated context
+and confirms its absence in a fresh anonymous context. The bearer token itself
+is never included in evidence; only a local-storage fingerprint is retained.
+
+Use this command for the intentionally vulnerable variant:
+
+```powershell
+.\.venv\Scripts\python -m authflowguard.react_json_app --mode vulnerable --port 8004
+```
+
+Then change the Setup target, permitted origin, and protected-resource URL to
+port `8004`. The app's unknown-account response should disclose
+`No account exists`, while the secure mode uses a generic response.
+
+## 11. Saved-Flow Revalidation
+
+When a completed scan has a verified profile, a later scan with the same target
+and protected resource attempts to reuse that profile. Before replaying it,
+AuthFlowGuard observes the current login page and compares nonsecret control
+signatures. Changing CSRF values are allowed, while renamed, reordered, removed,
+or newly inserted controls are treated as stale.
+
+If the profile is stale—or was created by an older version without control
+signatures—the new scan pauses in `awaiting_guidance`. Open Discovery, find the
+current login fields, choose the controls again, and submit the guided flow. The
+stale profile is never replayed.
