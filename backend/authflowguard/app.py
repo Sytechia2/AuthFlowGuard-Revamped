@@ -8,7 +8,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from authflowguard.models import ScanRequest
-from authflowguard.scan_manager import ScanExecutionInput, ScanManager
+from authflowguard.scan_manager import (
+    GuidanceObservationRequest,
+    GuidanceSubmission,
+    ScanExecutionInput,
+    ScanManager,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
@@ -68,6 +73,35 @@ def create_app(
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         return [event.model_dump(mode="json") for event in record.events]
+
+    @application.post("/api/scans/{scan_id}/guidance/observe")
+    async def observe_guidance(
+        scan_id: UUID,
+        request: GuidanceObservationRequest | None = None,
+    ) -> dict[str, object]:
+        try:
+            return await scan_manager.observe_guidance(
+                scan_id,
+                request.url if request else None,
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except (ValueError, RuntimeError) as error:
+            detail = str(error) or f"{type(error).__name__}: browser observation failed"
+            raise HTTPException(status_code=409, detail=detail) from error
+
+    @application.post("/api/scans/{scan_id}/guidance")
+    async def submit_guidance(
+        scan_id: UUID,
+        guidance: GuidanceSubmission,
+    ) -> dict[str, object]:
+        try:
+            record = scan_manager.submit_guidance(scan_id, guidance)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return scan_manager.snapshot(record)
 
     @application.post("/api/scans/{scan_id}/cancel")
     async def cancel_scan(scan_id: UUID) -> dict[str, object]:

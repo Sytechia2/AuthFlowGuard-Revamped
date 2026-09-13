@@ -1,10 +1,20 @@
 """Execute and verify a browser-based login without persisting live secrets."""
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
+from hashlib import sha256
 from uuid import UUID
 
-from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    async_playwright,
+)
+from playwright.async_api import (
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 from authflowguard.action_executor import ActionExecutionResult, BrowserActionExecutor
 from authflowguard.auth_profiles import (
@@ -12,6 +22,7 @@ from authflowguard.auth_profiles import (
     build_verified_login_profile,
 )
 from authflowguard.models import (
+    ActionWaitCondition,
     AuthFeature,
     AuthProfile,
     BrowserAction,
@@ -31,6 +42,10 @@ class LoginFormDiscoveryError(ValueError):
     """Raised when a usable login form cannot be identified unambiguously."""
 
 
+class StaleAuthProfileError(LoginFormDiscoveryError):
+    """Raised when a saved flow no longer matches the current login page."""
+
+
 @dataclass(frozen=True)
 class VerifiedLoginExecution:
     """Nonsecret output of login execution and independent verification."""
@@ -47,6 +62,14 @@ class GuidedFlowRecording:
     actions: list[BrowserAction]
     events: list[EvidenceEvent]
     traffic: list[TrafficReference]
+
+
+@dataclass(frozen=True)
+class GuidedPageObservation:
+    """Safe page metadata shown to a developer during guided discovery."""
+
+    event: EvidenceEvent
+    controls: list[SafeControlDescription]
 
 
 def _sanitize_recorded_action(
@@ -91,6 +114,35 @@ def _control_id(control: SafeControlDescription) -> str:
     return control_id
 
 
+def _control_signature(control: SafeControlDescription) -> str:
+    """Hash stable, nonsecret control metadata for saved-flow validation."""
+
+    metadata = {
+        key: control.get(key)
+        for key in (
+            "tag",
+            "id",
+            "name",
+            "type",
+            "placeholder",
+            "autocomplete",
+            "aria_label",
+        )
+    }
+    serialized = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+    return sha256(serialized.encode("utf-8")).hexdigest()
+
+
+async def _capture_control_signatures(
+    page: Page,
+    signatures: dict[str, str],
+) -> None:
+    controls = await PlaywrightWorker().read_controls(page)
+    for control in controls:
+        control_id = _control_id(control)
+        signatures.setdefault(control_id, _control_signature(control))
+
+
 def _select_one_control(
     controls: list[SafeControlDescription],
     description: str,
@@ -109,11 +161,13 @@ async def discover_login_form_actions(
     target: TargetScope,
     username_reference: str,
     password_reference: str,
+    second_factor_reference: str | None = None,
 ) -> list[BrowserAction]:
     """Identify an unambiguous conventional login form from safe attributes.
 
-    This deterministic baseline is intentionally narrow. INT-006 will use
-    Bedrock for layouts that cannot be selected from standard form semantics.
+    This deterministic baseline supports both conventional form submissions and
+    a two-step JSON flow with a visible one-time-code control. Layouts that do
+    not expose these semantics still use guided discovery.
     """
 
     controls = await PlaywrightWorker().read_controls(page)
@@ -137,8 +191,74 @@ async def discover_login_form_actions(
         }
 
     username_control = _select_one_control(controls, "username", is_username)
-    password_control = _select_one_control(controls, "current-password", is_password)
-    submit_control = _select_one_control(controls, "submit", is_submit)
+
+    password_controls = [control for control in controls if is_password(control)]
+    if len(password_controls) == 1:
+        password_control = _control_id(password_controls[0])
+        submit_control = _select_one_control(controls, "submit", is_submit)
+        return [
+            BrowserAction(
+                action_type=BrowserActionType.NAVIGATE,
+                url=target.target_url,
+                description="Open the discovered login page",
+            ),
+            BrowserAction(
+                action_type=BrowserActionType.FILL,
+                observed_control_id=username_control,
+                value_reference=username_reference,
+                description="Fill the username from its runtime reference",
+            ),
+            BrowserAction(
+                action_type=BrowserActionType.FILL,
+                observed_control_id=password_control,
+                value_reference=password_reference,
+                description="Fill the password from its runtime reference",
+            ),
+            BrowserAction(
+                action_type=BrowserActionType.CLICK,
+                observed_control_id=submit_control,
+                description="Submit the login form",
+            ),
+        ]
+
+    def is_verification_code(control: SafeControlDescription) -> bool:
+        name = (control.get("name") or "").lower()
+        return control.get("autocomplete") == "one-time-code" or name in {
+            "code",
+            "otp",
+            "verification_code",
+            "verification-code",
+        }
+
+    def is_visible_continue(control: SafeControlDescription) -> bool:
+        return is_submit(control) and control.get("visible") is True
+
+    def is_verify_button(control: SafeControlDescription) -> bool:
+        return (
+            control.get("tag") == "button"
+            and control.get("type") == "button"
+            and control.get("visible") is False
+        )
+
+    code_control = _select_one_control(
+        controls,
+        "verification-code",
+        is_verification_code,
+    )
+    continue_control = _select_one_control(
+        controls,
+        "first-step submit",
+        is_visible_continue,
+    )
+    verify_control = _select_one_control(
+        controls,
+        "verification submit",
+        is_verify_button,
+    )
+    if second_factor_reference is None:
+        raise LoginFormDiscoveryError(
+            "A second-factor credential reference is required for this login flow"
+        )
 
     return [
         BrowserAction(
@@ -150,18 +270,29 @@ async def discover_login_form_actions(
             action_type=BrowserActionType.FILL,
             observed_control_id=username_control,
             value_reference=username_reference,
-            description="Fill the username from its runtime reference",
-        ),
-        BrowserAction(
-            action_type=BrowserActionType.FILL,
-            observed_control_id=password_control,
-            value_reference=password_reference,
-            description="Fill the password from its runtime reference",
+            description="Fill the username for the first authentication step",
         ),
         BrowserAction(
             action_type=BrowserActionType.CLICK,
-            observed_control_id=submit_control,
-            description="Submit the login form",
+            observed_control_id=continue_control,
+            description="Request the verification step",
+        ),
+        BrowserAction(
+            action_type=BrowserActionType.WAIT,
+            observed_control_id=code_control,
+            wait_for=ActionWaitCondition.CONTROL_VISIBLE,
+            description="Wait for the verification-code control",
+        ),
+        BrowserAction(
+            action_type=BrowserActionType.FILL,
+            observed_control_id=code_control,
+            value_reference=second_factor_reference,
+            description="Fill the second authentication factor",
+        ),
+        BrowserAction(
+            action_type=BrowserActionType.CLICK,
+            observed_control_id=verify_control,
+            description="Verify the second authentication factor",
         ),
     ]
 
@@ -182,6 +313,10 @@ async def _record_marker_observation(
     marker_selector: str,
 ) -> ProtectedResourceObservation:
     marker = page.locator(marker_selector)
+    try:
+        await marker.first.wait_for(state="visible", timeout=1500)
+    except PlaywrightTimeoutError:
+        pass
     marker_present = await marker.count() > 0 and await marker.first.is_visible()
     page_evidence = await recorder.record_page_state(scan_id, page)
     page_evidence.redacted_details["account_marker_present"] = marker_present
@@ -202,13 +337,15 @@ async def _execute_steps(
     runtime_secrets: RuntimeSecrets,
     scan_id: UUID,
     steps: list[BrowserAction],
-) -> tuple[list[EvidenceEvent], list[TrafficReference]]:
+) -> tuple[list[EvidenceEvent], list[TrafficReference], dict[str, str]]:
     events: list[EvidenceEvent] = []
     traffic: list[TrafficReference] = []
+    control_signatures: dict[str, str] = {}
     executor = BrowserActionExecutor(page, target, runtime_secrets, scan_id)
     for action in steps:
         _collect_result(await executor.execute(action), events, traffic)
-    return events, traffic
+        await _capture_control_signatures(page, control_signatures)
+    return events, traffic, control_signatures
 
 
 async def record_guided_flow(
@@ -230,7 +367,7 @@ async def record_guided_flow(
         context = await _new_context(browser)
         try:
             page = await context.new_page()
-            events, traffic = await _execute_steps(
+            events, traffic, _control_signatures = await _execute_steps(
                 page=page,
                 target=target,
                 runtime_secrets=runtime_secrets,
@@ -242,6 +379,40 @@ async def record_guided_flow(
                 events=events,
                 traffic=traffic,
             )
+        finally:
+            await context.close()
+            await browser.close()
+
+
+async def observe_guidance_page(
+    *,
+    scan_id: UUID,
+    target: TargetScope,
+    observation_url: str | None = None,
+) -> GuidedPageObservation:
+    """Open the target once and return only safe control metadata for guidance."""
+
+    page_url = observation_url or str(target.target_url)
+    if not url_is_in_scope(page_url, target):
+        raise ValueError("The guidance observation URL is outside permitted_origins")
+
+    recorder = PlaywrightWorker()
+    runtime_secrets = RuntimeSecrets({})
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        context = await _new_context(browser)
+        try:
+            page = await context.new_page()
+            executor = BrowserActionExecutor(page, target, runtime_secrets, scan_id)
+            navigation = BrowserAction(
+                action_type=BrowserActionType.NAVIGATE,
+                url=page_url,
+                description="Open the target page for guided discovery",
+            )
+            await executor.execute(navigation)
+            event = await recorder.record_page_state(scan_id, page)
+            controls = event.redacted_details.get("controls", [])
+            return GuidedPageObservation(event=event, controls=controls)
         finally:
             await context.close()
             await browser.close()
@@ -275,7 +446,7 @@ async def execute_guided_verified_login_flow(
         anonymous_context: BrowserContext | None = None
         try:
             authenticated_page = await authenticated_context.new_page()
-            action_events, action_traffic = await _execute_steps(
+            action_events, action_traffic, control_signatures = await _execute_steps(
                 page=authenticated_page,
                 target=target,
                 runtime_secrets=runtime_secrets,
@@ -290,7 +461,7 @@ async def execute_guided_verified_login_flow(
                 url=protected_resource,
                 description="Open the protected resource after guided login",
             )
-            protected_events, protected_traffic = await _execute_steps(
+            protected_events, protected_traffic, _ = await _execute_steps(
                 page=authenticated_page,
                 target=target,
                 runtime_secrets=runtime_secrets,
@@ -320,7 +491,7 @@ async def execute_guided_verified_login_flow(
                 url=protected_resource,
                 description="Open the protected resource anonymously",
             )
-            anonymous_events, anonymous_traffic = await _execute_steps(
+            anonymous_events, anonymous_traffic, _ = await _execute_steps(
                 page=anonymous_page,
                 target=target,
                 runtime_secrets=RuntimeSecrets({}),
@@ -341,12 +512,15 @@ async def execute_guided_verified_login_flow(
                 target=target,
                 login_steps=recorded_actions,
                 protected_resource=protected_resource,
-                account_marker_description=account_marker_description,
+                account_marker_description=runtime_secrets.redact_text(
+                    account_marker_description
+                ),
                 authenticated_observation=authenticated_observation,
                 anonymous_observation=anonymous_observation,
                 discovery_source=DiscoverySource.GUIDED,
                 traffic=traffic,
                 session_references=session_references,
+                control_signatures=control_signatures,
             )
             return VerifiedLoginExecution(
                 profile=profile,
@@ -358,6 +532,78 @@ async def execute_guided_verified_login_flow(
                 await anonymous_context.close()
             await authenticated_context.close()
             await browser.close()
+
+
+async def revalidate_auth_profile(
+    *,
+    profile: AuthProfile,
+    scan_id: UUID,
+) -> None:
+    """Confirm that a saved flow still describes the current login page."""
+
+    login_steps = profile.authentication_steps.get(AuthFeature.LOGIN, [])
+    if not login_steps:
+        raise StaleAuthProfileError("The saved login flow has no login steps")
+    if not profile.control_signatures:
+        raise StaleAuthProfileError(
+            "The saved login flow has no page-control signatures; guidance is required"
+        )
+
+    navigation = next(
+        (
+            action
+            for action in login_steps
+            if action.action_type is BrowserActionType.NAVIGATE
+            and action.url is not None
+        ),
+        None,
+    )
+    if navigation is None or navigation.url is None:
+        raise StaleAuthProfileError(
+            "The saved login flow has no valid login-page navigation"
+        )
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        context = await _new_context(browser)
+        try:
+            page = await context.new_page()
+            executor = BrowserActionExecutor(
+                page,
+                profile.target,
+                RuntimeSecrets({}),
+                scan_id,
+            )
+            await executor.execute(navigation)
+            current_controls = await PlaywrightWorker().read_controls(page)
+            current_signatures = {
+                _control_id(control): _control_signature(control)
+                for control in current_controls
+            }
+        finally:
+            await context.close()
+            await browser.close()
+
+    expected_ids = set(profile.control_signatures)
+    current_ids = set(current_signatures)
+    missing_ids = sorted(expected_ids - current_ids)
+    added_ids = sorted(current_ids - expected_ids)
+    changed_ids = sorted(
+        control_id
+        for control_id in expected_ids & current_ids
+        if profile.control_signatures[control_id] != current_signatures[control_id]
+    )
+    if missing_ids or added_ids or changed_ids:
+        differences: list[str] = []
+        if missing_ids:
+            differences.append(f"missing {', '.join(missing_ids)}")
+        if added_ids:
+            differences.append(f"new {', '.join(added_ids)}")
+        if changed_ids:
+            differences.append(f"changed {', '.join(changed_ids)}")
+        raise StaleAuthProfileError(
+            "The saved login flow is stale: " + "; ".join(differences)
+        )
 
 
 async def replay_verified_auth_profile(
@@ -396,7 +642,7 @@ async def replay_verified_auth_profile(
         anonymous_context: BrowserContext | None = None
         try:
             authenticated_page = await authenticated_context.new_page()
-            action_events, action_traffic = await _execute_steps(
+            action_events, action_traffic, _ = await _execute_steps(
                 page=authenticated_page,
                 target=target,
                 runtime_secrets=runtime_secrets,
@@ -410,7 +656,7 @@ async def replay_verified_auth_profile(
                 url=protected_resource,
                 description="Open the saved protected resource",
             )
-            protected_events, protected_traffic = await _execute_steps(
+            protected_events, protected_traffic, _ = await _execute_steps(
                 page=authenticated_page,
                 target=target,
                 runtime_secrets=runtime_secrets,
@@ -440,7 +686,7 @@ async def replay_verified_auth_profile(
                 url=protected_resource,
                 description="Open the saved resource anonymously",
             )
-            anonymous_events, anonymous_traffic = await _execute_steps(
+            anonymous_events, anonymous_traffic, _ = await _execute_steps(
                 page=anonymous_page,
                 target=target,
                 runtime_secrets=RuntimeSecrets({}),
@@ -464,12 +710,15 @@ async def replay_verified_auth_profile(
                 target=target,
                 login_steps=replayed_steps,
                 protected_resource=protected_resource,
-                account_marker_description=protected_check.account_marker_description,
+                account_marker_description=runtime_secrets.redact_text(
+                    protected_check.account_marker_description
+                ),
                 authenticated_observation=authenticated_observation,
                 anonymous_observation=anonymous_observation,
                 discovery_source=source,
                 traffic=traffic,
                 session_references=session_references,
+                control_signatures=profile.control_signatures,
             )
             return VerifiedLoginExecution(
                 profile=replayed_profile,
@@ -490,6 +739,7 @@ async def execute_verified_login_flow(
     runtime_secrets: RuntimeSecrets,
     username_reference: str,
     password_reference: str,
+    second_factor_reference: str | None = None,
     protected_resource: str,
     account_marker_selector: str,
     account_marker_description: str,
@@ -527,12 +777,15 @@ async def execute_verified_login_flow(
             _collect_result(
                 await authenticated_executor.execute(navigation), events, traffic
             )
+            control_signatures: dict[str, str] = {}
+            await _capture_control_signatures(authenticated_page, control_signatures)
 
             discovered_steps = await discover_login_form_actions(
                 authenticated_page,
                 target,
                 username_reference,
                 password_reference,
+                second_factor_reference,
             )
             login_steps = [navigation, *discovered_steps[1:]]
             for action in discovered_steps[1:]:
@@ -592,12 +845,15 @@ async def execute_verified_login_flow(
                 target=target,
                 login_steps=login_steps,
                 protected_resource=protected_resource,
-                account_marker_description=account_marker_description,
+                account_marker_description=runtime_secrets.redact_text(
+                    account_marker_description
+                ),
                 authenticated_observation=authenticated_observation,
                 anonymous_observation=anonymous_observation,
                 discovery_source=discovery_source,
                 traffic=traffic,
                 session_references=session_references,
+                control_signatures=control_signatures,
             )
             return VerifiedLoginExecution(
                 profile=profile,

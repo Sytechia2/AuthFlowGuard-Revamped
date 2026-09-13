@@ -11,11 +11,13 @@ from uuid import uuid4
 import pytest
 import uvicorn
 from authflowguard.authentication import (
+    StaleAuthProfileError,
     VerifiedLoginExecution,
     execute_guided_verified_login_flow,
     execute_verified_login_flow,
     record_guided_flow,
     replay_verified_auth_profile,
+    revalidate_auth_profile,
 )
 from authflowguard.controlled_app import (
     KNOWN_PASSWORD,
@@ -257,3 +259,24 @@ def test_profile_replay_rejects_unverified_or_incomplete_profiles() -> None:
                 account_marker_selector="#marker",
             )
         )
+
+
+def test_saved_profile_revalidation_rejects_changed_control_metadata() -> None:
+    with run_controlled_server() as origin:
+        result = asyncio.run(run_verified_flow(origin))
+        asyncio.run(
+            revalidate_auth_profile(
+                profile=result.profile,
+                scan_id=uuid4(),
+            )
+        )
+        changed_profile = result.profile.model_copy(deep=True)
+        changed_profile.control_signatures["control-5"] = "changed"
+
+        with pytest.raises(StaleAuthProfileError, match="stale.*changed"):
+            asyncio.run(
+                revalidate_auth_profile(
+                    profile=changed_profile,
+                    scan_id=uuid4(),
+                )
+            )

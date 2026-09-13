@@ -6,7 +6,16 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from uuid import UUID, uuid4
 
-from playwright.async_api import Locator, Page, Request, Response, Route
+from playwright.async_api import (
+    Locator,
+    Page,
+    Request,
+    Response,
+    Route,
+)
+from playwright.async_api import (
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 from authflowguard.models import (
     ActionWaitCondition,
@@ -239,6 +248,15 @@ class BrowserActionExecutor:
             )
 
     async def _take_page_snapshot(self) -> PageSnapshot:
+        try:
+            await self._page.wait_for_load_state(
+                "domcontentloaded",
+                timeout=3000,
+            )
+        except PlaywrightTimeoutError:
+            # A single-page application may keep work pending after a click;
+            # snapshot the current DOM rather than blocking indefinitely.
+            pass
         controls = self._page.locator(CONTROL_SELECTOR)
         visible_control_ids: list[str] = []
         safe_control_states: list[dict[str, object]] = []
@@ -356,6 +374,15 @@ class BrowserActionExecutor:
     async def _click(self, action: BrowserAction) -> None:
         control = await self._find_control(action.observed_control_id)
         await control.click()
+        try:
+            await self._page.wait_for_load_state(
+                "domcontentloaded",
+                timeout=3000,
+            )
+        except PlaywrightTimeoutError:
+            # Most application clicks are AJAX or state-only updates. The
+            # timeout is only a guard for navigations that never settle.
+            pass
 
     async def _fill(self, action: BrowserAction) -> None:
         control = await self._find_control(action.observed_control_id)

@@ -1,10 +1,29 @@
 """Tests for the local backend application."""
 
+import time
 from pathlib import Path
 from uuid import uuid4
 
 from authflowguard.app import app, create_app
-from authflowguard.models import CheckId
+from authflowguard.authentication import (
+    GuidedPageObservation,
+    LoginFormDiscoveryError,
+    VerifiedLoginExecution,
+)
+from authflowguard.models import (
+    AuthFeature,
+    AuthProfile,
+    BrowserAction,
+    BrowserActionType,
+    CheckId,
+    EvidenceEvent,
+    EvidenceKind,
+    FeatureStatus,
+    ProtectedResourceCheck,
+    ScanRequest,
+    TargetScope,
+)
+from authflowguard.scan_manager import ScanExecutionInput, ScanState
 from fastapi.testclient import TestClient
 
 
@@ -107,3 +126,231 @@ def test_scan_api_creates_reports_status_and_cancellation(tmp_path: Path) -> Non
 
     missing = client.get(f"/api/scans/{uuid4()}")
     assert missing.status_code == 404
+
+
+def test_automatic_discovery_failure_pauses_for_guidance(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+    created = client.post(
+        "/api/scans",
+        json={
+            "target": {
+                "target_url": "https://app.example/login",
+                "permitted_origins": ["https://app.example"],
+            },
+            "selected_checks": [CheckId.LOGIN_ENUMERATION.value],
+        },
+    )
+    scan_id = created.json()["scan_id"]
+
+    async def fail_automatic_discovery(*args, **kwargs):
+        raise LoginFormDiscoveryError("Expected one submit control, found 2")
+
+    monkeypatch.setattr(
+        "authflowguard.scan_manager.execute_verified_login_flow",
+        fail_automatic_discovery,
+    )
+    response = client.post(
+        f"/api/scans/{scan_id}/start",
+        json={
+            "runtime_secrets": {"username": "developer", "password": "secret"},
+            "username_reference": "username",
+            "password_reference": "password",
+            "nonexistent_identifier_reference": "missing",
+            "failure_password_reference": "failure",
+            "protected_resource": "https://app.example/account",
+            "account_marker_selector": "#marker",
+            "account_marker_description": "Account marker",
+        },
+    )
+    assert response.status_code == 200
+
+    for _ in range(100):
+        status = client.get(f"/api/scans/{scan_id}").json()
+        if status["state"] == ScanState.AWAITING_GUIDANCE.value:
+            break
+        time.sleep(0.01)
+    assert status["state"] == ScanState.AWAITING_GUIDANCE.value
+    assert status["guidance_required"] is True
+    assert "submit control" in status["error"]
+    assert "secret" not in (tmp_path / scan_id / "metadata.json").read_text()
+
+
+def test_new_scan_revalidates_and_reuses_a_matching_saved_profile(
+    tmp_path: Path, monkeypatch
+) -> None:
+    application = create_app(data_root=tmp_path)
+    manager = application.state.scan_manager
+    target = TargetScope(
+        target_url="https://app.example/login",
+        permitted_origins=["https://app.example"],
+    )
+    saved = manager.create_scan(
+        ScanRequest(
+            target=target,
+            selected_checks=[CheckId.REGISTRATION_ENUMERATION],
+        )
+    )
+    saved.state = ScanState.COMPLETED
+    saved.profile = AuthProfile(
+        target=target,
+        features={AuthFeature.LOGIN: FeatureStatus.VERIFIED},
+        authentication_steps={
+            AuthFeature.LOGIN: [
+                BrowserAction(
+                    action_type=BrowserActionType.NAVIGATE,
+                    url="https://app.example/login",
+                    description="Open login",
+                )
+            ]
+        },
+        control_signatures={"control-1": "stable-signature"},
+        protected_resource_check=ProtectedResourceCheck(
+            resource="https://app.example/account",
+            authenticated_evidence_ids=[uuid4()],
+            anonymous_evidence_ids=[uuid4()],
+            account_marker_description="Account marker",
+        ),
+    )
+    current = manager.create_scan(
+        ScanRequest(
+            target=target,
+            selected_checks=[CheckId.REGISTRATION_ENUMERATION],
+        )
+    )
+    calls: list[str] = []
+
+    async def fake_revalidate(**kwargs) -> None:
+        calls.append("revalidate")
+
+    async def fake_replay(**kwargs) -> VerifiedLoginExecution:
+        calls.append("replay")
+        return VerifiedLoginExecution(profile=saved.profile, events=[], traffic=[])
+
+    monkeypatch.setattr(
+        "authflowguard.scan_manager.revalidate_auth_profile", fake_revalidate
+    )
+    monkeypatch.setattr(
+        "authflowguard.scan_manager.replay_verified_auth_profile", fake_replay
+    )
+    monkeypatch.setattr(
+        "authflowguard.scan_manager.execute_verified_login_flow",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("automatic discovery should not run")
+        ),
+    )
+
+    manager.start_scan(
+        current.scan_id,
+        ScanExecutionInput(
+            runtime_secrets={},
+            username_reference="username",
+            password_reference="password",
+            nonexistent_identifier_reference="missing",
+            failure_password_reference="failure",
+            protected_resource="https://app.example/account",
+            account_marker_selector="#marker",
+            account_marker_description="Account marker",
+        ),
+    )
+    assert current.future is not None
+    current.future.result(timeout=5)
+
+    assert calls == ["revalidate", "replay"]
+    assert current.state is ScanState.COMPLETED
+
+
+def test_guidance_api_observes_safe_controls_and_accepts_structured_flow(
+    tmp_path: Path, monkeypatch
+) -> None:
+    application = create_app(data_root=tmp_path)
+    manager = application.state.scan_manager
+    record = manager.create_scan(
+        ScanRequest(
+            target={
+                "target_url": "https://app.example/login",
+                "permitted_origins": ["https://app.example"],
+            },
+            selected_checks=[CheckId.LOGIN_ENUMERATION],
+        )
+    )
+    record.state = ScanState.AWAITING_GUIDANCE
+    record.pending_execution = ScanExecutionInput(
+        runtime_secrets={"username": "developer", "password": "secret"},
+        username_reference="username",
+        password_reference="password",
+        nonexistent_identifier_reference="missing",
+        failure_password_reference="failure",
+        protected_resource="https://app.example/account",
+        account_marker_selector="#marker",
+        account_marker_description="Account marker",
+    )
+    manager._persist_state(record)
+
+    control = {
+        "observed_control_id": "control-1",
+        "tag": "input",
+        "id": "username",
+        "name": "username",
+        "type": "text",
+        "placeholder": None,
+        "autocomplete": "username",
+        "aria_label": None,
+        "value_present": False,
+        "visible": True,
+    }
+    event = EvidenceEvent(
+        event_id=uuid4(),
+        scan_id=record.scan_id,
+        kind=EvidenceKind.PAGE_STATE,
+        summary="Observed controls",
+        redacted_details={
+            "url": "https://app.example/login",
+            "title": "Login",
+            "controls": [control],
+        },
+    )
+
+    async def fake_observation(*args, **kwargs):
+        return GuidedPageObservation(event=event, controls=[control])
+
+    monkeypatch.setattr(
+        "authflowguard.scan_manager.observe_guidance_page", fake_observation
+    )
+    client = TestClient(application)
+
+    observed = client.post(f"/api/scans/{record.scan_id}/guidance/observe")
+    assert observed.status_code == 200
+    assert observed.json()["controls"][0]["observed_control_id"] == "control-1"
+
+    submitted = []
+    monkeypatch.setattr(
+        manager._executor,
+        "submit",
+        lambda *args: submitted.append(args),
+    )
+    guidance = client.post(
+        f"/api/scans/{record.scan_id}/guidance",
+        json={
+            "actions": [
+                {
+                    "action_type": "navigate",
+                    "url": "https://app.example/login?do-not-save=yes",
+                    "description": "Open the login page",
+                },
+                {
+                    "action_type": "fill",
+                    "observed_control_id": "control-1",
+                    "value_reference": "username",
+                    "description": "Fill the username",
+                },
+            ]
+        },
+    )
+    assert guidance.status_code == 200
+    assert guidance.json()["state"] == ScanState.RUNNING.value
+    assert len(submitted) == 1
+    assert str(submitted[0][3].actions[0].url) == (
+        "https://app.example/login?do-not-save=yes"
+    )

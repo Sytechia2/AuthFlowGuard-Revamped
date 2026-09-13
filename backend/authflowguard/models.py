@@ -246,6 +246,7 @@ class AuthProfile(ContractModel):
     )
     relevant_traffic: list[TrafficReference] = Field(default_factory=list)
     session_references: list[SessionReference] = Field(default_factory=list)
+    control_signatures: dict[str, str] = Field(default_factory=dict)
     protected_resource_check: ProtectedResourceCheck | None = None
     discovery_history: list[DiscoveryRecord] = Field(default_factory=list)
 

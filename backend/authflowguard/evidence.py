@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from authflowguard.models import (
     SCHEMA_VERSION,
+    AuthProfile,
     CheckResult,
     EvidenceEvent,
     TestRunEvidence,
@@ -161,6 +162,24 @@ class EvidenceStore:
         path = results_dir / f"result-v{version}.json"
         self._write_json(path, result_data)
         return version, path
+
+    def save_profile(self, scan_id: UUID, profile: AuthProfile) -> Path:
+        """Save the verified, nonsecret authentication profile for a scan."""
+
+        path = self._scan_dir(scan_id) / "auth-profile.json"
+        self._write_json(
+            path,
+            redact_persisted_data(profile.model_dump(mode="json"), self._secret_values),
+        )
+        return path
+
+    def read_profile(self, scan_id: UUID) -> AuthProfile | None:
+        """Read a saved authentication profile, if this scan has one."""
+
+        path = self._scan_dir(scan_id) / "auth-profile.json"
+        if not path.exists():
+            return None
+        return AuthProfile.model_validate_json(path.read_text(encoding="utf-8"))
 
     def read_results(self, scan_id: UUID) -> list[dict[str, Any]]:
         results_dir = self._scan_dir(scan_id) / "results"
