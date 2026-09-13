@@ -111,6 +111,9 @@ def test_worker_records_controls_and_nonsecret_session_references() -> None:
     ]
     assert controls[0]["name"] == "username"
     assert controls[1]["type"] == "password"
+    assert controls[0]["value_present"] is True
+    assert controls[1]["value_present"] is False
+    assert all(control["visible"] for control in controls)
     assert all("value" not in control for control in controls)
 
     storage_types = {

@@ -10,6 +10,7 @@ from authflowguard.bedrock import (
     ObservedControlForModel,
     PageObservationForModel,
 )
+from authflowguard.models import BrowserActionType
 
 
 def read_arguments() -> argparse.Namespace:
@@ -49,6 +50,7 @@ def main() -> None:
                 name="username",
                 control_type="text",
                 autocomplete="username",
+                allowed_actions=[BrowserActionType.FILL, BrowserActionType.PRESS_KEY],
             )
         ],
         credential_references=["known-account-username"],

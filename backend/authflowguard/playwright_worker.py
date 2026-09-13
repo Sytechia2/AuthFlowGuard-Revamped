@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from hashlib import sha256
+from typing import TypedDict
 from uuid import UUID, uuid4
 
 from playwright.async_api import (
@@ -30,6 +31,21 @@ class PlaywrightObservation:
     events: list[EvidenceEvent]
     traffic: list[TrafficReference]
     session_references: list[SessionReference]
+
+
+class SafeControlDescription(TypedDict):
+    """Control metadata safe to persist or include in a model request."""
+
+    observed_control_id: str
+    tag: str
+    id: str | None
+    name: str | None
+    type: str | None
+    placeholder: str | None
+    autocomplete: str | None
+    aria_label: str | None
+    value_present: bool | None
+    visible: bool
 
 
 class PlaywrightWorker:
@@ -120,10 +136,10 @@ class PlaywrightWorker:
         await page.goto(str(target.target_url), wait_until="domcontentloaded")
         await page.wait_for_timeout(50)
 
-        page_event = await self._record_page_state(scan_id, page)
+        page_event = await self.record_page_state(scan_id, page)
         events.append(page_event)
 
-        storage_event, session_references = await self._record_session_state(
+        storage_event, session_references = await self.record_session_state(
             scan_id,
             context,
             page,
@@ -136,12 +152,12 @@ class PlaywrightWorker:
             session_references=session_references,
         )
 
-    async def _record_page_state(
+    async def record_page_state(
         self,
         scan_id: UUID,
         page: Page,
     ) -> EvidenceEvent:
-        controls = await self._read_controls(page)
+        controls = await self.read_controls(page)
 
         return EvidenceEvent(
             event_id=uuid4(),
@@ -155,35 +171,49 @@ class PlaywrightWorker:
             },
         )
 
-    async def _read_controls(self, page: Page) -> list[dict[str, str | None]]:
+    async def read_controls(self, page: Page) -> list[SafeControlDescription]:
+        """Describe controls without reading their live values."""
         locator = page.locator("input, button, select, textarea, a[href]")
-        controls: list[dict[str, str | None]] = []
+        controls: list[SafeControlDescription] = []
 
         for index in range(await locator.count()):
             control = locator.nth(index)
+            tag = await control.evaluate("element => element.tagName.toLowerCase()")
+            control_type = await control.get_attribute("type")
+            value_present: bool | None = None
+            if tag in {"input", "textarea"} and control_type not in {
+                "button",
+                "checkbox",
+                "file",
+                "radio",
+                "reset",
+                "submit",
+            }:
+                value_present = bool(await control.input_value())
             controls.append(
                 {
                     "observed_control_id": f"control-{index + 1}",
-                    "tag": await control.evaluate(
-                        "element => element.tagName.toLowerCase()"
-                    ),
+                    "tag": tag,
                     "id": await control.get_attribute("id"),
                     "name": await control.get_attribute("name"),
-                    "type": await control.get_attribute("type"),
+                    "type": control_type,
                     "placeholder": await control.get_attribute("placeholder"),
                     "autocomplete": await control.get_attribute("autocomplete"),
                     "aria_label": await control.get_attribute("aria-label"),
+                    "value_present": value_present,
+                    "visible": await control.is_visible(),
                 }
             )
 
         return controls
 
-    async def _record_session_state(
+    async def record_session_state(
         self,
         scan_id: UUID,
         context: BrowserContext,
         page: Page,
     ) -> tuple[EvidenceEvent, list[SessionReference]]:
+        """Fingerprint session state without returning any live values."""
         storage_event = EvidenceEvent(
             event_id=uuid4(),
             scan_id=scan_id,
