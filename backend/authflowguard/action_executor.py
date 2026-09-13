@@ -7,6 +7,9 @@ from hashlib import sha256
 from uuid import UUID, uuid4
 
 from playwright.async_api import (
+    Error as PlaywrightError,
+)
+from playwright.async_api import (
     Locator,
     Page,
     Request,
@@ -257,35 +260,50 @@ class BrowserActionExecutor:
             # A single-page application may keep work pending after a click;
             # snapshot the current DOM rather than blocking indefinitely.
             pass
-        controls = self._page.locator(CONTROL_SELECTOR)
-        visible_control_ids: list[str] = []
-        safe_control_states: list[dict[str, object]] = []
-
-        for index in range(await controls.count()):
-            control = controls.nth(index)
-            control_id = f"control-{index + 1}"
-            is_visible = await control.is_visible()
-            if is_visible:
-                visible_control_ids.append(f"control-{index + 1}")
-
-            tag_name = await control.evaluate(
-                "element => element.tagName.toLowerCase()"
-            )
-            control_type = await control.get_attribute("type")
-            state: dict[str, object] = {
-                "observed_control_id": control_id,
-                "visible": is_visible,
-                "disabled": await control.is_disabled(),
-            }
-
-            if tag_name == "select":
-                state["selected_option"] = await control.input_value()
-            elif control_type in {"checkbox", "radio"}:
-                state["checked"] = await control.is_checked()
-
-            safe_control_states.append(state)
-
-        visible_text = await self._page.locator("body").inner_text()
+        # Read a single DOM revision. Per-control awaits can span a redirect,
+        # leaving nth(index) waiting for a control absent from the new page.
+        for attempt in range(2):
+            try:
+                snapshot = await self._page.evaluate(
+                    """selector => {
+                        const controls = [...document.querySelectorAll(selector)]
+                            .map((element, index) => {
+                                const rect = element.getBoundingClientRect();
+                                const style = getComputedStyle(element);
+                                const state = {
+                                    observed_control_id: `control-${index + 1}`,
+                                    visible: rect.width > 0 && rect.height > 0
+                                        && style.visibility !== 'hidden'
+                                        && style.visibility !== 'collapse',
+                                    disabled: element.matches(':disabled')
+                                        || !!element.closest('[aria-disabled="true"]')
+                                };
+                                if (element.tagName === 'SELECT') {
+                                    state.selected_option = element.value;
+                                } else if (
+                                    ['checkbox', 'radio'].includes(element.type)
+                                ) {
+                                    state.checked = element.checked;
+                                }
+                                return state;
+                            });
+                        return {controls, url: location.href, title: document.title,
+                                text: document.body?.innerText ?? ''};
+                    }""",
+                    CONTROL_SELECTOR,
+                )
+                break
+            except PlaywrightError as error:
+                if attempt or "Execution context was destroyed" not in str(error):
+                    raise
+                await self._page.wait_for_load_state("domcontentloaded", timeout=3000)
+        safe_control_states = snapshot["controls"]
+        visible_control_ids = [
+            state["observed_control_id"]
+            for state in safe_control_states
+            if state["visible"]
+        ]
+        visible_text = snapshot["text"]
         normalized_text = " ".join(visible_text.split())
         text_fingerprint = sha256(normalized_text.encode("utf-8")).hexdigest()
         serialized_control_states = json.dumps(
@@ -298,8 +316,8 @@ class BrowserActionExecutor:
         ).hexdigest()
 
         return PageSnapshot(
-            url=url_without_query_or_fragment(self._page.url),
-            title=await self._page.title(),
+            url=url_without_query_or_fragment(snapshot["url"]),
+            title=snapshot["title"],
             visible_control_ids=visible_control_ids,
             visible_text_fingerprint=text_fingerprint,
             control_state_fingerprint=control_state_fingerprint,

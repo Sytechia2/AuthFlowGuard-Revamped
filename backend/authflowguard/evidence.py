@@ -186,7 +186,10 @@ class EvidenceStore:
         if not results_dir.exists():
             return []
         results: list[dict[str, Any]] = []
-        for path in sorted(results_dir.glob("result-v*.json")):
+        for path in sorted(
+            results_dir.glob("result-v*.json"),
+            key=lambda path: int(path.stem.removeprefix("result-v")),
+        ):
             results.append(json.loads(path.read_text(encoding="utf-8")))
         return results
 

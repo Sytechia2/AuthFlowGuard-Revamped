@@ -9,6 +9,13 @@ from uuid import UUID
 from authflowguard.evidence import EvidenceStore
 from authflowguard.models import CheckResult, TestRunEvidence
 
+CHECK_CODES = {
+    "login_enumeration": "CHK-001",
+    "registration_enumeration": "CHK-002",
+    "reset_request_enumeration": "CHK-003",
+    "login_throttling": "CHK-004",
+}
+
 
 def build_json_report(
     metadata: Mapping[str, Any],
@@ -112,9 +119,10 @@ def _result_html(result: Mapping[str, Any]) -> str:
     outcome = str(result.get("outcome", "unknown"))
     explanation = html.escape(str(result.get("explanation", "")))
     check_id = html.escape(str(result.get("check_id", "unknown")))
+    check_code = CHECK_CODES.get(str(result.get("check_id")), "")
     reference = html.escape(str(result.get("owasp_reference", "")))
     return (
-        f'<section><h3 class="{html.escape(outcome)}">{check_id}</h3>'
+        f'<section><h3 class="{html.escape(outcome)}">{check_code} {check_id}</h3>'
         f"<p><strong>Outcome:</strong> {html.escape(outcome)}</p>"
         f"<p><strong>OWASP:</strong> {reference}</p><p>{explanation}</p></section>"
     )

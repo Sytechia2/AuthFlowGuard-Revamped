@@ -212,8 +212,8 @@ Use these Setup values:
 - Authenticated marker selector: `[data-testid="account-marker"]`
 
 Select **Login account enumeration** and start the scan. When Testing shows
-`awaiting_guidance`, open **Discovery**. Set **Page to observe** to
-`http://127.0.0.1:8001/login`, then choose **Observe target controls**.
+`awaiting_guidance`, open **Discovery**. Set **Login page address** to
+`http://127.0.0.1:8001/login`, then choose **Find login fields**.
 
 For the bundled controlled application, the visible login controls are currently:
 
@@ -223,7 +223,8 @@ control-6  password field
 control-7  submit button
 ```
 
-Enter this four-step flow:
+Choose the username/email field, password field, and sign-in button from the
+dropdowns. The backend records this four-step flow using the selected references:
 
 ```text
 Navigate → http://127.0.0.1:8001/login
@@ -293,3 +294,139 @@ If the profile is stale—or was created by an older version without control
 signatures—the new scan pauses in `awaiting_guidance`. Open Discovery, find the
 current login fields, choose the controls again, and submit the guided flow. The
 stale profile is never replayed.
+
+## 12. Registration and Reset-Request Enumeration
+
+CHK-002 (`registration_enumeration`) and CHK-003
+(`reset_request_enumeration`) use WSTG-IDNT-04. Both execute native HTML POST
+forms through Playwright, then analyse the captured evidence offline. Each check
+submits one known identifier and one nonexistent identifier in separate, fresh
+browser contexts. Each form GET obtains its own CSRF token and cookie session;
+neither is replayed between attempts. These checks do not assess timing or
+establish repeatability beyond the single captured pair.
+
+Registration can create an account, including in the secure evaluation fixture.
+Use a **fresh disposable nonexistent identifier for each scan**, or restart the
+controlled application to reset its in-memory state. Tests create an isolated
+application instance per scenario. Within a scan, login enumeration runs first,
+reset-request enumeration next, and registration last, regardless of the order
+selected. This prevents registration from changing the nonexistent account used
+by the earlier checks. The runner does not delete accounts from arbitrary targets.
+
+The runner finds an unambiguous visible registration/reset link on the saved
+login page; it does not assume fixed endpoint paths. The bundled fixture links
+to `GET/POST /register` and `GET/POST /reset`. Only a single visible native POST
+form with an identifiable username/email control and submit button is supported;
+registration additionally requires one password field. Missing/ambiguous forms,
+blocked navigation, timeouts, unexpected HTTP errors, and cancellation produce
+`execution_error`, not a secure result. Custom JSON/SPA registration and reset
+flows are outside this implementation.
+
+For API callers, the start request optionally accepts `registration_url` and
+`reset_request_url` to identify an in-scope form explicitly. An optional
+`registration_password_reference` resolves a disposable registration password
+from `runtime_secrets`; otherwise `failure_password_reference` is reused. In
+Setup, the **Invalid password** field therefore also supplies the disposable
+registration password. Choose a value satisfying the target's registration rules.
+
+### Evidence and outcomes
+
+Both checks use the existing `TestRunEvidence` format with labelled
+`known_identifier_attempt` and `nonexistent_identifier_attempt` observations.
+They retain POST/final status codes, normalized body/title/redirect-path and
+control-state fingerprints, fixed message categories, event references,
+completed/attempted steps, errors, and coverage limitations. Raw response text,
+usernames, passwords, CSRF values, cookies, and authorization headers are not
+stored. Hidden form values, labelled tokens/request IDs, UUIDs and timestamps
+are normalized before hashing. Arbitrary unrecognized dynamic content remains
+a stated limitation.
+
+| Check | Vulnerable fixture | Secure fixture |
+| --- | --- | --- |
+| CHK-002 | Known: 409/already registered; nonexistent: 202/check email → `finding_confirmed` | Both: 202/check email → `no_issue_observed` |
+| CHK-003 | Known: generic reset instructions; nonexistent: no account exists → `finding_confirmed` | Both: generic reset instructions → `no_issue_observed` |
+
+Incomplete or malformed evidence is `inconclusive`. Captured browser failures or
+unexpected HTTP error statuses are `execution_error`. With account-existence
+privacy disabled in policy, successful comparisons produce `no_issue_observed`.
+Both new analysers produce identical full results for identical evidence, policy,
+and analyser version, including stable result IDs and evidence capture timestamps.
+
+### Manual walkthrough
+
+1. Start the secure controlled app on port 8001, the backend on port 8080, and
+   the frontend as described above. Use the normal `/login` Setup values with
+   `developer@example.test` / `correct-horse-battery-staple`, protected resource
+   `/account`, and marker `[data-testid="account-marker"]`.
+2. Supply a fresh nonexistent identifier such as `scan-001@example.test` and a
+   disposable registration password in **Invalid password**.
+3. Select **Registration account enumeration** and **Reset-request account
+   enumeration** only. Start the scan and open Results after completion. Both
+   checks should show `no_issue_observed`; JSON and HTML reports include both.
+4. Repeat on a fresh vulnerable fixture on port 8002, changing all three URLs
+   (target, permitted origin, protected resource). Both should show
+   `finding_confirmed` with the differences listed above.
+5. The same checks run after guided login verification. Follow Section 9 to
+   exercise that route. A stale saved login profile still pauses for guidance
+   before any check executes.
+
+### Offline reanalysis API
+
+`POST /api/scans/{scan_id}/reanalyse` now processes **every stored evidence
+record**, dispatching by check ID for CHK-001 through CHK-004. Its response
+has changed from a single result to:
+
+```json
+{"scan_id": "<scan UUID>", "results": ["<one result object per evidence record>"]}
+```
+
+No browser, network, runtime credentials, or model service is used. Each result
+is saved as a new version; existing evidence and result-version files are retained.
+Scan status and reports expose the latest result for each evidence record rather
+than accumulating duplicate current results. This remains true after a backend
+restart. Reanalysis is rejected while the scan is running or awaiting guidance.
+
+`test_form_enumeration.py` covers both browser/analyser matrices, fresh CSRF and
+session isolation, dynamic normalization, redaction, nonstandard routes, failures,
+cancellation, and deterministic offline analysis. `test_enumeration_scans.py`
+covers check selection, automatic/guided secure/vulnerable scans, ordering,
+persisted reports, stale flows, and reanalysis of multiple checks/evidence records.
+
+The full regression run also exposed a shared snapshot race during the existing
+two-step login: navigation could replace controls between individual reads.
+`BrowserActionExecutor` now captures one DOM revision per snapshot, with a bounded
+retry if navigation destroys the execution context. `test_action_executor.py`
+checks snapshot consistency while the page repeatedly replaces its controls.
+
+Final verification for this batch: **167 backend tests and 10 frontend tests
+passed**. Ruff formatting/lint, mypy, Prettier, ESLint, TypeScript, the production
+build, and `git diff --check` passed. The backend retains the existing
+Starlette/TestClient anyio deprecation warning.
+
+## 13. Login Throttling and Lockout (CHK-004)
+
+CHK-004 follows WSTG-ATHN-03. After login has been verified, the browser runner
+performs a bounded sequence of failed-password attempts, creating a fresh
+browser context for every attempt. It then submits the known password as a
+valid-login control. The runner records status codes, normalized URL/title/body
+fingerprints, safe indicators such as `rate_limited` and `signed_in`, attempted
+and completed steps, and execution errors. Passwords, response bodies, cookies,
+and authorization data are never saved.
+
+The default sequence contains three failed attempts and one valid control. A
+`SecurityPolicy.expected_lockout_threshold` can lower or raise the attempt count,
+with a hard cap of five attempts. A restricted valid control (401, 403, 423, or
+429, or a rate-limit indicator) is `no_issue_observed`; a successful control
+after all bounded failures is `finding_confirmed`. Missing or malformed attempt
+records are `inconclusive`, while browser failures, cancellation, and unexpected
+server-error statuses are `execution_error`. The analyser is offline and
+deterministic, including its result ID and evidence capture timestamp.
+
+For a manual run, start the secure controlled app and select **Login throttling
+and lockout** in Setup. Use the verified login credentials and the existing
+Invalid password reference. The secure fixture should restrict the valid
+control after three failed attempts. Repeat against the vulnerable fixture; the
+valid control succeeds and the result should be `finding_confirmed`. JSON and
+HTML reports include CHK-004, its WSTG reference, attempt coverage, and any
+limitations. Reanalysis of the saved scan does not launch a browser or resolve
+runtime credentials.

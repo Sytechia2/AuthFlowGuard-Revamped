@@ -309,3 +309,43 @@ async def verify_executor_rejects_stale_references(origin: str) -> None:
 def test_executor_rejects_missing_secrets_and_stale_controls() -> None:
     with run_action_server() as origin:
         asyncio.run(verify_executor_rejects_stale_references(origin))
+
+
+def test_snapshot_remains_consistent_while_page_replaces_its_controls() -> None:
+    async def snapshot_changing_page() -> None:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page()
+            page.set_default_timeout(1000)
+            try:
+                await page.set_content("<title>empty</title><body></body>")
+                await page.evaluate("""() => {
+                    let populated = false;
+                    window.snapshotTimer = setInterval(() => {
+                        populated = !populated;
+                        document.title = populated ? 'populated' : 'empty';
+                        document.body.innerHTML = populated
+                            ? '<input><input><button>Continue</button>' : '';
+                    }, 1);
+                }""")
+                executor = BrowserActionExecutor(
+                    page,
+                    TargetScope(
+                        target_url="https://app.example/login",
+                        permitted_origins=["https://app.example"],
+                    ),
+                    RuntimeSecrets({}),
+                    uuid4(),
+                )
+                for _ in range(20):
+                    snapshot = await executor._take_page_snapshot()
+                    expected = (
+                        ["control-1", "control-2", "control-3"]
+                        if snapshot.title == "populated"
+                        else []
+                    )
+                    assert snapshot.visible_control_ids == expected
+            finally:
+                await browser.close()
+
+    asyncio.run(snapshot_changing_page())

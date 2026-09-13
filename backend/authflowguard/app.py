@@ -114,10 +114,13 @@ def create_app(
     @application.post("/api/scans/{scan_id}/reanalyse")
     async def reanalyse_scan(scan_id: UUID) -> dict[str, object]:
         try:
-            result = scan_manager.reanalyse(scan_id)
+            results = scan_manager.reanalyse(scan_id)
         except (KeyError, ValueError, FileNotFoundError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
-        return result.model_dump(mode="json")
+        return {
+            "scan_id": str(scan_id),
+            "results": [result.model_dump(mode="json") for result in results],
+        }
 
     @application.get("/api/scans/{scan_id}/report/{extension}")
     async def download_report(scan_id: UUID, extension: str) -> FileResponse:

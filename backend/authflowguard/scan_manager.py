@@ -22,9 +22,24 @@ from authflowguard.authentication import (
     replay_verified_auth_profile,
     revalidate_auth_profile,
 )
+from authflowguard.checks.form_enumeration import FormEnumerationRun
 from authflowguard.checks.login_enumeration import (
+    LoginEnumerationRun,
     analyse_login_enumeration,
     run_login_enumeration_check,
+)
+from authflowguard.checks.login_throttling import (
+    LoginThrottlingRun,
+    analyse_login_throttling,
+    run_login_throttling_check,
+)
+from authflowguard.checks.registration_enumeration import (
+    analyse_registration_enumeration,
+    run_registration_enumeration_check,
+)
+from authflowguard.checks.reset_request_enumeration import (
+    analyse_reset_request_enumeration,
+    run_reset_request_enumeration_check,
 )
 from authflowguard.evidence import EvidenceStore
 from authflowguard.models import (
@@ -40,6 +55,26 @@ from authflowguard.models import (
 from authflowguard.reports import export_scan_reports
 from authflowguard.scope import url_without_query_or_fragment
 from authflowguard.secrets import RuntimeSecrets
+
+ANALYSERS = {
+    CheckId.LOGIN_ENUMERATION: analyse_login_enumeration,
+    CheckId.REGISTRATION_ENUMERATION: analyse_registration_enumeration,
+    CheckId.RESET_REQUEST_ENUMERATION: analyse_reset_request_enumeration,
+    CheckId.LOGIN_THROTTLING: analyse_login_throttling,
+}
+
+
+def _latest_results(results: list[CheckResult]) -> list[CheckResult]:
+    """Keep version history on disk, but expose one current result per evidence."""
+    latest = {}
+    for result in results:
+        evidence_id = (
+            result.evidence_references[0]
+            if result.evidence_references
+            else result.result_id
+        )
+        latest[(result.check_id, evidence_id)] = result
+    return list(latest.values())
 
 
 class ScanState(StrEnum):
@@ -65,6 +100,9 @@ class ScanExecutionInput(BaseModel):
     protected_resource: HttpUrl
     account_marker_selector: str = Field(min_length=1)
     account_marker_description: str = Field(min_length=1)
+    registration_url: HttpUrl | None = None
+    reset_request_url: HttpUrl | None = None
+    registration_password_reference: str | None = None
 
 
 class GuidanceSubmission(BaseModel):
@@ -288,20 +326,27 @@ class ScanManager:
                 return profile
         return None
 
-    def reanalyse(self, scan_id: UUID) -> CheckResult:
+    def reanalyse(self, scan_id: UUID) -> list[CheckResult]:
         record = self.get_scan(scan_id)
+        if record.state in {ScanState.RUNNING, ScanState.AWAITING_GUIDANCE}:
+            raise ValueError("Wait for scan execution to finish before reanalysis")
         if record.profile is None or not record.evidence:
             raise ValueError("The scan has no completed evidence to reanalyse")
-        evidence = record.evidence[0]
-        result = analyse_login_enumeration(
-            evidence,
-            record.profile,
-            record.request.policy,
-        )
-        record.results.append(result)
-        self._store.save_result(result)
+        if any(evidence.check_id not in ANALYSERS for evidence in record.evidence):
+            raise ValueError(
+                "No offline analyser is available for some stored evidence"
+            )
+        results = [
+            ANALYSERS[evidence.check_id](
+                evidence, record.profile, record.request.policy
+            )
+            for evidence in record.evidence
+        ]
+        for result in results:
+            self._store.save_result(result)
+        record.results = _latest_results([*record.results, *results])
         export_scan_reports(self._store, scan_id, record.evidence, record.results)
-        return result
+        return results
 
     def report_path(self, scan_id: UUID, extension: str) -> Path:
         if extension not in {"json", "html"}:
@@ -334,7 +379,13 @@ class ScanManager:
             asyncio.run(self._run_guided_scan_async(record, execution, guidance))
         except ValueError as error:
             with self._lock:
-                record.state = ScanState.AWAITING_GUIDANCE
+                record.state = (
+                    ScanState.CANCELLED
+                    if record.cancel_requested.is_set()
+                    else ScanState.AWAITING_GUIDANCE
+                )
+                if record.state is ScanState.CANCELLED:
+                    record.pending_execution = None
                 record.error = str(error)
             self._persist_state(record)
         except Exception as error:
@@ -382,13 +433,21 @@ class ScanManager:
                     )
             except (LoginFormDiscoveryError, ValueError) as error:
                 with self._lock:
-                    record.state = ScanState.AWAITING_GUIDANCE
+                    record.state = (
+                        ScanState.CANCELLED
+                        if record.cancel_requested.is_set()
+                        else ScanState.AWAITING_GUIDANCE
+                    )
                     record.error = (
                         f"Saved authentication flow needs guidance: {error}"
                         if saved_profile is not None
                         else str(error)
                     )
-                    record.pending_execution = execution
+                    record.pending_execution = (
+                        execution
+                        if record.state is ScanState.AWAITING_GUIDANCE
+                        else None
+                    )
                 self._persist_state(record)
                 return
             await self._complete_profile_execution(record, execution, profile_execution)
@@ -432,43 +491,94 @@ class ScanManager:
             self._persist_state(record)
             return
 
-        if CheckId.LOGIN_ENUMERATION in record.request.selected_checks:
+        # Registration can create the disposable account. Execute all checks
+        # depending on its nonexistence before the registration submission.
+        check_order = (
+            CheckId.LOGIN_ENUMERATION,
+            CheckId.RESET_REQUEST_ENUMERATION,
+            CheckId.REGISTRATION_ENUMERATION,
+            CheckId.LOGIN_THROTTLING,
+        )
+        for check_id in check_order:
+            if record.cancel_requested.is_set():
+                break
+            if check_id not in record.request.selected_checks:
+                continue
             check_secrets = RuntimeSecrets(execution.runtime_secrets)
+            run: LoginEnumerationRun | FormEnumerationRun | LoginThrottlingRun
             try:
-                run = await run_login_enumeration_check(
-                    profile=profile_execution.profile,
-                    scan_id=record.scan_id,
-                    runtime_secrets=check_secrets,
-                    known_identifier_reference=execution.username_reference,
-                    nonexistent_identifier_reference=(
-                        execution.nonexistent_identifier_reference
-                    ),
-                    failure_password_reference=execution.failure_password_reference,
-                )
+                if check_id is CheckId.LOGIN_ENUMERATION:
+                    run = await run_login_enumeration_check(
+                        profile=profile_execution.profile,
+                        scan_id=record.scan_id,
+                        runtime_secrets=check_secrets,
+                        known_identifier_reference=execution.username_reference,
+                        nonexistent_identifier_reference=execution.nonexistent_identifier_reference,
+                        failure_password_reference=execution.failure_password_reference,
+                    )
+                elif check_id is CheckId.RESET_REQUEST_ENUMERATION:
+                    run = await run_reset_request_enumeration_check(
+                        profile=profile_execution.profile,
+                        scan_id=record.scan_id,
+                        runtime_secrets=check_secrets,
+                        known_identifier_reference=execution.username_reference,
+                        nonexistent_identifier_reference=execution.nonexistent_identifier_reference,
+                        form_url=str(execution.reset_request_url)
+                        if execution.reset_request_url
+                        else None,
+                        cancel_requested=record.cancel_requested.is_set,
+                    )
+                elif check_id is CheckId.LOGIN_THROTTLING:
+                    run = await run_login_throttling_check(
+                        profile=profile_execution.profile,
+                        scan_id=record.scan_id,
+                        runtime_secrets=check_secrets,
+                        username_reference=execution.username_reference,
+                        password_reference=execution.password_reference,
+                        failure_password_reference=execution.failure_password_reference,
+                        expected_lockout_threshold=(
+                            record.request.policy.expected_lockout_threshold
+                        ),
+                        cancel_requested=record.cancel_requested.is_set,
+                    )
+                else:
+                    run = await run_registration_enumeration_check(
+                        profile=profile_execution.profile,
+                        scan_id=record.scan_id,
+                        runtime_secrets=check_secrets,
+                        known_identifier_reference=execution.username_reference,
+                        nonexistent_identifier_reference=execution.nonexistent_identifier_reference,
+                        registration_password_reference=(
+                            execution.registration_password_reference
+                            or execution.failure_password_reference
+                        ),
+                        form_url=str(execution.registration_url)
+                        if execution.registration_url
+                        else None,
+                        cancel_requested=record.cancel_requested.is_set,
+                    )
             finally:
                 check_secrets.discard_all()
             self._save_events(record, run.events)
             record.evidence.append(run.evidence)
             self._store.save_evidence(run.evidence)
-            result = analyse_login_enumeration(
+            result = ANALYSERS[check_id](
                 run.evidence,
                 profile_execution.profile,
                 record.request.policy,
             )
             record.results.append(result)
             self._store.save_result(result)
-            export_scan_reports(
-                self._store,
-                record.scan_id,
-                record.evidence,
-                record.results,
-            )
         record.state = (
             ScanState.CANCELLED
             if record.cancel_requested.is_set()
             else ScanState.COMPLETED
         )
         self._persist_state(record)
+        if record.evidence:
+            export_scan_reports(
+                self._store, record.scan_id, record.evidence, record.results
+            )
 
     def _save_events(
         self,
@@ -534,7 +644,7 @@ class ScanManager:
                     state=state,
                     events=self._store.read_events(scan_id),
                     evidence=self._store.read_all_evidence(scan_id),
-                    results=results,
+                    results=_latest_results(results),
                     profile=self._store.read_profile(scan_id),
                     error=str(error) if error is not None else None,
                 )

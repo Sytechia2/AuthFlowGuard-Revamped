@@ -16,6 +16,7 @@ type SecurityCheck = {
 };
 
 type ScanResult = {
+  result_id?: string;
   check_id: string;
   outcome: string;
   owasp_reference: string;
@@ -111,7 +112,7 @@ const securityChecks: SecurityCheck[] = [
     reference: "WSTG-IDNT-04",
   },
   {
-    id: "reset-enumeration",
+    id: "reset-request-enumeration",
     label: "Reset-request account enumeration",
     reference: "WSTG-IDNT-04",
   },
@@ -553,6 +554,12 @@ function SetupView({ onStarted }: SetupViewProps) {
               required
               value={nonexistentUsername}
             />
+            {selectedChecks.includes("registration-enumeration") && (
+              <small>
+                Registration may create this account. Use a fresh disposable
+                identifier for each scan.
+              </small>
+            )}
           </div>
           <div className="field">
             <label htmlFor="failure-password">Invalid password</label>
@@ -563,6 +570,11 @@ function SetupView({ onStarted }: SetupViewProps) {
               type="password"
               value={failurePassword}
             />
+            {selectedChecks.includes("registration-enumeration") && (
+              <small>
+                Also used as the disposable account's registration password.
+              </small>
+            )}
           </div>
         </div>
 
@@ -1418,13 +1430,20 @@ function ResultsView({ scanId, onScanIdChange }: ResultsViewProps) {
             <p>No completed results are available yet.</p>
           ) : (
             <div className="result-list">
-              {scan.results.map((result) => (
+              {scan.results.map((result, index) => (
                 <article
                   className="result-card"
-                  key={`${result.check_id}-${result.owasp_reference}`}
+                  key={result.result_id ?? `${result.check_id}-${index}`}
                 >
                   <p className="eyebrow">{result.owasp_reference}</p>
-                  <h3>{result.check_id}</h3>
+                  <h3>
+                    {result.check_id === "registration_enumeration" &&
+                      "CHK-002 "}
+                    {result.check_id === "reset_request_enumeration" &&
+                      "CHK-003 "}
+                    {result.check_id === "login_throttling" && "CHK-004 "}
+                    {result.check_id}
+                  </h3>
                   <strong>{result.outcome}</strong>
                   <p>{result.explanation}</p>
                 </article>

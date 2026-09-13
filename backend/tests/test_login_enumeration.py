@@ -38,9 +38,87 @@ from authflowguard.secrets import RuntimeSecrets
 
 @contextmanager
 def run_controlled_server(mode: EvaluationMode) -> Iterator[str]:
-    listening_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listening_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listening_socket.bind(("127.0.0.1", 0))
+    # Chromium refuses a small set of well-known ports (including 6667).
+    # Retry an ephemeral bind if the OS happens to select one of them.
+    unsafe_ports = {
+        1,
+        7,
+        9,
+        11,
+        13,
+        15,
+        17,
+        19,
+        20,
+        21,
+        22,
+        23,
+        25,
+        37,
+        42,
+        43,
+        53,
+        67,
+        69,
+        79,
+        87,
+        95,
+        101,
+        102,
+        103,
+        104,
+        109,
+        110,
+        111,
+        113,
+        115,
+        117,
+        119,
+        123,
+        135,
+        137,
+        139,
+        143,
+        161,
+        179,
+        389,
+        427,
+        465,
+        512,
+        513,
+        514,
+        515,
+        526,
+        530,
+        531,
+        532,
+        540,
+        556,
+        563,
+        587,
+        601,
+        636,
+        993,
+        995,
+        2049,
+        3659,
+        4045,
+        6000,
+        6665,
+        6666,
+        6667,
+        6668,
+        6669,
+        6697,
+        10080,
+    }
+    while True:
+        listening_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listening_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listening_socket.bind(("127.0.0.1", 0))
+        if listening_socket.getsockname()[1] not in unsafe_ports:
+            break
+        listening_socket.close()
     listening_socket.listen()
     port = listening_socket.getsockname()[1]
     server = uvicorn.Server(

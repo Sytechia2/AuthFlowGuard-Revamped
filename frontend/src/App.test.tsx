@@ -156,6 +156,15 @@ describe("setup workflow", () => {
       "/api/scans/scan-123/start",
       expect.objectContaining({ method: "POST" }),
     );
+    const createCall = vi
+      .mocked(fetch)
+      .mock.calls.find(([url]) => url === "/api/scans");
+    const payload = JSON.parse(String(createCall?.[1]?.body)) as {
+      selected_checks: string[];
+    };
+    expect(payload.selected_checks).toContain("registration_enumeration");
+    expect(payload.selected_checks).toContain("reset_request_enumeration");
+    expect(payload.selected_checks).not.toContain("reset_enumeration");
   });
 
   test("opens Discovery for a paused scan and submits guided actions", async () => {
@@ -352,14 +361,32 @@ describe("setup workflow", () => {
             scan_id: "scan-123",
             state: "completed",
             event_count: 78,
-            evidence_count: 1,
-            result_count: 1,
+            evidence_count: 4,
+            result_count: 4,
             results: [
               {
                 check_id: "login_enumeration",
                 outcome: "finding_confirmed",
                 owasp_reference: "WSTG-IDNT-04",
                 explanation: "Repeatable account differences were observed.",
+              },
+              {
+                check_id: "registration_enumeration",
+                outcome: "no_issue_observed",
+                owasp_reference: "WSTG-IDNT-04",
+                explanation: "Registration responses matched.",
+              },
+              {
+                check_id: "reset_request_enumeration",
+                outcome: "inconclusive",
+                owasp_reference: "WSTG-IDNT-04",
+                explanation: "Reset evidence was incomplete.",
+              },
+              {
+                check_id: "login_throttling",
+                outcome: "no_issue_observed",
+                owasp_reference: "WSTG-ATHN-03",
+                explanation: "The valid login was restricted after failures.",
               },
             ],
           }),
@@ -381,6 +408,19 @@ describe("setup workflow", () => {
       "/api/scans/scan-123/report/json",
     );
     expect(fetch).toHaveBeenLastCalledWith("/api/scans/scan-123");
+    expect(
+      screen.getByRole("heading", { name: "CHK-002 registration_enumeration" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", {
+        name: "CHK-003 reset_request_enumeration",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "CHK-004 login_throttling" }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("no_issue_observed")).toHaveLength(2);
+    expect(screen.getByText("inconclusive")).toBeInTheDocument();
   });
 
   test("shows saved runs and loads one without manual ID entry", async () => {
