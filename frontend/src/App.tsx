@@ -31,7 +31,50 @@ type ScanStatus = {
   evidence_count: number;
   result_count: number;
   results: ScanResult[];
+  error?: string | null;
+  profile_source?: "automatic" | "guided" | null;
+  guidance_required?: boolean;
 };
+
+type SafeControl = {
+  observed_control_id: string;
+  tag: string;
+  id: string | null;
+  name: string | null;
+  type: string | null;
+  placeholder: string | null;
+  autocomplete: string | null;
+  aria_label: string | null;
+  value_present: boolean | null;
+  visible: boolean;
+};
+
+type GuidanceActionType = "navigate" | "fill" | "click";
+
+type GuidanceActionDraft = {
+  actionType: GuidanceActionType;
+  controlId: string;
+  valueReference: string;
+  url: string;
+  description: string;
+};
+
+type GuidanceObservation = {
+  url?: string;
+  title?: string;
+  controls: SafeControl[];
+};
+
+function controlLabel(control: SafeControl): string {
+  const label =
+    control.aria_label ??
+    control.name ??
+    control.id ??
+    control.placeholder ??
+    (control.type === "password" ? "Password field" : "Unnamed control");
+  const kind = control.type ? ` (${control.type})` : "";
+  return `${label}${kind}`;
+}
 
 const workflowViews: WorkflowView[] = [
   {
@@ -149,10 +192,16 @@ function App() {
             }}
           />
         )}
-        {activeView === "discovery" && <DiscoveryView />}
+        {activeView === "discovery" && (
+          <DiscoveryView
+            scanId={scanId}
+            onSubmitted={() => setActiveView("testing")}
+          />
+        )}
         {activeView === "testing" && (
           <TestingView
             scanId={scanId}
+            onOpenDiscovery={() => setActiveView("discovery")}
             onOpenResults={() => setActiveView("results")}
           />
         )}
@@ -230,6 +279,7 @@ function SetupView({ onStarted }: SetupViewProps) {
   );
   const [knownUsername, setKnownUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [secondFactor, setSecondFactor] = useState("");
   const [nonexistentUsername, setNonexistentUsername] = useState("");
   const [failurePassword, setFailurePassword] = useState("");
   const [protectedResource, setProtectedResource] = useState(
@@ -285,6 +335,14 @@ function SetupView({ onStarted }: SetupViewProps) {
               reference_id: "failure_password",
               purpose: "Invalid password for controlled failures",
             },
+            ...(secondFactor.trim()
+              ? [
+                  {
+                    reference_id: "second_factor",
+                    purpose: "One-time verification code",
+                  },
+                ]
+              : []),
           ],
           disposable_identifier_references: [
             {
@@ -295,7 +353,13 @@ function SetupView({ onStarted }: SetupViewProps) {
         }),
       });
       if (!createResponse.ok) {
-        throw new Error("The backend rejected the scan setup.");
+        const detail = (await createResponse.json().catch(() => null)) as {
+          detail?: string;
+        } | null;
+        throw new Error(
+          detail?.detail ??
+            `The backend rejected the scan setup (HTTP ${createResponse.status}).`,
+        );
       }
       const created = (await createResponse.json()) as {
         scan_id?: string;
@@ -313,11 +377,15 @@ function SetupView({ onStarted }: SetupViewProps) {
             runtime_secrets: {
               username: knownUsername,
               password,
+              ...(secondFactor.trim() ? { second_factor: secondFactor } : {}),
               nonexistent_username: nonexistentUsername,
               failure_password: failurePassword,
             },
             username_reference: "username",
             password_reference: "password",
+            second_factor_reference: secondFactor.trim()
+              ? "second_factor"
+              : null,
             nonexistent_identifier_reference: "nonexistent_username",
             failure_password_reference: "failure_password",
             protected_resource: protectedResource.trim(),
@@ -327,9 +395,16 @@ function SetupView({ onStarted }: SetupViewProps) {
         },
       );
       if (!startResponse.ok) {
-        throw new Error("The backend could not start the scan.");
+        const detail = (await startResponse.json().catch(() => null)) as {
+          detail?: string;
+        } | null;
+        throw new Error(
+          detail?.detail ??
+            `The backend could not start the scan (HTTP ${startResponse.status}).`,
+        );
       }
       setPassword("");
+      setSecondFactor("");
       setFailurePassword("");
       onStarted(created.scan_id);
     } catch (startError) {
@@ -459,6 +534,16 @@ function SetupView({ onStarted }: SetupViewProps) {
             />
           </div>
           <div className="field">
+            <label htmlFor="second-factor">One-time verification code</label>
+            <input
+              id="second-factor"
+              onChange={(event) => setSecondFactor(event.target.value)}
+              placeholder="Only for two-step login flows"
+              value={secondFactor}
+            />
+            <small>Optional; kept in memory only for this scan.</small>
+          </div>
+          <div className="field">
             <label htmlFor="nonexistent-username">
               Nonexistent account username
             </label>
@@ -547,22 +632,468 @@ function SetupView({ onStarted }: SetupViewProps) {
   );
 }
 
-function DiscoveryView() {
+type DiscoveryViewProps = {
+  scanId: string;
+  onSubmitted: () => void;
+};
+
+function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
+  const [scan, setScan] = useState<ScanStatus | null>(null);
+  const [observation, setObservation] = useState<GuidanceObservation | null>(
+    null,
+  );
+  const [observationUrl, setObservationUrl] = useState("");
+  const [actions, setActions] = useState<GuidanceActionDraft[]>([
+    {
+      actionType: "navigate",
+      controlId: "",
+      valueReference: "",
+      url: "",
+      description: "Open the login page",
+    },
+    {
+      actionType: "fill",
+      controlId: "",
+      valueReference: "username",
+      url: "",
+      description: "Fill the username",
+    },
+    {
+      actionType: "fill",
+      controlId: "",
+      valueReference: "password",
+      url: "",
+      description: "Fill the password",
+    },
+    {
+      actionType: "click",
+      controlId: "",
+      valueReference: "",
+      url: "",
+      description: "Submit the login form",
+    },
+  ]);
+  const [protectedResource, setProtectedResource] = useState("");
+  const [markerSelector, setMarkerSelector] = useState(
+    '[data-testid="account-marker"]',
+  );
+  const [markerDescription, setMarkerDescription] = useState(
+    "Authenticated account marker",
+  );
+  const [isObserving, setIsObserving] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!scanId) return;
+    let active = true;
+    void fetch(`/api/scans/${encodeURIComponent(scanId)}`)
+      .then(async (response) => {
+        if (!response.ok)
+          throw new Error("The scan status could not be loaded.");
+        return (await response.json()) as ScanStatus;
+      })
+      .then((loadedScan) => {
+        if (active) {
+          setScan(loadedScan);
+          setObservationUrl(loadedScan.target_url ?? "");
+          setError(null);
+        }
+      })
+      .catch((loadError: unknown) => {
+        if (active) {
+          setError(
+            loadError instanceof Error
+              ? loadError.message
+              : "Unable to load discovery status.",
+          );
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [scanId]);
+
+  async function observePage() {
+    setIsObserving(true);
+    setError(null);
+    try {
+      const response = await fetch(
+        `/api/scans/${encodeURIComponent(scanId)}/guidance/observe`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: observationUrl.trim() }),
+        },
+      );
+      if (!response.ok)
+        throw new Error("The target page could not be observed.");
+      const observed = (await response.json()) as GuidanceObservation;
+      setObservation(observed);
+      setActions((currentActions) =>
+        currentActions.map((action, index) =>
+          index === 0
+            ? { ...action, url: observed.url ?? "" }
+            : { ...action, controlId: "" },
+        ),
+      );
+    } catch (observeError) {
+      setError(
+        observeError instanceof Error
+          ? observeError.message
+          : "Unable to observe the target page.",
+      );
+    } finally {
+      setIsObserving(false);
+    }
+  }
+
+  function updateAction(
+    index: number,
+    field: keyof GuidanceActionDraft,
+    value: string,
+  ) {
+    setActions((currentActions) =>
+      currentActions.map((action, actionIndex) =>
+        actionIndex === index ? { ...action, [field]: value } : action,
+      ),
+    );
+  }
+
+  async function submitGuidance(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setIsSubmitting(true);
+    setError(null);
+    try {
+      const payload = actions.map((action) => {
+        const common = {
+          action_type: action.actionType,
+          description:
+            action.description.trim() || "Guided authentication step",
+        };
+        if (action.actionType === "navigate") {
+          return { ...common, url: action.url.trim() };
+        }
+        if (action.actionType === "fill") {
+          return {
+            ...common,
+            observed_control_id: action.controlId.trim(),
+            value_reference: action.valueReference.trim(),
+          };
+        }
+        return { ...common, observed_control_id: action.controlId.trim() };
+      });
+      const response = await fetch(
+        `/api/scans/${encodeURIComponent(scanId)}/guidance`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            actions: payload,
+            ...(protectedResource.trim()
+              ? { protected_resource: protectedResource.trim() }
+              : {}),
+            ...(markerSelector.trim()
+              ? { account_marker_selector: markerSelector.trim() }
+              : {}),
+            ...(markerDescription.trim()
+              ? { account_marker_description: markerDescription.trim() }
+              : {}),
+          }),
+        },
+      );
+      if (!response.ok) {
+        const detail = (await response.json().catch(() => null)) as {
+          detail?: string;
+        } | null;
+        throw new Error(detail?.detail ?? "The guided flow was rejected.");
+      }
+      onSubmitted();
+    } catch (submitError) {
+      setError(
+        submitError instanceof Error
+          ? submitError.message
+          : "Unable to submit guided flow.",
+      );
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  if (!scanId) {
+    return (
+      <EmptyWorkspace
+        code="DISCOVERY_IDLE"
+        heading="No discovery session yet"
+        message="Start a scan from Setup. If automatic discovery cannot identify the login controls, the guided workspace will open here."
+      />
+    );
+  }
+
   return (
-    <EmptyWorkspace
-      code="DISCOVERY_IDLE"
-      heading="No discovery session yet"
-      message="Complete the target setup to begin observing and verifying authentication controls."
-    />
+    <form className="discovery-layout" onSubmit={submitGuidance}>
+      <section className="panel discovery-intro-panel">
+        <div className="section-heading">
+          <div>
+            <p className="section-number">A</p>
+            <h2>Help us log in</h2>
+          </div>
+          <span className="status-pill">{scan?.state ?? "loading"}</span>
+        </div>
+        <p>
+          The scan paused because it could not identify the login controls with
+          confidence. Find the login page below, choose the username field,
+          password field, and sign-in button, then AuthFlowGuard will try those
+          steps and verify the account page in separate signed-in and signed-out
+          browser sessions. Your Setup credentials are reused automatically.
+        </p>
+        {scan?.error && <p className="form-error">{scan.error}</p>}
+        <div className="field observation-url-field">
+          <label htmlFor="observation-url">Login page address</label>
+          <input
+            id="observation-url"
+            onChange={(event) => setObservationUrl(event.target.value)}
+            required
+            type="url"
+            value={observationUrl}
+          />
+          <small>
+            Use the login page here if the scan target was only used to trigger
+            this help step.
+          </small>
+        </div>
+        <button
+          className="secondary-button"
+          disabled={isObserving || scan?.state !== "awaiting_guidance"}
+          onClick={() => void observePage()}
+          type="button"
+        >
+          {isObserving ? "Finding fields..." : "Find login fields"}
+        </button>
+      </section>
+
+      <section className="panel controls-panel">
+        <div className="section-heading">
+          <div>
+            <p className="section-number">B</p>
+            <h2>Fields and buttons found on this page</h2>
+          </div>
+          <span className="selection-count">
+            {observation?.controls.length ?? 0} found
+          </span>
+        </div>
+        {observation ? (
+          <>
+            <p className="panel-help">
+              {observation.title || "Untitled page"} · {observation.url}
+            </p>
+            <div className="observed-controls">
+              {observation.controls.map((control) => (
+                <div
+                  className="observed-control"
+                  key={control.observed_control_id}
+                >
+                  <code>{control.observed_control_id}</code>
+                  <span>{controlLabel(control)}</span>
+                  <small>{control.visible ? "visible" : "hidden"}</small>
+                </div>
+              ))}
+            </div>
+          </>
+        ) : (
+          <p className="history-empty">
+            Find the login fields to choose from the controls on this page.
+          </p>
+        )}
+      </section>
+
+      <section className="panel flow-panel">
+        <div className="section-heading">
+          <div>
+            <p className="section-number">C</p>
+            <h2>Choose the sign-in controls</h2>
+          </div>
+          <span className="required-label">Setup details reused</span>
+        </div>
+        <p className="panel-help">
+          Choose the recognizable controls below. The selected values are saved
+          as safe references; live usernames and passwords never enter the flow.
+        </p>
+        <div className="guided-questions">
+          <label className="field">
+            <span>Which field is your username or email?</span>
+            <select
+              aria-label="Username or email field"
+              onChange={(event) =>
+                updateAction(1, "controlId", event.target.value)
+              }
+              required
+              value={actions[1].controlId}
+            >
+              <option value="">Choose a field</option>
+              {(observation?.controls ?? [])
+                .filter(
+                  (control) =>
+                    control.visible &&
+                    control.tag === "input" &&
+                    control.type !== "password",
+                )
+                .map((control) => (
+                  <option
+                    key={control.observed_control_id}
+                    value={control.observed_control_id}
+                  >
+                    {controlLabel(control)}
+                  </option>
+                ))}
+            </select>
+          </label>
+          <label className="field">
+            <span>Which field is your password?</span>
+            <select
+              aria-label="Password field"
+              onChange={(event) =>
+                updateAction(2, "controlId", event.target.value)
+              }
+              required
+              value={actions[2].controlId}
+            >
+              <option value="">Choose a field</option>
+              {(observation?.controls ?? [])
+                .filter(
+                  (control) =>
+                    control.visible &&
+                    control.tag === "input" &&
+                    control.type === "password",
+                )
+                .map((control) => (
+                  <option
+                    key={control.observed_control_id}
+                    value={control.observed_control_id}
+                  >
+                    {controlLabel(control)}
+                  </option>
+                ))}
+            </select>
+          </label>
+          <label className="field">
+            <span>Which button signs you in?</span>
+            <select
+              aria-label="Sign-in button"
+              onChange={(event) =>
+                updateAction(3, "controlId", event.target.value)
+              }
+              required
+              value={actions[3].controlId}
+            >
+              <option value="">Choose a button</option>
+              {(observation?.controls ?? [])
+                .filter(
+                  (control) =>
+                    control.visible &&
+                    (control.tag === "button" ||
+                      (control.tag === "input" &&
+                        ["submit", "button"].includes(control.type ?? ""))),
+                )
+                .map((control) => (
+                  <option
+                    key={control.observed_control_id}
+                    value={control.observed_control_id}
+                  >
+                    {controlLabel(control)}
+                  </option>
+                ))}
+            </select>
+          </label>
+        </div>
+      </section>
+
+      <section className="panel marker-panel">
+        <div className="section-heading">
+          <div>
+            <p className="section-number">D</p>
+            <h2>Protected-resource proof</h2>
+          </div>
+        </div>
+        <p className="panel-help">
+          AuthFlowGuard checks that the signed-in account page contains a marker
+          that is absent in a fresh anonymous browser session.
+        </p>
+        <details className="advanced-settings" open>
+          <summary>Advanced: change how login is checked</summary>
+          <p className="panel-help">
+            Change these only when the Setup values do not describe the target.
+            A selector is required because a dashboard URL or title alone does
+            not prove that authentication succeeded.
+          </p>
+          <div className="credential-fields">
+            <div className="field">
+              <label htmlFor="guided-protected-resource">
+                Protected resource URL
+              </label>
+              <input
+                id="guided-protected-resource"
+                onChange={(event) => setProtectedResource(event.target.value)}
+                placeholder="Leave blank to use Setup value"
+                type="url"
+                value={protectedResource}
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="guided-marker-selector">
+                Authenticated marker selector
+              </label>
+              <input
+                id="guided-marker-selector"
+                onChange={(event) => setMarkerSelector(event.target.value)}
+                required
+                value={markerSelector}
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="guided-marker-description">
+                Marker description
+              </label>
+              <input
+                id="guided-marker-description"
+                onChange={(event) => setMarkerDescription(event.target.value)}
+                required
+                value={markerDescription}
+              />
+            </div>
+          </div>
+        </details>
+        {error && (
+          <p className="form-error" role="alert">
+            {error}
+          </p>
+        )}
+        <button
+          className="primary-button"
+          disabled={isSubmitting}
+          type="submit"
+        >
+          {isSubmitting
+            ? "Saving guided flow..."
+            : "Save and verify guided flow"}
+          <span aria-hidden="true">→</span>
+        </button>
+      </section>
+    </form>
   );
 }
 
 type TestingViewProps = {
   scanId: string;
+  onOpenDiscovery: () => void;
   onOpenResults: () => void;
 };
 
-function TestingView({ scanId, onOpenResults }: TestingViewProps) {
+function TestingView({
+  scanId,
+  onOpenDiscovery,
+  onOpenResults,
+}: TestingViewProps) {
   const [scan, setScan] = useState<ScanStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isCancelling, setIsCancelling] = useState(false);
@@ -653,6 +1184,7 @@ function TestingView({ scanId, onOpenResults }: TestingViewProps) {
         <span>{scan?.event_count ?? 0} events</span>
         <span>{scan?.evidence_count ?? 0} evidence packages</span>
         <span>{scan?.result_count ?? 0} results</span>
+        {scan?.profile_source && <span>discovery: {scan.profile_source}</span>}
       </div>
       {error && (
         <p className="form-error" role="alert">
@@ -668,6 +1200,22 @@ function TestingView({ scanId, onOpenResults }: TestingViewProps) {
         >
           {isCancelling ? "Cancelling..." : "Cancel scan"}
         </button>
+      )}
+      {scan?.state === "awaiting_guidance" && (
+        <div className="guidance-callout">
+          <strong>Automatic discovery needs your guidance.</strong>
+          <p>
+            Identify the login controls in Discovery and AuthFlowGuard will
+            replay the saved flow in fresh authenticated and anonymous contexts.
+          </p>
+          <button
+            className="secondary-button"
+            onClick={onOpenDiscovery}
+            type="button"
+          >
+            Open Discovery
+          </button>
+        </div>
       )}
       {scan?.state === "completed" && (
         <button
@@ -850,6 +1398,9 @@ function ResultsView({ scanId, onScanIdChange }: ResultsViewProps) {
           <p>
             {scan.evidence_count} evidence package(s), {scan.event_count}{" "}
             event(s), and {scan.result_count} result(s) saved.
+          </p>
+          <p>
+            Authentication profile: {scan.profile_source ?? "not verified yet"}
           </p>
           <div className="result-actions">
             <a

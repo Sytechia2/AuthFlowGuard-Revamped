@@ -158,6 +158,166 @@ describe("setup workflow", () => {
     );
   });
 
+  test("opens Discovery for a paused scan and submits guided actions", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ status: "ok" }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ scan_id: "guided-scan", state: "created" }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            scan_id: "guided-scan",
+            state: "running",
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            scan_id: "guided-scan",
+            state: "awaiting_guidance",
+            target_url: "https://staging.example.test/login",
+            error: "Expected one submit control, found 2",
+            event_count: 0,
+            evidence_count: 0,
+            result_count: 0,
+            results: [],
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            scan_id: "guided-scan",
+            state: "awaiting_guidance",
+            target_url: "https://staging.example.test/login",
+            error: "Expected one submit control, found 2",
+            event_count: 0,
+            evidence_count: 0,
+            result_count: 0,
+            results: [],
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            url: "https://staging.example.test/login",
+            title: "Sign in",
+            controls: [
+              {
+                observed_control_id: "control-5",
+                tag: "input",
+                id: "username",
+                name: "username",
+                type: "email",
+                placeholder: null,
+                autocomplete: "username",
+                aria_label: null,
+                value_present: false,
+                visible: true,
+              },
+              {
+                observed_control_id: "control-6",
+                tag: "input",
+                id: "password",
+                name: "password",
+                type: "password",
+                placeholder: null,
+                autocomplete: "current-password",
+                aria_label: null,
+                value_present: false,
+                visible: true,
+              },
+              {
+                observed_control_id: "control-7",
+                tag: "button",
+                id: null,
+                name: null,
+                type: "submit",
+                placeholder: null,
+                autocomplete: null,
+                aria_label: null,
+                value_present: null,
+                visible: true,
+              },
+            ],
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            scan_id: "guided-scan",
+            state: "running",
+          }),
+        }),
+    );
+    render(<App />);
+
+    fireEvent.change(screen.getByLabelText("Target URL"), {
+      target: { value: "https://staging.example.test/login" },
+    });
+    fireEvent.change(screen.getByLabelText("Permitted origins"), {
+      target: { value: "https://staging.example.test" },
+    });
+    fireEvent.change(screen.getByLabelText("Known account username"), {
+      target: { value: "developer@example.test" },
+    });
+    fireEvent.change(screen.getByLabelText("Known account password"), {
+      target: { value: "known-password" },
+    });
+    fireEvent.change(screen.getByLabelText("Nonexistent account username"), {
+      target: { value: "missing@example.test" },
+    });
+    fireEvent.change(screen.getByLabelText("Invalid password"), {
+      target: { value: "wrong-password" },
+    });
+    fireEvent.change(screen.getByLabelText("Protected resource URL"), {
+      target: { value: "https://staging.example.test/account" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /start local scan/i }));
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: "Open Discovery" }),
+      ).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open Discovery" }));
+    await waitFor(() => {
+      expect(
+        screen.getByRole("heading", { name: "Help us log in" }),
+      ).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Find login fields" }));
+    await waitFor(() => {
+      expect(screen.getByText("control-5")).toBeInTheDocument();
+    });
+    fireEvent.change(screen.getByLabelText("Username or email field"), {
+      target: { value: "control-5" },
+    });
+    fireEvent.change(screen.getByLabelText("Password field"), {
+      target: { value: "control-6" },
+    });
+    fireEvent.change(screen.getByLabelText("Sign-in button"), {
+      target: { value: "control-7" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: /save and verify guided flow/i }),
+    );
+
+    await waitFor(() => {
+      expect(fetch).toHaveBeenCalledWith(
+        "/api/scans/guided-scan/guidance",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+  });
+
   test("navigation switches between testing and results views", () => {
     mockHealthResponse(true, "ok");
     render(<App />);

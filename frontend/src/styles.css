@@ -506,6 +506,125 @@ h2 {
   font-size: 0.84rem;
 }
 
+.discovery-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 0.85fr) minmax(24rem, 1.15fr);
+  gap: 1rem;
+}
+
+.discovery-layout .panel {
+  padding: clamp(1.25rem, 3vw, 2rem);
+}
+
+.discovery-intro-panel,
+.flow-panel,
+.marker-panel {
+  grid-column: 1 / -1;
+}
+
+.discovery-intro-panel p:not(.eyebrow):not(.form-error),
+.guidance-callout p {
+  color: var(--muted);
+}
+
+.observed-controls {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.observed-control {
+  display: grid;
+  grid-template-columns: 6rem minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  background: rgba(8, 17, 28, 0.45);
+  font-size: 0.82rem;
+}
+
+.observed-control small {
+  color: var(--muted);
+}
+
+.guided-action {
+  display: grid;
+  grid-template-columns:
+    1.5rem 8rem minmax(10rem, 1fr) minmax(10rem, 1fr)
+    minmax(10rem, 1fr);
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.65rem;
+}
+
+.guided-action strong {
+  color: var(--cyan);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.8rem;
+  text-align: center;
+}
+
+.guided-action input,
+.guided-action select {
+  width: 100%;
+  min-width: 0;
+  padding: 0.65rem 0.7rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 0.4rem;
+  outline: none;
+  background: #091522;
+  color: var(--text);
+}
+
+.guided-questions {
+  display: grid;
+  gap: 0.9rem;
+  max-width: 46rem;
+}
+
+.guided-questions .field {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.guided-questions select {
+  width: 100%;
+  padding: 0.7rem 0.75rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 0.4rem;
+  background: #091522;
+  color: var(--text);
+}
+
+.advanced-settings {
+  margin-top: 0.8rem;
+}
+
+.advanced-settings summary {
+  color: var(--cyan);
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.guided-action input:focus,
+.guided-action select:focus {
+  border-color: var(--cyan);
+  box-shadow: 0 0 0 0.2rem rgba(53, 214, 199, 0.09);
+}
+
+.guidance-callout {
+  max-width: 42rem;
+  margin-top: 1rem;
+  padding: 1rem;
+  border-left: 2px solid var(--amber);
+  background: rgba(242, 187, 98, 0.055);
+}
+
+.guidance-callout p {
+  margin: 0.35rem 0 0.85rem;
+}
+
 code {
   color: var(--cyan);
   font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
@@ -761,6 +880,18 @@ code {
   .credential-fields {
     grid-template-columns: 1fr;
   }
+
+  .discovery-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .guided-action {
+    grid-template-columns: 1.5rem 8rem minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .guided-action input:last-child {
+    grid-column: 3 / -1;
+  }
 }
 
 @media (max-width: 640px) {
@@ -789,5 +920,18 @@ code {
 
   .status-row > span:nth-child(3) {
     display: none;
+  }
+
+  .guided-action {
+    grid-template-columns: 1.5rem 1fr;
+  }
+
+  .guided-action input,
+  .guided-action select {
+    grid-column: 2;
+  }
+
+  .guided-action input:last-child {
+    grid-column: 2;
   }
 }
