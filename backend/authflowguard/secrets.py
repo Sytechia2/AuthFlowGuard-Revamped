@@ -24,5 +24,13 @@ class RuntimeSecrets:
             self._values[reference_id] = ""
         self._values.clear()
 
+    def redact_text(self, text: str) -> str:
+        """Remove any currently-held secret values from user-facing text."""
+        redacted = text
+        for value in self._values.values():
+            if value:
+                redacted = redacted.replace(value, "[redacted]")
+        return redacted
+
     def __len__(self) -> int:
         return len(self._values)
