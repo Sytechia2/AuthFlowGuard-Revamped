@@ -6,6 +6,16 @@ truth for scope, architecture, security rules, responsibilities, schedule, and
 acceptance criteria. This execution plan translates that direction into tasks
 that can be assigned, implemented, tested, and marked complete.
 
+The remaining teammate assignments, dependencies, deliverables, and update
+format are maintained in
+[WORK_BREAKDOWN_STRUCTURE.md](WORK_BREAKDOWN_STRUCTURE.md).
+
+This execution plan is the Team Lead's technical progress and evidence tracker.
+Teammates should use the WBS for their assignments and maintain a small GitHub
+issue or individual work plan for their own implementation steps. They should
+send completion evidence to the Team Lead instead of creating a separate
+project-wide execution plan.
+
 **Tracking started:** 10 September 2026
 
 **Target submission:** 28–29 September 2026

@@ -3,6 +3,10 @@
 AuthFlowGuard AI runs entirely on the developer's computer. During development,
 run the Python backend and React interface in separate terminals.
 
+For diagrams of the current backend and a walkthrough of a scan, read
+[ARCHITECTURE.md](ARCHITECTURE.md). It also explains the separate command-line
+Bedrock agent and which connections remain to be implemented.
+
 ## 1. Backend
 
 From the repository root:
