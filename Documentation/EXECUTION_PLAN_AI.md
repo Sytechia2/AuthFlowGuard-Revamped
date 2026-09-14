@@ -174,19 +174,22 @@ Primary owner: **Member 4**.
 | UI-006 | Package the frontend for the local backend to serve. | **Done** | FND-005, FND-006 | FastAPI serves `frontend/dist`; production build and backend static-serving test pass. |
 | UI-007 | Refine guided discovery into plain-language questions about missing login information. | **Done** | UI-002, RUN-003 | Discovery explains why the scan paused, reuses Setup credentials, offers recognizable username/password/button choices from fresh observations, clears stale selections after refresh, and keeps proof overrides under Advanced settings. Frontend behavior and submission tests pass. |
 
-### 8.1. Planned Guided Discovery Refinement
+### 8.1. Guided Discovery Refinement
 
-**Status: Not started; documentation only.** The implemented UI-002 fallback
-remains the current behavior. This refinement records user feedback from
-13 September 2026 and does not represent a completed interface change.
+**Status: Done.** UI-007 implemented this refinement on top of the UI-002
+fallback. The interface now explains why a scan paused, reuses Setup
+credentials, presents recognizable field and button choices, clears stale
+selections after refreshed observations, and keeps proof overrides under
+Advanced settings. The requirements below record the user feedback received on
+13 September 2026 and the behavior covered by the completed implementation.
 
-The user expects AuthFlowGuard to explain which part of logging in needs help,
-then ask for the information needed to continue. The current wording, especially
-"Observe target controls," is too technical. The initial design should support
+The feedback asked AuthFlowGuard to explain which part of logging in needs help,
+then ask for the information needed to continue. The earlier wording, especially
+"Observe target controls," was too technical. The implemented design supports
 the familiar sequence of entering a username or email and password, selecting
 Sign in, and reaching an account page or dashboard.
 
-#### Proposed interaction
+#### Implemented interaction
 
 1. **Explain the pause and the specific help needed.** Use a heading such as
    "Help us log in." When supported by observations, say, for example, "We found
@@ -221,9 +224,9 @@ chat interface or live browser recorder is not required for this refinement.
 The current implementation also covers the controlled React/JSON two-step
 bearer-token flow; broader SPA layouts remain part of the generality evaluation.
 
-#### Wording direction
+#### Implemented wording
 
-| Current wording | Proposed user-facing wording |
+| Earlier wording | Implemented user-facing wording |
 | --- | --- |
 | Guided discovery | Help us log in |
 | Page to observe | Login page address |
@@ -234,7 +237,7 @@ bearer-token flow; broader SPA layouts remain part of the generality evaluation.
 | Protected-resource proof | How we check that login worked |
 | Save and verify guided flow | Check login and continue |
 
-#### Acceptance criteria for UI-007
+#### Completion evidence for UI-007
 
 - A user can explain why the scan paused, what information is missing, and what
   will happen after submission without knowing browser automation terminology.
@@ -249,11 +252,11 @@ bearer-token flow; broader SPA layouts remain part of the generality evaluation.
 - Advanced verification settings remain available and explain the required
   selector honestly. Login proof still checks separate signed-in and signed-out
   sessions, and saved actions continue to exclude live credentials.
-- Verification includes frontend behavior tests for focused questions,
-  recognizable choices, Setup reuse, recovery, and submission; an end-to-end
-  guided login on the controlled application; and a user walkthrough to confirm
-  the wording is understandable. Update the development walkthrough after
-  implementation and record the evidence before marking UI-007 Done.
+- Frontend behavior tests cover focused questions, recognizable choices, Setup
+  reuse, recovery, and submission. The controlled-application guided-login
+  walkthrough is documented in `Documentation/DEVELOPMENT.md`. Broader user
+  evaluation remains part of the release evaluation rather than UI-007's
+  implementation status.
 
 ## 9. Evaluation and Release Tasks
 
@@ -283,7 +286,7 @@ be linked here as they are created.
 
 | Acceptance area | Status | Current gap |
 | --- | --- | --- |
-| Six checks and 24 scenarios | **Done** | CHK-001 through CHK-006 cover secure, vulnerable, ambiguous/incomplete, and execution-failure scenarios. |
+| Six checks and 24 evaluated scenarios | **In progress** | Automated tests cover secure, vulnerable, ambiguous/incomplete, and execution-failure outcomes for CHK-001 through CHK-006. EVA-005 must still execute and document the formal 24-scenario evaluation matrix. |
 | Runner/analyser separation | **Done** | All six checks keep browser execution separate from offline analysis. Reanalysis dispatches every stored evidence record to its check-specific analyser. |
 | Repeatable analysis | **Done** | All six checks produce deterministic results for identical evidence/policy/version. Reanalysis retains version files and exposes only the latest result per evidence, including after restart. |
 | Offline reporting | **Done** | JSON and HTML reports are generated from local evidence/results without target, browser, AWS, or network access. |
