@@ -184,3 +184,8 @@ cython_debug/
 
 # Local AuthFlowGuard scan evidence and reports
 .authflowguard-data/
+
+# Local AI/editor tooling installed for interface design work
+.agents/
+.codex/
+.impeccable/
