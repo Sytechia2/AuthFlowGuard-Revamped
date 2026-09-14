@@ -448,9 +448,31 @@ Both runners keep cookie values and response bodies in memory only, record
 status and marker controls, and return `execution_error` for browser failures or
 server-error responses. Missing controls are `inconclusive`.
 
+### Current support boundary
+
+CHK-005 and CHK-006 currently support saved login flows whose fill actions are
+a username followed by a password, with authentication state held in browser
+cookies. The session-check adapter assigns the username reference to the first
+fill action and the password reference to every later fill action. It therefore
+cannot yet replay login flows containing a one-time verification code or another
+additional fill step. Although authentication discovery and proof support the
+React/JSON bearer-token fixture, these two checks do not copy or replay bearer
+tokens stored in local or session storage.
+
+CHK-006 currently discovers logout only when the protected page contains an
+identifiable HTML form whose action or visible text indicates logout, whose
+submit control produces a POST response. Logout links, client-side navigation,
+and JavaScript requests using another HTTP method are not yet supported.
+
+An unsupported saved-login shape can fail before check evidence is created and
+therefore fail the scan. Unsupported logout discovery is captured as
+`execution_error`; an analyser given incomplete saved evidence returns
+`inconclusive`. None of these outcomes means that the target passed the check,
+and an unsupported pattern must never be reported as `no_issue_observed`.
+
 The controlled application demonstrates both scenarios: secure mode rotates the
 session at login and removes it at logout, while vulnerable mode reuses the
 pre-login session and leaves the logged-out session valid. The browser and
 offline tests cover secure and vulnerable outcomes, deterministic reanalysis,
 malformed evidence, execution failures, scan persistence, and report code
-mapping. Bearer tokens stored outside browser cookies remain a documented limit.
+mapping.
