@@ -1,6 +1,7 @@
 """CHK-004 runner and deterministic analyser tests."""
 
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -73,7 +74,9 @@ def profile_for(origin: str) -> AuthProfile:
     )
 
 
-def run_check(origin: str, *, cancel_requested: Any = lambda: False):
+def run_check(
+    origin: str, *, cancel_requested: Callable[[], bool] = lambda: False
+) -> tuple[AuthProfile, LoginThrottlingRun]:
     profile = profile_for(origin)
     secrets = RuntimeSecrets(
         {

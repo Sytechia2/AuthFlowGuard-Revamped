@@ -2,8 +2,10 @@
 
 import time
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
+import pytest
 from authflowguard.app import app, create_app
 from authflowguard.authentication import (
     GuidedPageObservation,
@@ -23,6 +25,7 @@ from authflowguard.models import (
     ScanRequest,
     TargetScope,
 )
+from authflowguard.playwright_worker import SafeControlDescription
 from authflowguard.scan_manager import ScanExecutionInput, ScanState
 from fastapi.testclient import TestClient
 
@@ -129,7 +132,7 @@ def test_scan_api_creates_reports_status_and_cancellation(tmp_path: Path) -> Non
 
 
 def test_automatic_discovery_failure_pauses_for_guidance(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     client = TestClient(create_app(data_root=tmp_path))
     created = client.post(
@@ -144,7 +147,7 @@ def test_automatic_discovery_failure_pauses_for_guidance(
     )
     scan_id = created.json()["scan_id"]
 
-    async def fail_automatic_discovery(*args, **kwargs):
+    async def fail_automatic_discovery(*args: Any, **kwargs: Any) -> None:
         raise LoginFormDiscoveryError("Expected one submit control, found 2")
 
     monkeypatch.setattr(
@@ -178,7 +181,7 @@ def test_automatic_discovery_failure_pauses_for_guidance(
 
 
 def test_new_scan_revalidates_and_reuses_a_matching_saved_profile(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     application = create_app(data_root=tmp_path)
     manager = application.state.scan_manager
@@ -221,10 +224,10 @@ def test_new_scan_revalidates_and_reuses_a_matching_saved_profile(
     )
     calls: list[str] = []
 
-    async def fake_revalidate(**kwargs) -> None:
+    async def fake_revalidate(**kwargs: Any) -> None:
         calls.append("revalidate")
 
-    async def fake_replay(**kwargs) -> VerifiedLoginExecution:
+    async def fake_replay(**kwargs: Any) -> VerifiedLoginExecution:
         calls.append("replay")
         return VerifiedLoginExecution(profile=saved.profile, events=[], traffic=[])
 
@@ -262,7 +265,7 @@ def test_new_scan_revalidates_and_reuses_a_matching_saved_profile(
 
 
 def test_guidance_api_observes_safe_controls_and_accepts_structured_flow(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     application = create_app(data_root=tmp_path)
     manager = application.state.scan_manager
@@ -288,7 +291,7 @@ def test_guidance_api_observes_safe_controls_and_accepts_structured_flow(
     )
     manager._persist_state(record)
 
-    control = {
+    control: SafeControlDescription = {
         "observed_control_id": "control-1",
         "tag": "input",
         "id": "username",
@@ -312,7 +315,7 @@ def test_guidance_api_observes_safe_controls_and_accepts_structured_flow(
         },
     )
 
-    async def fake_observation(*args, **kwargs):
+    async def fake_observation(*args: Any, **kwargs: Any) -> GuidedPageObservation:
         return GuidedPageObservation(event=event, controls=[control])
 
     monkeypatch.setattr(
