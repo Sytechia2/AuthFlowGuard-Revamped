@@ -14,6 +14,8 @@ CHECK_CODES = {
     "registration_enumeration": "CHK-002",
     "reset_request_enumeration": "CHK-003",
     "login_throttling": "CHK-004",
+    "session_fixation": "CHK-005",
+    "logout_invalidation": "CHK-006",
 }
 
 

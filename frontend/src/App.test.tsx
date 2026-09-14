@@ -361,8 +361,8 @@ describe("setup workflow", () => {
             scan_id: "scan-123",
             state: "completed",
             event_count: 78,
-            evidence_count: 4,
-            result_count: 4,
+            evidence_count: 6,
+            result_count: 6,
             results: [
               {
                 check_id: "login_enumeration",
@@ -387,6 +387,18 @@ describe("setup workflow", () => {
                 outcome: "no_issue_observed",
                 owasp_reference: "WSTG-ATHN-03",
                 explanation: "The valid login was restricted after failures.",
+              },
+              {
+                check_id: "session_fixation",
+                outcome: "no_issue_observed",
+                owasp_reference: "WSTG-SESS-03",
+                explanation: "The original session was rejected after login.",
+              },
+              {
+                check_id: "logout_invalidation",
+                outcome: "no_issue_observed",
+                owasp_reference: "WSTG-SESS-06",
+                explanation: "The old session was rejected after logout.",
               },
             ],
           }),
@@ -419,7 +431,13 @@ describe("setup workflow", () => {
     expect(
       screen.getByRole("heading", { name: "CHK-004 login_throttling" }),
     ).toBeInTheDocument();
-    expect(screen.getAllByText("no_issue_observed")).toHaveLength(2);
+    expect(
+      screen.getByRole("heading", { name: "CHK-005 session_fixation" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "CHK-006 logout_invalidation" }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("no_issue_observed")).toHaveLength(4);
     expect(screen.getByText("inconclusive")).toBeInTheDocument();
   });
 

@@ -33,6 +33,11 @@ from authflowguard.checks.login_throttling import (
     analyse_login_throttling,
     run_login_throttling_check,
 )
+from authflowguard.checks.logout_invalidation import (
+    LogoutInvalidationRun,
+    analyse_logout_invalidation,
+    run_logout_invalidation_check,
+)
 from authflowguard.checks.registration_enumeration import (
     analyse_registration_enumeration,
     run_registration_enumeration_check,
@@ -40,6 +45,11 @@ from authflowguard.checks.registration_enumeration import (
 from authflowguard.checks.reset_request_enumeration import (
     analyse_reset_request_enumeration,
     run_reset_request_enumeration_check,
+)
+from authflowguard.checks.session_fixation import (
+    SessionFixationRun,
+    analyse_session_fixation,
+    run_session_fixation_check,
 )
 from authflowguard.evidence import EvidenceStore
 from authflowguard.models import (
@@ -61,6 +71,8 @@ ANALYSERS = {
     CheckId.REGISTRATION_ENUMERATION: analyse_registration_enumeration,
     CheckId.RESET_REQUEST_ENUMERATION: analyse_reset_request_enumeration,
     CheckId.LOGIN_THROTTLING: analyse_login_throttling,
+    CheckId.SESSION_FIXATION: analyse_session_fixation,
+    CheckId.LOGOUT_INVALIDATION: analyse_logout_invalidation,
 }
 
 
@@ -498,6 +510,8 @@ class ScanManager:
             CheckId.RESET_REQUEST_ENUMERATION,
             CheckId.REGISTRATION_ENUMERATION,
             CheckId.LOGIN_THROTTLING,
+            CheckId.SESSION_FIXATION,
+            CheckId.LOGOUT_INVALIDATION,
         )
         for check_id in check_order:
             if record.cancel_requested.is_set():
@@ -505,7 +519,13 @@ class ScanManager:
             if check_id not in record.request.selected_checks:
                 continue
             check_secrets = RuntimeSecrets(execution.runtime_secrets)
-            run: LoginEnumerationRun | FormEnumerationRun | LoginThrottlingRun
+            run: (
+                LoginEnumerationRun
+                | FormEnumerationRun
+                | LoginThrottlingRun
+                | SessionFixationRun
+                | LogoutInvalidationRun
+            )
             try:
                 if check_id is CheckId.LOGIN_ENUMERATION:
                     run = await run_login_enumeration_check(
@@ -539,6 +559,28 @@ class ScanManager:
                         expected_lockout_threshold=(
                             record.request.policy.expected_lockout_threshold
                         ),
+                        cancel_requested=record.cancel_requested.is_set,
+                    )
+                elif check_id is CheckId.SESSION_FIXATION:
+                    run = await run_session_fixation_check(
+                        profile=profile_execution.profile,
+                        scan_id=record.scan_id,
+                        runtime_secrets=check_secrets,
+                        username_reference=execution.username_reference,
+                        password_reference=execution.password_reference,
+                        protected_resource=str(execution.protected_resource),
+                        account_marker_selector=execution.account_marker_selector,
+                        cancel_requested=record.cancel_requested.is_set,
+                    )
+                elif check_id is CheckId.LOGOUT_INVALIDATION:
+                    run = await run_logout_invalidation_check(
+                        profile=profile_execution.profile,
+                        scan_id=record.scan_id,
+                        runtime_secrets=check_secrets,
+                        username_reference=execution.username_reference,
+                        password_reference=execution.password_reference,
+                        protected_resource=str(execution.protected_resource),
+                        account_marker_selector=execution.account_marker_selector,
                         cancel_requested=record.cancel_requested.is_set,
                     )
                 else:

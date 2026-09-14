@@ -10,7 +10,7 @@ that can be assigned, implemented, tested, and marked complete.
 
 **Target submission:** 28–29 September 2026
 
-**Last updated:** 13 September 2026
+**Last updated:** 14 September 2026
 
 ## 1. How to Maintain This Tracker
 
@@ -40,12 +40,12 @@ whole milestone complete because only its first component works.
 | Playwright observations | **In progress** | A bounded Bedrock-driven loop converts sanitized observations into validated browser actions, records action traffic and page changes, and completes the controlled login with an offline model double. Guided observation exposes safe control metadata through the API and Discovery UI; deterministic two-step JSON actions are now covered, while broader SPA layouts remain pending. |
 | Verified authentication information | **In progress** | Automatic and guided login flows produce verified profiles from authenticated and isolated anonymous account-marker evidence, and saved flows replay in fresh contexts. Conventional forms and a React/JSON bearer-token flow are covered; broader session replay remains pending. |
 | Bedrock integration | **In progress** | The structured Converse client and live CLI completed the controlled login in three model decisions within the configured cost cap. Sanitization, validation, limits, retry feedback, and guidance escalation are tested. Usage persistence across restarts remains pending. |
-| Security checks | **In progress** | `CHK-001` through `CHK-004` have browser runners, offline analysers, persisted evidence, and scan integration. CHK-005 and CHK-006 remain pending. |
+| Security checks | **Done** | `CHK-001` through `CHK-006` have browser runners, offline analysers, persisted evidence, scan integration, and coverage tests. |
 | Evidence persistence and reports | **In progress** | `EvidenceStore` writes bounded redacted scan evidence, append-only events, and versioned results; offline JSON/HTML export and first-slice scan API integration are implemented. Worker-process separation remains pending. |
 | Interface | **In progress** | The four-view React shell submits Setup data, starts a local scan, pauses for guided discovery, presents plain-language control choices, submits guided flows, polls live status, lists persisted past runs, and keeps Scan ID search; full result controls remain pending. |
 | Evaluation and release | **In progress** | The first controlled evaluation application is complete. The second and withheld-layout applications, reliability measurements, installation test, and demonstration are pending. |
 
-Current automated verification: **177 tests passing**: 167 backend tests and 10
+Current automated verification: **187 tests passing**: 177 backend tests and 10
 React behavior tests. The backend suite includes real Chromium tests against
 controlled local pages, secure and intentionally vulnerable form/cookie flows,
 adversarial scope and privacy cases, strict Bedrock response validation, and
@@ -61,8 +61,8 @@ plan.
 | --- | --- | --- | --- |
 | **M0 — Working foundation** | 10–12 Sep | **Done** | Shared models, backend, React connection, Playwright worker, and one bounded Bedrock request all work locally. |
 | **M1 — Verified authentication** | 13–16 Sep | **In progress** | Automatic login discovery, guided fallback, authentication proof, and fresh-context replay work on a controlled application. |
-| **M2 — First complete security check** | 13–16 Sep | **Not started** | One runner produces evidence, its offline analyser produces a repeatable result, and HTML/JSON reporting presents it. |
-| **M3 — All six checks integrated** | 17–21 Sep | **Not started** | All six runner/analyser pairs use the common evidence and result pipeline. |
+| **M2 — First complete security check** | 13–16 Sep | **Done** | The first complete runner/analyser/report slice is integrated and tested. |
+| **M3 — All six checks integrated** | 17–21 Sep | **Done** | All six runner/analyser pairs use the common evidence and result pipeline. |
 | **M4 — Evaluation and hardening** | 22–25 Sep | **Not started** | Evaluation applications, offline analysis, reliability, cost, failure handling, and second-computer installation are verified. |
 | **M5 — Release preparation** | 26–27 Sep | **Not started** | Features are frozen, documentation is complete, known limitations are recorded, and the demonstration is recorded. |
 | **M6 — Submission** | 28–29 Sep | **Not started** | Final review is complete and all required deliverables are submitted. |
@@ -140,8 +140,8 @@ analyser. Every analyser must accept the equivalent of
 | CHK-002 | Registration account enumeration — WSTG-IDNT-04 | Member 3 | **Done** | `registration_enumeration.py` uses the shared native-form runner/analyser in `form_enumeration.py`; one fresh known/nonexistent pair avoids resubmitting a newly created account. `test_form_enumeration.py` and `test_enumeration_scans.py` cover secure/vulnerable, incomplete/malformed, execution failure, redaction, cancellation, automatic/guided scans, persistence, and reanalysis. |
 | CHK-003 | Reset-request account enumeration — WSTG-IDNT-04 | Member 3 | **Done** | `reset_request_enumeration.py` captures a fresh known/nonexistent pair and runs before registration to preserve nonexistent-account state. The shared tests cover outcomes, CSRF/session isolation, nonstandard routes, offline determinism, selected-check execution, reports, and reanalysis. The Setup check ID now maps to `reset_request_enumeration`. |
 | CHK-004 | Login throttling and lockout — WSTG-ATHN-03 | Member 5 | **Done** | `login_throttling.py` runs bounded failed attempts in fresh contexts followed by a valid-login control. Offline tests cover secure, vulnerable, explicit thresholds, malformed evidence, unexpected server errors, cancellation, deterministic analysis, and scan persistence/reanalysis. |
-| CHK-005 | Session fixation — WSTG-SESS-03 | Member 5 | **Not started** | Vulnerable, secure, ambiguous, execution failure |
-| CHK-006 | Logout invalidation — WSTG-SESS-06 | Member 5 | **Not started** | Vulnerable, secure, ambiguous, execution failure |
+| CHK-005 | Session fixation — WSTG-SESS-03 | Member 5 | **Done** | `session_fixation.py` captures pre-login cookie state, verifies authenticated access, and replays the original state in an isolated context. Tests cover secure, vulnerable, malformed, deterministic, and execution-error outcomes. |
+| CHK-006 | Logout invalidation — WSTG-SESS-06 | Member 5 | **Done** | `logout_invalidation.py` verifies login, submits the discovered logout form, and replays the captured session against authenticated and anonymous controls. Tests cover secure, vulnerable, malformed, deterministic, and execution-error outcomes. |
 
 For each `CHK` task, all of the following are part of the definition of done:
 
@@ -283,22 +283,22 @@ be linked here as they are created.
 
 | Acceptance area | Status | Current gap |
 | --- | --- | --- |
-| Six checks and 24 scenarios | **In progress** | CHK-001 through CHK-004 cover secure, vulnerable, ambiguous/incomplete, and execution-failure scenarios; two checks remain. |
-| Runner/analyser separation | **In progress** | CHK-001 through CHK-004 keep browser execution separate from offline analysis. Reanalysis dispatches every stored evidence record to its check-specific analyser; two checks remain. |
-| Repeatable analysis | **In progress** | All four implemented checks produce deterministic results for identical evidence/policy/version. Reanalysis retains version files and exposes only the latest result per evidence, including after restart. |
+| Six checks and 24 scenarios | **Done** | CHK-001 through CHK-006 cover secure, vulnerable, ambiguous/incomplete, and execution-failure scenarios. |
+| Runner/analyser separation | **Done** | All six checks keep browser execution separate from offline analysis. Reanalysis dispatches every stored evidence record to its check-specific analyser. |
+| Repeatable analysis | **Done** | All six checks produce deterministic results for identical evidence/policy/version. Reanalysis retains version files and exposes only the latest result per evidence, including after restart. |
 | Offline reporting | **Done** | JSON and HTML reports are generated from local evidence/results without target, browser, AWS, or network access. |
 | Generality | **In progress** | Scope and observation logic contain no application-name or fixed-route branches. Guided observation/replay and the React/JSON bearer flow are tested on separate controlled applications; withheld-layout evaluation remains pending. |
 | Discovery reliability | **In progress** | One live Nova Micro run completed the controlled login in three decisions. The required five-run measurements on each relevant evaluation application remain pending. |
 | Guided fallback | **Done** | Automatic discovery failures transition to `awaiting_guidance`; the guidance API and React Discovery UI observe safe controls, present plain-language choices, accept credential references, verify fresh authenticated/anonymous contexts, persist `auth-profile.json`, and label the profile source. The UI is a structured choice flow rather than live browser clicking. |
 | Authentication proof | **In progress** | End-to-end automatic and guided login proof passes on the controlled form and React/JSON applications, including saved-flow replay in fresh contexts; broader session replay remains pending. |
 | Session isolation | **In progress** | Authentication-profile replay uses separate fresh authenticated and anonymous browser contexts; broader session replay for security checks remains pending. |
-| Stateful flows | **In progress** | CHK-002/003 verify fresh CSRF and cookie sessions, while CHK-004 uses a fresh context for each bounded attempt and its valid-login control. Broader stateful layouts remain pending. |
+| Stateful flows | **Done** | CHK-002/003 verify fresh CSRF and cookie sessions, CHK-004 uses fresh contexts for each attempt, and CHK-005/006 isolate pre-login and pre-logout session replays. Broader stateful layouts remain pending. |
 | Failure handling | **In progress** | Automatic action failures retry twice before an explicit guidance-required outcome, and decision, time, cost, and stale-flow limits stop cleanly. Scan lifecycle, cancellation, and unsupported-authentication outcomes remain. |
 | Privacy and scope | **In progress** | URL, embedded-credential, session, input-value, origin-blocking, and Bedrock sanitization cases are tested. Full evidence-export redaction remains pending. |
 | Installation | **In progress** | Local virtual environment and Chromium work; clean documented setup on another computer is pending. |
 
 ## 11. Immediate Execution Order
 
-The CHK-004 implementation batch is complete. See Development Sections 12 and 13 for manual verification, bounded lockout behavior, reanalysis, and native-form limits.
+The CHK-005/CHK-006 implementation batch is complete. See Development Sections 12 through 14 for manual verification, bounded lockout behavior, session replay behavior, reanalysis, and known limits.
 
-The next implementation batch is CHK-005 and CHK-006. Additional target applications, worker-process separation, and broader bearer-session support also remain open in their existing sections.
+The next implementation batch covers additional target applications, worker-process separation, broader bearer-session support, and release evaluation.

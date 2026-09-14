@@ -176,10 +176,10 @@ controlled application's values:
 
 Select **Start local scan**. The interface switches to **Testing**, polls the
 scan, and shows the generated scan ID. When the state is `completed`, choose
-**Open results** to see the finding and download the offline JSON or HTML
-report. You can choose **Cancel scan** while execution is still running. Only the implemented login-account-enumeration check produces a result
-in this release; the other check selections are retained in the scan request
-but are not yet executed.
+**Open results** to see the findings and download the offline JSON or HTML
+report. You can choose **Cancel scan** while execution is still running. The
+implemented CHK-001 through CHK-006 selections are executed and each completed
+check produces a persisted evidence package and result.
 
 The **Results** view lists saved local runs automatically. Select any listed
 run to load it, or continue using the Scan ID search field when you already
@@ -373,7 +373,7 @@ and analyser version, including stable result IDs and evidence capture timestamp
 ### Offline reanalysis API
 
 `POST /api/scans/{scan_id}/reanalyse` now processes **every stored evidence
-record**, dispatching by check ID for CHK-001 through CHK-004. Its response
+record**, dispatching by check ID for CHK-001 through CHK-006. Its response
 has changed from a single result to:
 
 ```json
@@ -398,7 +398,7 @@ two-step login: navigation could replace controls between individual reads.
 retry if navigation destroys the execution context. `test_action_executor.py`
 checks snapshot consistency while the page repeatedly replaces its controls.
 
-Final verification for this batch: **167 backend tests and 10 frontend tests
+Final verification for this batch: **177 backend tests and 10 frontend tests
 passed**. Ruff formatting/lint, mypy, Prettier, ESLint, TypeScript, the production
 build, and `git diff --check` passed. The backend retains the existing
 Starlette/TestClient anyio deprecation warning.
@@ -430,3 +430,27 @@ valid control succeeds and the result should be `finding_confirmed`. JSON and
 HTML reports include CHK-004, its WSTG reference, attempt coverage, and any
 limitations. Reanalysis of the saved scan does not launch a browser or resolve
 runtime credentials.
+
+## 14. Session Fixation and Logout Invalidation (CHK-005/CHK-006)
+
+CHK-005 captures the browser cookie state before login, verifies authenticated
+access, and replays the original state in a separate browser context. A replay
+that still reaches the protected account marker confirms session fixation;
+rejection matching the anonymous control produces `no_issue_observed`.
+The analyser records whether the cookie fingerprint changed, but an unchanged
+cookie alone is not treated as a finding.
+
+CHK-006 verifies login, captures the active session, submits the logout form
+discovered on the protected page, and replays the pre-logout session in a fresh
+context. A replay that retains the account marker confirms logout invalidation
+failure. Rejection matching the anonymous control produces `no_issue_observed`.
+Both runners keep cookie values and response bodies in memory only, record
+status and marker controls, and return `execution_error` for browser failures or
+server-error responses. Missing controls are `inconclusive`.
+
+The controlled application demonstrates both scenarios: secure mode rotates the
+session at login and removes it at logout, while vulnerable mode reuses the
+pre-login session and leaves the logged-out session valid. The browser and
+offline tests cover secure and vulnerable outcomes, deterministic reanalysis,
+malformed evidence, execution failures, scan persistence, and report code
+mapping. Bearer tokens stored outside browser cookies remain a documented limit.

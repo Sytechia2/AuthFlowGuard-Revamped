@@ -1442,6 +1442,8 @@ function ResultsView({ scanId, onScanIdChange }: ResultsViewProps) {
                     {result.check_id === "reset_request_enumeration" &&
                       "CHK-003 "}
                     {result.check_id === "login_throttling" && "CHK-004 "}
+                    {result.check_id === "session_fixation" && "CHK-005 "}
+                    {result.check_id === "logout_invalidation" && "CHK-006 "}
                     {result.check_id}
                   </h3>
                   <strong>{result.outcome}</strong>
