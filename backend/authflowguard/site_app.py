@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import html
 import secrets
+from dataclasses import dataclass
 from enum import StrEnum
 from urllib.parse import parse_qs
 
@@ -21,6 +22,12 @@ class EvaluationMode(StrEnum):
 KNOWN_MEMBER_ID = "MBR-40817"
 KNOWN_PASSPHRASE = "lantern-orchard-47"
 SESSION_COOKIE = "desk_pass"
+
+
+@dataclass
+class SessionState:
+    member_id: str | None = None
+    form_seal: str | None = None
 
 
 def _shell(title: str, body: str) -> str:
@@ -44,17 +51,29 @@ def create_site_app(
 ) -> FastAPI:
     selected_mode = EvaluationMode(mode)
     application = FastAPI(title=f"Workshop desk ({selected_mode.value})")
-    sessions: dict[str, str] = {}
+    sessions: dict[str, SessionState] = {}
+
+    def session_for(request: Request) -> tuple[str, SessionState, bool]:
+        session_id = request.cookies.get(SESSION_COOKIE)
+        if session_id is not None and session_id in sessions:
+            return session_id, sessions[session_id], False
+        session_id = secrets.token_urlsafe(24)
+        session = SessionState()
+        sessions[session_id] = session
+        return session_id, session, True
 
     @application.get("/", include_in_schema=False)
     async def index() -> RedirectResponse:
         return RedirectResponse("/desk/entry", status_code=303)
 
     @application.get("/desk/entry", response_class=HTMLResponse)
-    async def entry() -> HTMLResponse:
-        body = """
+    async def entry(request: Request) -> HTMLResponse:
+        session_id, session, created = session_for(request)
+        session.form_seal = secrets.token_urlsafe(24)
+        body = f"""
 <h1>Your bookings</h1>
 <form method="post" action="/desk/entry">
+  <input type="hidden" name="form_seal" value="{session.form_seal}">
   <label>Member ID <input name="member_id"></label>
   <label>Passphrase <input name="passphrase" type="password"></label>
   <button type="submit">Open my bookings</button>
@@ -63,24 +82,61 @@ def create_site_app(
   <a href="/desk/join">Become a member</a>
   <a href="/desk/lost-passphrase">Forgotten passphrase?</a>
 </p>"""
-        return HTMLResponse(_shell("Riverside Workshop Desk", body))
+        response = HTMLResponse(_shell("Riverside Workshop Desk", body))
+        if created:
+            response.set_cookie(
+                SESSION_COOKIE, session_id, httponly=True, samesite="lax"
+            )
+        return response
+
+    @application.get("/desk/bookings", response_class=HTMLResponse)
+    async def bookings(request: Request) -> HTMLResponse:
+        session_id = request.cookies.get(SESSION_COOKIE)
+        session = sessions.get(session_id) if session_id else None
+
+        if session is None or session.member_id is None:
+            return HTMLResponse(
+                _shell("Sign-in required", "<h1>Sign in to see your bookings.</h1>"),
+                status_code=401,
+            )
+
+        body = f"""
+<h1>Your bookings</h1>
+<p class="booking-holder" data-desk="owner">
+  Booked for {html.escape(session.member_id)}
+</p>
+<form method="post" action="/desk/depart">
+  <button type="submit">Leave the desk</button>
+</form>"""
+        return HTMLResponse(_shell("Your bookings", body))
 
     @application.post("/desk/entry")
     async def submit_entry(request: Request) -> Response:
+        session_id, session, _created = session_for(request)
         submitted = parse_qs(
             (await request.body()).decode("utf-8"), keep_blank_values=True
         )
         member_id = submitted.get("member_id", [""])[-1]
         passphrase = submitted.get("passphrase", [""])[-1]
+        supplied_seal = submitted.get("form_seal", [""])[-1]
+
+        if session.form_seal is None or not secrets.compare_digest(
+            session.form_seal, supplied_seal
+        ):
+            return HTMLResponse(
+                _shell("Invalid request", "<h1>That form has expired.</h1>"),
+                status_code=400,
+            )
 
         if member_id == KNOWN_MEMBER_ID and secrets.compare_digest(
             passphrase, KNOWN_PASSPHRASE
         ):
-            session_id = secrets.token_urlsafe(24)
-            sessions[session_id] = member_id
+            sessions.pop(session_id, None)
+            new_session_id = secrets.token_urlsafe(24)
+            sessions[new_session_id] = SessionState(member_id=member_id)
             response = RedirectResponse("/desk/bookings", status_code=303)
             response.set_cookie(
-                SESSION_COOKIE, session_id, httponly=True, samesite="lax"
+                SESSION_COOKIE, new_session_id, httponly=True, samesite="lax"
             )
             return response
 
@@ -89,21 +145,14 @@ def create_site_app(
             status_code=401,
         )
 
-    @application.get("/desk/bookings", response_class=HTMLResponse)
-    async def bookings(request: Request) -> HTMLResponse:
+    @application.post("/desk/depart")
+    async def depart(request: Request) -> RedirectResponse:
         session_id = request.cookies.get(SESSION_COOKIE)
-        member_id = sessions.get(session_id) if session_id else None
-
-        if member_id is None:
-            return HTMLResponse(
-                _shell("Sign-in required", "<h1>Sign in to see your bookings.</h1>"),
-                status_code=401,
-            )
-
-        body = f"""
-<h1>Your bookings</h1>
-<p class="booking-holder" data-desk="owner">Booked for {html.escape(member_id)}</p>"""
-        return HTMLResponse(_shell("Your bookings", body))
+        if session_id:
+            sessions.pop(session_id, None)
+        response = RedirectResponse("/desk/entry", status_code=303)
+        response.delete_cookie(SESSION_COOKIE)
+        return response
 
     return application
 
