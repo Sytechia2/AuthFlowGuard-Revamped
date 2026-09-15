@@ -181,7 +181,7 @@ of whether AuthFlowGuard can adapt.
 - Include secure and intentionally vulnerable behavior where practical.
 - Document how to start, reset, and use it.
 - Do not show its implementation to the discovery owner before the first
-  recorded test.
+  recorded test. 
 
 **Done when:**
 
