@@ -262,6 +262,6 @@ login procedure.
 | [automatic_actions.py](../backend/authflowguard/automatic_actions.py) | Repeating the AI agent's page-reading, action-selection, and execution steps |
 | [bedrock.py](../backend/authflowguard/bedrock.py) | Preparing model requests, validating responses, and checking estimated cost |
 
-The two bundled test applications, controlled_app.py and react_json_app.py, run
-as separate websites. They give AuthFlowGuard something to test; they are not
-parts of the scan manager.
+The three bundled test applications, controlled_app.py, react_json_app.py, and
+site_app.py, run as separate websites. They give AuthFlowGuard something to
+test; they are not parts of the scan manager.

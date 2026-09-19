@@ -22,6 +22,7 @@ class EvaluationMode(StrEnum):
 KNOWN_MEMBER_ID = "MBR-40817"
 KNOWN_PASSPHRASE = "lantern-orchard-47"
 SESSION_COOKIE = "desk_pass"
+LOCKOUT_THRESHOLD = 3
 
 
 @dataclass
@@ -52,6 +53,7 @@ def create_site_app(
     selected_mode = EvaluationMode(mode)
     application = FastAPI(title=f"Workshop desk ({selected_mode.value})")
     sessions: dict[str, SessionState] = {}
+    failed_logins: dict[str, int] = {}
 
     def session_for(request: Request) -> tuple[str, SessionState, bool]:
         session_id = request.cookies.get(SESSION_COOKIE)
@@ -77,11 +79,7 @@ def create_site_app(
   <label>Member ID <input name="member_id"></label>
   <label>Passphrase <input name="passphrase" type="password"></label>
   <button type="submit">Open my bookings</button>
-</form>
-<p>
-  <a href="/desk/join">Become a member</a>
-  <a href="/desk/lost-passphrase">Forgotten passphrase?</a>
-</p>"""
+</form>"""
         response = HTMLResponse(_shell("Riverside Workshop Desk", body))
         if created:
             response.set_cookie(
@@ -106,7 +104,7 @@ def create_site_app(
   Booked for {html.escape(session.member_id)}
 </p>
 <form method="post" action="/desk/depart">
-  <button type="submit">Leave the desk</button>
+  <button type="submit">Log out of the desk</button>
 </form>"""
         return HTMLResponse(_shell("Your bookings", body))
 
@@ -120,41 +118,73 @@ def create_site_app(
         passphrase = submitted.get("passphrase", [""])[-1]
         supplied_seal = submitted.get("form_seal", [""])[-1]
 
-        if session.form_seal is None or not secrets.compare_digest(
-            session.form_seal, supplied_seal
+        expected_seal = session.form_seal
+        session.form_seal = None
+        if expected_seal is None or not secrets.compare_digest(
+            expected_seal, supplied_seal
         ):
             return HTMLResponse(
                 _shell("Invalid request", "<h1>That form has expired.</h1>"),
                 status_code=400,
             )
 
-        if member_id == KNOWN_MEMBER_ID and secrets.compare_digest(
-            passphrase, KNOWN_PASSPHRASE
-        ):
-            sessions.pop(session_id, None)
-            new_session_id = secrets.token_urlsafe(24)
-            sessions[new_session_id] = SessionState(member_id=member_id)
+        is_known = member_id == KNOWN_MEMBER_ID
+        is_locked = failed_logins.get(member_id, 0) >= LOCKOUT_THRESHOLD
+
+        if selected_mode is EvaluationMode.SECURE and is_known and is_locked:
+            return HTMLResponse(
+                _shell("Sign-in unavailable", "<h1>Try again later.</h1>"),
+                status_code=429,
+            )
+
+        if is_known and secrets.compare_digest(passphrase, KNOWN_PASSPHRASE):
+            failed_logins.pop(member_id, None)
+            if selected_mode is EvaluationMode.SECURE:
+                sessions.pop(session_id, None)
+                new_session_id = secrets.token_urlsafe(24)
+                sessions[new_session_id] = SessionState(member_id=member_id)
+                response = RedirectResponse("/desk/bookings", status_code=303)
+                response.set_cookie(
+                    SESSION_COOKIE, new_session_id, httponly=True, samesite="lax"
+                )
+                return response
+
+            session.member_id = member_id
             response = RedirectResponse("/desk/bookings", status_code=303)
             response.set_cookie(
-                SESSION_COOKIE, new_session_id, httponly=True, samesite="lax"
+                SESSION_COOKIE, session_id, httponly=True, samesite="lax"
             )
             return response
 
+        if is_known:
+            failed_logins[member_id] = failed_logins.get(member_id, 0) + 1
+
+        if selected_mode is EvaluationMode.VULNERABLE and not is_known:
+            message = "No member with that ID."
+        elif selected_mode is EvaluationMode.VULNERABLE:
+            message = "That passphrase is incorrect."
+        else:
+            message = "Those details don't match our records."
         return HTMLResponse(
-            _shell("Sign-in failed", "<h1>Those details don't match our records.</h1>"),
+            _shell("Sign-in failed", f"<h1>{message}</h1>"),
             status_code=401,
         )
 
     @application.post("/desk/depart")
     async def depart(request: Request) -> RedirectResponse:
         session_id = request.cookies.get(SESSION_COOKIE)
-        if session_id:
-            sessions.pop(session_id, None)
         response = RedirectResponse("/desk/entry", status_code=303)
-        response.delete_cookie(SESSION_COOKIE)
+        if selected_mode is EvaluationMode.SECURE:
+            if session_id:
+                sessions.pop(session_id, None)
+            response.delete_cookie(SESSION_COOKIE)
         return response
 
     return application
+
+
+secure_app = create_site_app(EvaluationMode.SECURE)
+vulnerable_app = create_site_app(EvaluationMode.VULNERABLE)
 
 
 def main(argv: list[str] | None = None) -> None:

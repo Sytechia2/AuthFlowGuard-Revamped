@@ -480,3 +480,28 @@ pre-login session and leaves the logged-out session valid. The browser and
 offline tests cover secure and vulnerable outcomes, deterministic reanalysis,
 malformed evidence, execution failures, scan persistence, and report code
 mapping.
+
+## 15. Independent Evaluation Application (Application C)
+
+Run the independently-designed workshop-desk fixture in secure mode:
+
+```powershell
+.\.venv\Scripts\python -m authflowguard.site_app --mode secure --port 8005
+```
+
+Use `--mode vulnerable` on a different port to expose the intentionally weak
+comparison behaviours. Unlike the controlled application, this fixture was
+built without reusing its labels, routes, or page layout, to give discovery an
+unfamiliar target. It has a login page at `/desk/entry` and a protected page
+at `/desk/bookings`; it deliberately has no registration or password-reset
+forms, so CHK-002 and CHK-003 are not applicable to it. It targets CHK-001
+(login enumeration), CHK-004 (login throttling), CHK-005 (session fixation),
+and CHK-006 (logout invalidation) instead. Its built-in credentials are test
+data only:
+
+- Member ID: `MBR-40817`
+- Passphrase: `lantern-orchard-47`
+
+All state is held in memory, so restarting the process resets it — there is no
+separate reset command. This application binds to `127.0.0.1` by default and
+must not be deployed as a production service.
