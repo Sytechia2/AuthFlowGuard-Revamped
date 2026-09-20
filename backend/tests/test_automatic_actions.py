@@ -16,7 +16,7 @@ from authflowguard.automatic_actions import (
     AutomaticBrowserController,
 )
 from authflowguard.bedrock import BedrockActionDecision, PageObservationForModel
-from authflowguard.controlled_app import (
+from authflowguard.evaluation_targets.controlled_app import (
     KNOWN_PASSWORD,
     KNOWN_USERNAME,
     EvaluationMode,

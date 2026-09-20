@@ -19,7 +19,7 @@ from authflowguard.authentication import (
     replay_verified_auth_profile,
     revalidate_auth_profile,
 )
-from authflowguard.controlled_app import (
+from authflowguard.evaluation_targets.controlled_app import (
     KNOWN_PASSWORD,
     KNOWN_USERNAME,
     EvaluationMode,

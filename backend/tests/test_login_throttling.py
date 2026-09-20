@@ -13,7 +13,7 @@ from authflowguard.checks.login_throttling import (
     analyse_login_throttling,
     run_login_throttling_check,
 )
-from authflowguard.controlled_app import (
+from authflowguard.evaluation_targets.controlled_app import (
     KNOWN_PASSWORD,
     KNOWN_USERNAME,
     EvaluationMode,

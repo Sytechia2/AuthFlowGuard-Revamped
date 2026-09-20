@@ -1,10 +1,11 @@
 """Tests for the independent workshop-desk evaluation application."""
 
 import re
+from typing import cast
 
 import httpx
 import pytest
-from authflowguard.site_app import (
+from authflowguard.evaluation_targets.site_app import (
     KNOWN_MEMBER_ID,
     KNOWN_PASSPHRASE,
     LOCKOUT_THRESHOLD,
@@ -29,7 +30,10 @@ def post_entry(
 ) -> httpx.Response:
     form = client.get("/desk/entry")
     values = {"form_seal": form_seal(form.text), **values}
-    return client.post("/desk/entry", data=values, follow_redirects=follow_redirects)
+    return cast(
+        httpx.Response,
+        client.post("/desk/entry", data=values, follow_redirects=follow_redirects),
+    )
 
 
 @pytest.mark.parametrize("mode", list(EvaluationMode))

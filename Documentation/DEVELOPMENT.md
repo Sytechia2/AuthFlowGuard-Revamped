@@ -120,7 +120,7 @@ after the applied quota values are nonzero.
 Run the server-rendered form/cookie fixture in secure mode:
 
 ```powershell
-.\.venv\Scripts\python -m authflowguard.controlled_app --mode secure --port 8001
+.\.venv\Scripts\python -m authflowguard.evaluation_targets.controlled_app --mode secure --port 8001
 ```
 
 Use `--mode vulnerable` on a different port to expose the intentionally weak
@@ -255,7 +255,7 @@ verification code through JSON, receives a bearer token through JSON, and stores
 that token in browser localStorage. Start it separately from the form fixture:
 
 ```powershell
-.\.venv\Scripts\python -m authflowguard.react_json_app --mode secure --port 8003
+.\.venv\Scripts\python -m authflowguard.evaluation_targets.react_json_app --mode secure --port 8003
 ```
 
 Use these Setup values:
@@ -279,7 +279,7 @@ is never included in evidence; only a local-storage fingerprint is retained.
 Use this command for the intentionally vulnerable variant:
 
 ```powershell
-.\.venv\Scripts\python -m authflowguard.react_json_app --mode vulnerable --port 8004
+.\.venv\Scripts\python -m authflowguard.evaluation_targets.react_json_app --mode vulnerable --port 8004
 ```
 
 Then change the Setup target, permitted origin, and protected-resource URL to
@@ -486,7 +486,7 @@ mapping.
 Run the independently-designed workshop-desk fixture in secure mode:
 
 ```powershell
-.\.venv\Scripts\python -m authflowguard.site_app --mode secure --port 8005
+.\.venv\Scripts\python -m authflowguard.evaluation_targets.site_app --mode secure --port 8005
 ```
 
 Use `--mode vulnerable` on a different port to expose the intentionally weak
