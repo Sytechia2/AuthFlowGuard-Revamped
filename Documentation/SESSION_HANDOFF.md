@@ -10,7 +10,7 @@ happens to any single machine's session history.
 | Task | Tracker | Status | Evidence |
 | --- | --- | --- | --- |
 | Execute the formal check cases | EVA-005 | **Done, Application A** | `evaluation/reports/formal-cases.md` — 24/24 pass |
-| Test failure situations | EVA-006 | **Done, in part** | 6 fault-injection and 6 degraded-evidence cases, included in the 24 |
+| Test failure situations | EVA-006 | **Partial — do not report as done** | 3 of 7 named conditions evidenced, 2 blocked, 2 untested. `KNOWN_LIMITATIONS.md` §5 |
 | Confirm offline analysis and reports | EVA-007 | **Done** | `evaluation/reports/offline-verification.md` — 6/6 pass |
 | Decide session-check scope | Task 5.6 | **Done — all three deferred** | `Documentation/KNOWN_LIMITATIONS.md` §1 |
 | Freeze features, list limitations | REL-001 | **Done** | `Documentation/KNOWN_LIMITATIONS.md` |
@@ -61,10 +61,15 @@ Raw scan data under `evaluation/results/*/scan-data/` is gitignored; the
 
 1. Applications B (4 cases) and C (16 cases) are authored but not executed. The
    runner's `fixture_for()` only wires Application A; add `react_json_app` and
-   `site_app` to execute them.
-2. Correct `pyproject.toml` to depend on `httpx2`.
-3. Assign the `test_react_json_app` fixture-isolation defect (Member 2).
-4. EVA-004 and EVA-008 unblock only when Bedrock is wired into web scans.
+   `site_app` to execute them. Note the requirement is "at least 24" scenarios
+   "mainly" on Application A, so running only A meets the minimum but is not a
+   documented cap.
+2. EVA-006 needs cases for unsupported authentication and an explicit timeout.
+   Bedrock-outage and worker-failure testing stay blocked until those parts of
+   the system exist.
+3. Correct `pyproject.toml` to depend on `httpx2`.
+4. Assign the `test_react_json_app` fixture-isolation defect (Member 2).
+5. EVA-004 and EVA-008 unblock only when Bedrock is wired into web scans.
 
 ## Resuming the Claude Code session on another machine
 

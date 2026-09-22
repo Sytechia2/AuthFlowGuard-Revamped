@@ -69,6 +69,29 @@ See Section 5.
 | EVA-004 | Discovery reliability, five runs per flow per application | **Blocked** | Requires live Bedrock discovery, which the web application does not use (Section 2). The terminal agent is also subject to the Nova quota problem recorded in `DEVELOPMENT.md` Section 5. |
 | EVA-008 | Token, cost, and duration measurement | **Blocked for live figures** | Requires live Bedrock calls. Cost accounting infrastructure is implemented and tested (`authflowguard.evaluation.cost_model`, `cost_tracking`), and can produce projected figures from fixture token counts, but every such figure is labelled `MOCK ONLY` and is not an AWS charge. |
 
+### EVA-006 failure testing is partial
+
+Task 5.3 names seven failure conditions. Three are evidenced, two are blocked on
+unfinished runtime work, and two remain untested. **EVA-006 must not be reported
+as complete.**
+
+| Condition | State | Evidence or reason |
+| --- | --- | --- |
+| Stale saved flows | Covered | `test_enumeration_scans.py` returns a stale profile to `awaiting_guidance` before any check runs |
+| Cancellation | Covered | Cancellation tests in `test_enumeration_scans.py` and `test_app.py` |
+| Missing target features / target errors | Partly covered | Six fault-injection cases produce `execution_error` from the analyser |
+| Timeouts | Partly covered | Timeout paths appear in existing tests; no dedicated formal case |
+| Unsupported authentication | **Not tested** | No case exercises an unsupported login shape end to end |
+| Bedrock outages | **Blocked** | Web scans do not call Bedrock, so there is no outage to simulate |
+| Worker failure | **Blocked** | Scans run in a background thread; the separate worker process (RUN-002) does not exist yet |
+
+The task's completion criterion — that no failed or unsupported test is reported
+as a security pass — holds for every condition that was exercised. Twelve of the
+twenty-four executed cases exist specifically to demonstrate it: six degrade
+saved evidence and require `inconclusive`, and six inject server errors during a
+real scan and require `execution_error`. Neither may be reported as
+`no_issue_observed`.
+
 These are dependencies on unfinished integration work, not gaps in the
 evaluation method. Scan duration *was* recorded for all 24 executed cases and is
 in `evaluation/reports/formal-cases.csv`.
