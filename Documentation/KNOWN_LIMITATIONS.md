@@ -167,5 +167,17 @@ independently designed target, it is doing exactly the job it was built for.
 4.80 s.
 
 What remains unmeasured is the reliability of the *terminal Bedrock agent*, for
-the reason in Section 5. The distinction matters: the product's shipping
-discovery path has been measured; its optional AI path has not.
+the reason in Section 5.
+
+Keep two distinctions apart, because they are easy to conflate:
+
+| | What decides the next step | Measured? |
+| --- | --- | --- |
+| **Automatic** discovery in a web scan | Programmed rules. **No AI.** | Yes — the table above |
+| **Guided** fallback in a web scan | A person identifies the fields | Yes — the table above |
+| **Terminal Bedrock agent** | Amazon Bedrock chooses each action | No — needs live AWS |
+
+"Automatic" therefore does **not** mean "AI". Every figure in the table above
+was produced without a single model call. The Bedrock agent is a separate
+command-line tool that is not wired into scans at all, which is why its
+reliability is the only part left unmeasured.
