@@ -383,9 +383,12 @@ def run_live_case(
     result.duration_seconds = time.monotonic() - started
 
     guidance_note = ""
+    result.discovery = "automatic"
     if record.state is ScanState.AWAITING_GUIDANCE:
+        result.discovery = "guided"
         guidance_note = attempt_guided_login(client, scan_id, case.setup, origin)
         if record.state is ScanState.AWAITING_GUIDANCE:
+            result.discovery = "failed"
             result.detail = guidance_note
             return result
         try:
@@ -415,7 +418,6 @@ def run_live_case(
         else Verdict.FAIL
     )
     result.detail = f"{guidance_note} {latest.get('explanation', '')}".strip()[:300]
-    result.discovery = "guided" if guidance_note else "automatic"
     return result
 
 

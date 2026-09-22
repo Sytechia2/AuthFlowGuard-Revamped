@@ -91,14 +91,14 @@ property holds: an unsupported flow produced `execution_error`, never
 
 | Tracker | Task | Status | Reason |
 | --- | --- | --- | --- |
-| EVA-004 | Discovery reliability, five runs per flow per application | **Blocked** | Requires live Bedrock discovery, which the web application does not use (Section 2). The terminal agent is also subject to the Nova quota problem recorded in `DEVELOPMENT.md` Section 5. |
+| EVA-004 | Discovery reliability of the **terminal Bedrock agent** | **Blocked** | The agent needs live AWS and is subject to the Nova quota problem in `DEVELOPMENT.md` Section 5. Discovery reliability of the web application's own rule-based discovery **was measured** — see Section 6. |
 | EVA-008 | Model token and cost measurement | **Blocked** | Requires live Bedrock calls. Browser request volume and scan duration **were** measured across 22 live scans (`evaluation/reports/measurements.md`). Cost accounting is implemented and tested (`cost_model`, `cost_tracking`) and will produce a table as soon as real model calls exist. No projected figure is published, because a projection is not a measurement. |
 
 ### EVA-006 failure testing is partial
 
-Task 5.3 names seven failure conditions. Four are evidenced, one is partly
-covered, and two are blocked on unfinished runtime work. **EVA-006 should be
-reported as substantially covered, not complete.**
+Task 5.3 names seven failure conditions. Five are evidenced, one is partly
+covered, and one is blocked because the component does not exist yet.
+**EVA-006 should be reported as substantially covered, not complete.**
 
 | Condition | State | Evidence or reason |
 | --- | --- | --- |
@@ -107,7 +107,7 @@ reported as substantially covered, not complete.**
 | Missing target features / target errors | Covered | Eleven fault-injection cases across three applications produce `execution_error` from the analyser |
 | Timeouts | Partly covered | Timeout paths appear in existing tests; no dedicated formal case |
 | Unsupported authentication | Covered | Application B's two-step JSON login is unsupported by CHK-001 and by the guided fallback; both refuse rather than pass (Section 4.1) |
-| Bedrock outages | **Blocked** | Web scans do not call Bedrock, so there is no outage to simulate |
+| Bedrock outages | Covered | `test_evaluation_failures.py` drives the controller against an unreachable model: it escalates to guidance, never reports success, and does not leak the service error into the operator-facing reason |
 | Worker failure | **Blocked** | Scans run in a background thread; the separate worker process (RUN-002) does not exist yet |
 
 The task's completion criterion — that no failed or unsupported test is reported
@@ -121,7 +121,7 @@ These are dependencies on unfinished integration work, not gaps in the
 evaluation method. Scan duration *was* recorded for all 24 executed cases and is
 in `evaluation/reports/formal-cases.csv`.
 
-## 6. Test suite
+## 7. Test suite
 
 `backend/tests/test_react_json_app.py::test_automatic_flow_supports_two_step_json_and_bearer_sessions`
 fails when the full suite runs, and passes when run alone. The failure is
@@ -135,3 +135,37 @@ in its dev extras, so a environment built from `pyproject.toml` could not
 collect it. **The dependency should be corrected to `httpx2`.**
 
 Current state: **213 passed, 1 failed**.
+
+## 6. Discovery reliability, measured
+
+EVA-004 was **not** blocked. Login discovery in a scan started from the web
+interface is rule-based — `scan_manager.py` contains no Bedrock reference — so
+it can be measured without AWS. Each application's login flow was attempted
+five times against a freshly started fixture.
+
+| Application | Automatic | Guided | Failed | Meets the 4/5 automatic target |
+| --- | --- | --- | --- | --- |
+| A — forms and cookies | 5/5 | 0/5 | 0/5 | Yes |
+| B — React, JSON, bearer token | 2/5 | 0/5 | 3/5 | **No** |
+| C — independent withheld layout | 0/5 | 5/5 | 0/5 | No |
+
+Three findings follow from this table.
+
+**Application B's automatic discovery is non-deterministic.** It succeeded on
+two attempts out of five, and attempt durations ranged from 0.89 s to 94.49 s
+against an identical fixture. This is very likely the same defect as the
+intermittent `test_react_json_app` full-suite failure in Section 7: both involve
+the React/JSON target and both are order- or timing-dependent. **This is the
+most serious reliability finding in the evaluation** and should be assigned
+before any reliability claim is published.
+
+**Application C never completes automatically, and always completes guided.**
+Its sign-in page carries two forms, which discovery treats as ambiguous. As the
+independently designed target, it is doing exactly the job it was built for.
+
+**Application A meets the target** at 5 of 5, with durations between 4.71 s and
+4.80 s.
+
+What remains unmeasured is the reliability of the *terminal Bedrock agent*, for
+the reason in Section 5. The distinction matters: the product's shipping
+discovery path has been measured; its optional AI path has not.

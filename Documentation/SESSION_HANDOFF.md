@@ -10,11 +10,11 @@ happens to any single machine's session history.
 | Task | Tracker | Status | Evidence |
 | --- | --- | --- | --- |
 | Execute the formal check cases | EVA-005 | **Done, all three applications** | `evaluation/reports/formal-cases.md` — 44 cases, 41 pass |
-| Test failure situations | EVA-006 | **Substantially covered** | 4 of 7 conditions evidenced, 1 partial, 2 blocked. `KNOWN_LIMITATIONS.md` §5 |
+| Test failure situations | EVA-006 | **Substantially covered** | 5 of 7 conditions evidenced, 1 partial, 1 blocked. `KNOWN_LIMITATIONS.md` §5 |
 | Confirm offline analysis and reports | EVA-007 | **Done** | `evaluation/reports/offline-verification.md` — 6/6 pass |
 | Decide session-check scope | Task 5.6 | **Done — all three deferred** | `Documentation/KNOWN_LIMITATIONS.md` §1 |
 | Freeze features, list limitations | REL-001 | **Done** | `Documentation/KNOWN_LIMITATIONS.md` |
-| Discovery reliability | EVA-004 | **Blocked** | Needs live Bedrock; web scans do not call it. Limitations §5 |
+| Discovery reliability | EVA-004 | **Measured for web scans** | `evaluation/reports/discovery-reliability.md` — A 5/5, B 2/5, C 0/5 automatic |
 | Usage, cost, duration | EVA-008 | **Measured except model cost** | `evaluation/reports/measurements.md` — 22 scans, requests and durations |
 
 ## How to reproduce every number
@@ -27,6 +27,10 @@ python -m authflowguard.evaluation.case_runner --application A,B,C --run-id my-r
 
 # Measured consumption: browser requests and durations
 python -m authflowguard.evaluation.measurements my-run --out evaluation/reports/measurements.md
+
+# EVA-004: discovery reliability, five attempts per application
+python -m authflowguard.evaluation.discovery_reliability `
+  --out evaluation/reports/discovery-reliability.md
 
 # Render the submission table
 python -m authflowguard.evaluation.tables evaluation/results/my-run/results.json
@@ -67,11 +71,14 @@ Raw scan data under `evaluation/results/*/scan-data/` is gitignored; the
    the product to make those rows pass.
 2. Automatic discovery fails on Application C; all 16 cases ran guided. Worth
    investigating whether the two-form sign-in page can be disambiguated.
-3. EVA-006 still needs a dedicated timeout case. Bedrock-outage and
-   worker-failure testing stay blocked until those parts of the system exist.
-4. Correct `pyproject.toml` to depend on `httpx2`.
-5. Assign the `test_react_json_app` fixture-isolation defect (Member 2).
-6. EVA-004 and live cost figures unblock only when Bedrock is wired into web scans.
+3. **Application B's automatic discovery succeeds only 2 times in 5.** Likely
+   the same root cause as the intermittent `test_react_json_app` failure. This
+   is the most serious open reliability defect.
+4. EVA-006 still needs a dedicated timeout case. Worker-failure testing stays
+   blocked until a separate worker process exists.
+5. Correct `pyproject.toml` to depend on `httpx2`.
+6. Assign the `test_react_json_app` fixture-isolation defect (Member 2).
+7. Terminal-agent reliability and live cost figures unblock only when Bedrock is wired into web scans.
 
 ## Resuming the Claude Code session on another machine
 
