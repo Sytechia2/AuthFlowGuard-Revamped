@@ -106,6 +106,7 @@ class CaseResult:
     origin_used: str | None = None
     detail: str = ""
     duration_seconds: float = 0.0
+    discovery: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -119,6 +120,7 @@ class CaseResult:
             "scan_id": self.scan_id,
             "evidence_id": self.evidence_id,
             "origin_used": self.origin_used,
+            "discovery": self.discovery,
             "detail": self.detail,
             "duration_seconds": round(self.duration_seconds, 2),
         }
@@ -166,15 +168,22 @@ def rebase_url(url: str, origin: str) -> str:
 
 
 def execution_input_for(setup: CaseSetup, origin: str) -> ScanExecutionInput:
+    secrets = {
+        "known": setup.known_username,
+        "password": setup.known_password,
+        "missing": setup.nonexistent_username,
+        "failure": setup.failure_password,
+    }
+    # A two-step login supplies a verification code as a separate reference.
+    second_factor = getattr(setup, "second_factor", None)
+    if second_factor:
+        secrets["second_factor"] = str(second_factor)
+
     return ScanExecutionInput(
-        runtime_secrets={
-            "known": setup.known_username,
-            "password": setup.known_password,
-            "missing": setup.nonexistent_username,
-            "failure": setup.failure_password,
-        },
+        runtime_secrets=secrets,
         username_reference="known",
         password_reference="password",
+        second_factor_reference="second_factor" if second_factor else None,
         nonexistent_identifier_reference="missing",
         failure_password_reference="failure",
         protected_resource=rebase_url(setup.protected_resource_url, origin),
@@ -194,6 +203,126 @@ def scan_request_for(case: FormalCase, setup: CaseSetup, origin: str) -> ScanReq
     if case.security_policy:
         payload["policy"] = case.security_policy
     return ScanRequest.model_validate(payload)
+
+
+USERNAME_HINTS = ("username", "email", "user", "login", "member", "identifier")
+
+
+def choose_guided_controls(
+    controls: list[dict[str, Any]],
+) -> tuple[str, str, str] | None:
+    """Pick the username, password and submit controls from an observation.
+
+    Chosen by role rather than by name, so this works on an application whose
+    labels were never shown to the discovery implementation.
+    """
+
+    password = next((c for c in controls if str(c.get("type")) == "password"), None)
+    submit = next(
+        (
+            c
+            for c in controls
+            if str(c.get("tag")) == "button"
+            or str(c.get("type")) in {"submit", "button"}
+        ),
+        None,
+    )
+    username = next(
+        (
+            c
+            for c in controls
+            if str(c.get("tag")) == "input"
+            and str(c.get("type")) not in {"password", "hidden", "submit"}
+            and c.get("visible", True)
+            and any(
+                hint in f"{c.get('name', '')}{c.get('aria_label', '')}".lower()
+                for hint in USERNAME_HINTS
+            )
+        ),
+        None,
+    )
+    if username is None:
+        username = next(
+            (
+                c
+                for c in controls
+                if str(c.get("tag")) == "input"
+                and c.get("visible", True)
+                and str(c.get("type")) not in {"password", "hidden", "submit"}
+            ),
+            None,
+        )
+    if username is None or password is None or submit is None:
+        return None
+    return (
+        str(username["observed_control_id"]),
+        str(password["observed_control_id"]),
+        str(submit["observed_control_id"]),
+    )
+
+
+def attempt_guided_login(
+    client: TestClient,
+    scan_id: str,
+    setup: CaseSetup,
+    origin: str,
+) -> str:
+    """Supply a guided login flow after automatic discovery paused.
+
+    Returns a short note describing what happened, for the case result.
+    """
+
+    observation = client.post(f"/api/scans/{scan_id}/guidance/observe")
+    if observation.status_code != 200:
+        return f"Guided observation failed: HTTP {observation.status_code}."
+
+    controls = observation.json().get("controls", [])
+    chosen = choose_guided_controls(controls)
+    if chosen is None:
+        return (
+            "Guided fallback could not identify a username, password and submit "
+            f"control among {len(controls)} observed controls."
+        )
+
+    username_id, password_id, submit_id = chosen
+    submission = client.post(
+        f"/api/scans/{scan_id}/guidance",
+        json={
+            "actions": [
+                {
+                    "action_type": "navigate",
+                    "url": rebase_url(setup.target_url, origin),
+                    "description": "Open the login page",
+                },
+                {
+                    "action_type": "fill",
+                    "observed_control_id": username_id,
+                    "value_reference": "known",
+                    "description": "Fill the account identifier",
+                },
+                {
+                    "action_type": "fill",
+                    "observed_control_id": password_id,
+                    "value_reference": "password",
+                    "description": "Fill the password",
+                },
+                {
+                    "action_type": "click",
+                    "observed_control_id": submit_id,
+                    "description": "Submit the login form",
+                },
+            ],
+            "protected_resource": rebase_url(setup.protected_resource_url, origin),
+            "account_marker_selector": setup.marker_selector,
+            "account_marker_description": "Authenticated account marker",
+        },
+    )
+    if submission.status_code != 200:
+        return (
+            f"Guided flow rejected: HTTP {submission.status_code} "
+            f"{submission.text[:120]}"
+        )
+    return "Automatic discovery paused; completed through the guided fallback."
 
 
 def run_live_case(
@@ -253,11 +382,18 @@ def run_live_case(
 
     result.duration_seconds = time.monotonic() - started
 
+    guidance_note = ""
     if record.state is ScanState.AWAITING_GUIDANCE:
-        result.detail = (
-            "Automatic login discovery paused for guidance, so no check ran."
-        )
-        return result
+        guidance_note = attempt_guided_login(client, scan_id, case.setup, origin)
+        if record.state is ScanState.AWAITING_GUIDANCE:
+            result.detail = guidance_note
+            return result
+        try:
+            record.future.result(timeout=SCAN_TIMEOUT_SECONDS)
+        except Exception as error:  # noqa: BLE001 - recorded, never raised
+            result.detail = f"{guidance_note} Guided scan raised: {error!r}"
+            return result
+        result.duration_seconds = time.monotonic() - started
 
     snapshot = client.get(f"/api/scans/{scan_id}").json()
     results = snapshot.get("results") or []
@@ -278,7 +414,8 @@ def run_live_case(
         if result.actual_outcome == case.expected_outcome.value
         else Verdict.FAIL
     )
-    result.detail = latest.get("explanation", "")[:300]
+    result.detail = f"{guidance_note} {latest.get('explanation', '')}".strip()[:300]
+    result.discovery = "guided" if guidance_note else "automatic"
     return result
 
 
@@ -290,6 +427,16 @@ def fixture_for(application: str, fixture_mode: str) -> FastAPI:
     )
     if application == "A":
         return create_controlled_app(mode)
+    if application == "B":
+        from authflowguard.evaluation_targets.react_json_app import (
+            create_react_json_app,
+        )
+
+        return create_react_json_app(mode)
+    if application == "C":
+        from authflowguard.evaluation_targets.site_app import create_site_app
+
+        return create_site_app(mode)
     raise ValueError(f"No fixture builder is wired for application {application}")
 
 
@@ -519,6 +666,41 @@ FAULTS: dict[str, FaultSpec] = {
         "route",
         "Logout submission returns HTTP 503 after the session is captured.",
     ),
+    "B-CHK-001-execution-failure": FaultSpec(
+        "POST",
+        "/api/auth/start",
+        2,
+        "target",
+        "Target fails after login proof and before the second comparison pair.",
+    ),
+    "C-CHK-001-execution-failure": FaultSpec(
+        "POST",
+        "/desk/entry",
+        2,
+        "target",
+        "Target fails after the first known/nonexistent comparison pair.",
+    ),
+    "C-CHK-004-execution-failure": FaultSpec(
+        "POST",
+        "/desk/entry",
+        1,
+        "target",
+        "Target fails after the first failed sign-in attempt.",
+    ),
+    "C-CHK-005-execution-failure": FaultSpec(
+        "GET",
+        "/desk/bookings",
+        2,
+        "route",
+        "Protected page returns HTTP 503 during the isolated replay.",
+    ),
+    "C-CHK-006-execution-failure": FaultSpec(
+        "POST",
+        "/desk/depart",
+        0,
+        "route",
+        "Sign-out submission returns HTTP 503 after the session is captured.",
+    ),
 }
 
 
@@ -635,7 +817,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--cases", type=Path, default=Path("evaluation/cases/formal_cases.json")
     )
-    parser.add_argument("--application", default="A")
+    parser.add_argument(
+        "--application", default="A", help="Comma separated, e.g. A,B,C"
+    )
     parser.add_argument("--run-id", default=datetime.now(UTC).strftime("%Y%m%d-%H%M%S"))
     parser.add_argument("--results-root", type=Path, default=Path("evaluation/results"))
     parser.add_argument(
@@ -645,10 +829,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     arguments = parser.parse_args(argv)
 
+    wanted = {name.strip() for name in str(arguments.application).split(",")}
     selected = [
-        case
-        for case in load_cases(arguments.cases)
-        if case.application == arguments.application
+        case for case in load_cases(arguments.cases) if case.application in wanted
     ]
     run_directory = arguments.results_root / arguments.run_id
     if arguments.reuse_scan_data:

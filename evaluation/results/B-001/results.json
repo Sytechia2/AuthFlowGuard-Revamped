@@ -1,0 +1,67 @@
+{
+  "case_file": "evaluation/cases/formal_cases.json",
+  "generated_at": "2026-09-22T19:03:46.996049+00:00",
+  "results": [
+    {
+      "actual_outcome": "execution_error",
+      "application": "B",
+      "case_id": "B-CHK-001-secure",
+      "check_id": "login_enumeration",
+      "detail": "One or more login enumeration attempts failed before comparison.",
+      "discovery": "automatic",
+      "duration_seconds": 94.63,
+      "evidence_id": "f2208df7-86a9-459a-ba78-8271c26f5299",
+      "execution_mode": "live_scan",
+      "expected_outcome": "no_issue_observed",
+      "origin_used": "http://127.0.0.1:7412",
+      "scan_id": "8c93fb9f-cf56-4204-9d9e-baf45d08e308",
+      "verdict": "fail"
+    },
+    {
+      "actual_outcome": null,
+      "application": "B",
+      "case_id": "B-CHK-001-vulnerable",
+      "check_id": "login_enumeration",
+      "detail": "Guided fallback could not identify a username, password and submit control among 4 observed controls.",
+      "discovery": null,
+      "duration_seconds": 4.03,
+      "evidence_id": null,
+      "execution_mode": "live_scan",
+      "expected_outcome": "finding_confirmed",
+      "origin_used": "http://127.0.0.1:5075",
+      "scan_id": "41c5f371-8e5c-4f48-b4a8-d31f5338e292",
+      "verdict": "blocked"
+    },
+    {
+      "actual_outcome": "execution_error",
+      "application": "B",
+      "case_id": "B-CHK-001-ambiguous",
+      "check_id": "login_enumeration",
+      "detail": "Retained two of three comparison pairs. One or more login enumeration attempts failed before comparison.",
+      "discovery": null,
+      "duration_seconds": 0.01,
+      "evidence_id": "f2208df7-86a9-459a-ba78-8271c26f5299",
+      "execution_mode": "offline_analysis",
+      "expected_outcome": "inconclusive",
+      "origin_used": null,
+      "scan_id": "8c93fb9f-cf56-4204-9d9e-baf45d08e308",
+      "verdict": "fail"
+    },
+    {
+      "actual_outcome": "execution_error",
+      "application": "B",
+      "case_id": "B-CHK-001-execution-failure",
+      "check_id": "login_enumeration",
+      "detail": "[target] Target fails after login proof and before the second comparison pair. One or more login enumeration attempts failed before comparison.",
+      "discovery": "automatic",
+      "duration_seconds": 33.96,
+      "evidence_id": "59d0081c-8041-4ceb-8ea1-3764a8a52b6f",
+      "execution_mode": "fault_injection",
+      "expected_outcome": "execution_error",
+      "origin_used": "http://127.0.0.1:28231",
+      "scan_id": "06fb8fd3-76f4-45d8-92e2-9364982af6cd",
+      "verdict": "pass"
+    }
+  ],
+  "run_id": "B-001"
+}

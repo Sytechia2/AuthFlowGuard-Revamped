@@ -1,6 +1,6 @@
 # Known Limitations
 
-**Prepared by Member 5 for REL-001, 22 September 2026.**
+**Prepared by Member 5 for REL-001, 23 September 2026.**
 
 This is the single consolidated list of what AuthFlowGuard does not do. It
 exists so that no incomplete behaviour is presented as complete. Every entry
@@ -34,7 +34,7 @@ signed-in/signed-out comparison, run the six checks, or persist a scan through
 ScanManager.
 
 Consequently the measurements that depend on live model behaviour — discovery
-reliability (EVA-004) and token/cost measurement (EVA-008) — could not be taken.
+reliability (EVA-004) and model token/cost measurement — could not be taken.
 See Section 5.
 
 ## 3. Runtime
@@ -48,8 +48,14 @@ See Section 5.
 
 ## 4. Evaluation coverage
 
-- The formal 24-case matrix was executed against **Application A only**. Cases
-  for Applications B (4) and C (16) are authored but **not executed**.
+- All 44 authored cases were executed: Application A (24), B (4) and C (16).
+  41 passed. The three exceptions are all Application B and are recorded in
+  Section 4.1 as findings, not as harness defects.
+- **Automatic login discovery did not succeed on Application C.** All 16 of its
+  cases completed through the guided fallback instead. The site presents two
+  forms on the sign-in page, which discovery treats as ambiguous. This is the
+  intended purpose of an independently designed target, and it is the clearest
+  generality result the evaluation produced.
 - Application C (`site_app`) has no registration or reset-request features, so
   those two checks have no cases for it. That is an absence of the feature, not
   a pass.
@@ -62,35 +68,54 @@ See Section 5.
   the case file, so a run cannot fail because a port was busy. The origin
   actually used is recorded on every result.
 
+### 4.1 Application B — login enumeration is not supported
+
+Application B uses a two-step JSON login with a verification code and a bearer
+token. Automatic discovery succeeded and login was proven, but CHK-001 could
+not run: the enumeration runner submits failed logins through a native form,
+and Application B has no such form.
+
+| Case | Expected | Actual | Reading |
+| --- | --- | --- | --- |
+| `B-CHK-001-secure` | `no_issue_observed` | `execution_error` | The product refused to claim a pass it could not evidence. The case expectation was optimistic. |
+| `B-CHK-001-ambiguous` | `inconclusive` | `execution_error` | Derived from the secure run's evidence, so it inherits the same outcome. |
+| `B-CHK-001-vulnerable` | `finding_confirmed` | not reached | Automatic discovery paused, and the guided fallback submits a username, a password and a submit control. It cannot express a two-step flow whose second step is a verification code. |
+| `B-CHK-001-execution-failure` | `execution_error` | `execution_error` | Passed. |
+
+**These expectations were not adjusted to make the rows pass.** The correct
+correction is to record CHK-001 as unsupported for Application B. The important
+property holds: an unsupported flow produced `execution_error`, never
+`no_issue_observed`.
+
 ## 5. Measurements not taken
 
 | Tracker | Task | Status | Reason |
 | --- | --- | --- | --- |
 | EVA-004 | Discovery reliability, five runs per flow per application | **Blocked** | Requires live Bedrock discovery, which the web application does not use (Section 2). The terminal agent is also subject to the Nova quota problem recorded in `DEVELOPMENT.md` Section 5. |
-| EVA-008 | Token, cost, and duration measurement | **Blocked for live figures** | Requires live Bedrock calls. Cost accounting infrastructure is implemented and tested (`authflowguard.evaluation.cost_model`, `cost_tracking`), and can produce projected figures from fixture token counts, but every such figure is labelled `MOCK ONLY` and is not an AWS charge. |
+| EVA-008 | Model token and cost measurement | **Blocked** | Requires live Bedrock calls. Browser request volume and scan duration **were** measured across 22 live scans (`evaluation/reports/measurements.md`). Cost accounting is implemented and tested (`cost_model`, `cost_tracking`) and will produce a table as soon as real model calls exist. No projected figure is published, because a projection is not a measurement. |
 
 ### EVA-006 failure testing is partial
 
-Task 5.3 names seven failure conditions. Three are evidenced, two are blocked on
-unfinished runtime work, and two remain untested. **EVA-006 must not be reported
-as complete.**
+Task 5.3 names seven failure conditions. Four are evidenced, one is partly
+covered, and two are blocked on unfinished runtime work. **EVA-006 should be
+reported as substantially covered, not complete.**
 
 | Condition | State | Evidence or reason |
 | --- | --- | --- |
 | Stale saved flows | Covered | `test_enumeration_scans.py` returns a stale profile to `awaiting_guidance` before any check runs |
 | Cancellation | Covered | Cancellation tests in `test_enumeration_scans.py` and `test_app.py` |
-| Missing target features / target errors | Partly covered | Six fault-injection cases produce `execution_error` from the analyser |
+| Missing target features / target errors | Covered | Eleven fault-injection cases across three applications produce `execution_error` from the analyser |
 | Timeouts | Partly covered | Timeout paths appear in existing tests; no dedicated formal case |
-| Unsupported authentication | **Not tested** | No case exercises an unsupported login shape end to end |
+| Unsupported authentication | Covered | Application B's two-step JSON login is unsupported by CHK-001 and by the guided fallback; both refuse rather than pass (Section 4.1) |
 | Bedrock outages | **Blocked** | Web scans do not call Bedrock, so there is no outage to simulate |
 | Worker failure | **Blocked** | Scans run in a background thread; the separate worker process (RUN-002) does not exist yet |
 
 The task's completion criterion — that no failed or unsupported test is reported
-as a security pass — holds for every condition that was exercised. Twelve of the
-twenty-four executed cases exist specifically to demonstrate it: six degrade
-saved evidence and require `inconclusive`, and six inject server errors during a
-real scan and require `execution_error`. Neither may be reported as
-`no_issue_observed`.
+as a security pass — holds for every condition that was exercised. Twenty-two of
+the forty-four executed cases exist specifically to demonstrate it: eleven
+degrade saved evidence and require `inconclusive`, and eleven inject server
+errors during a real scan and require `execution_error`. Neither may be reported
+as `no_issue_observed`.
 
 These are dependencies on unfinished integration work, not gaps in the
 evaluation method. Scan duration *was* recorded for all 24 executed cases and is

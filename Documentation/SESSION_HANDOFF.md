@@ -9,21 +9,24 @@ happens to any single machine's session history.
 
 | Task | Tracker | Status | Evidence |
 | --- | --- | --- | --- |
-| Execute the formal check cases | EVA-005 | **Done, Application A** | `evaluation/reports/formal-cases.md` — 24/24 pass |
-| Test failure situations | EVA-006 | **Partial — do not report as done** | 3 of 7 named conditions evidenced, 2 blocked, 2 untested. `KNOWN_LIMITATIONS.md` §5 |
+| Execute the formal check cases | EVA-005 | **Done, all three applications** | `evaluation/reports/formal-cases.md` — 44 cases, 41 pass |
+| Test failure situations | EVA-006 | **Substantially covered** | 4 of 7 conditions evidenced, 1 partial, 2 blocked. `KNOWN_LIMITATIONS.md` §5 |
 | Confirm offline analysis and reports | EVA-007 | **Done** | `evaluation/reports/offline-verification.md` — 6/6 pass |
 | Decide session-check scope | Task 5.6 | **Done — all three deferred** | `Documentation/KNOWN_LIMITATIONS.md` §1 |
 | Freeze features, list limitations | REL-001 | **Done** | `Documentation/KNOWN_LIMITATIONS.md` |
 | Discovery reliability | EVA-004 | **Blocked** | Needs live Bedrock; web scans do not call it. Limitations §5 |
-| Usage, cost, duration | EVA-008 | **Blocked for live figures** | Infrastructure built and tested; live numbers need Bedrock. Limitations §5 |
+| Usage, cost, duration | EVA-008 | **Measured except model cost** | `evaluation/reports/measurements.md` — 22 scans, requests and durations |
 
 ## How to reproduce every number
 
 From the repository root, with the environment from `DEVELOPMENT.md` §1:
 
 ```powershell
-# 24 formal cases (live, degraded-evidence, and fault-injection)
-python -m authflowguard.evaluation.case_runner --run-id my-run
+# All 44 cases across the three applications
+python -m authflowguard.evaluation.case_runner --application A,B,C --run-id my-run
+
+# Measured consumption: browser requests and durations
+python -m authflowguard.evaluation.measurements my-run --out evaluation/reports/measurements.md
 
 # Render the submission table
 python -m authflowguard.evaluation.tables evaluation/results/my-run/results.json
@@ -59,17 +62,16 @@ Raw scan data under `evaluation/results/*/scan-data/` is gitignored; the
 
 ## Outstanding, for whoever picks this up
 
-1. Applications B (4 cases) and C (16 cases) are authored but not executed. The
-   runner's `fixture_for()` only wires Application A; add `react_json_app` and
-   `site_app` to execute them. Note the requirement is "at least 24" scenarios
-   "mainly" on Application A, so running only A meets the minimum but is not a
-   documented cap.
-2. EVA-006 needs cases for unsupported authentication and an explicit timeout.
-   Bedrock-outage and worker-failure testing stay blocked until those parts of
-   the system exist.
-3. Correct `pyproject.toml` to depend on `httpx2`.
-4. Assign the `test_react_json_app` fixture-isolation defect (Member 2).
-5. EVA-004 and EVA-008 unblock only when Bedrock is wired into web scans.
+1. Kevin's Application B expectations need correcting: CHK-001 is unsupported
+   against a two-step JSON login. See `KNOWN_LIMITATIONS.md` §4.1. Do not change
+   the product to make those rows pass.
+2. Automatic discovery fails on Application C; all 16 cases ran guided. Worth
+   investigating whether the two-form sign-in page can be disambiguated.
+3. EVA-006 still needs a dedicated timeout case. Bedrock-outage and
+   worker-failure testing stay blocked until those parts of the system exist.
+4. Correct `pyproject.toml` to depend on `httpx2`.
+5. Assign the `test_react_json_app` fixture-isolation defect (Member 2).
+6. EVA-004 and live cost figures unblock only when Bedrock is wired into web scans.
 
 ## Resuming the Claude Code session on another machine
 
