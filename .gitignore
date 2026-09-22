@@ -189,3 +189,7 @@ cython_debug/
 .agents/
 .codex/
 .impeccable/
+
+# Member 5 evaluation runs: keep results and reports, not raw scan data
+evaluation/results/*/scan-data/
+evaluation/results/*/fault-scan-data/
