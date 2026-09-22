@@ -142,3 +142,51 @@ def test_a_recovering_model_service_does_not_strand_the_scan(failures: int) -> N
                 await browser.close()
 
     assert asyncio.run(scenario()) >= 1
+
+
+def test_a_target_that_stops_responding_never_reports_a_security_pass() -> None:
+    """A protected resource that hangs must not be read as a clean result.
+
+    EVA-006 requires a timeout to produce an explicit outcome. The dangerous
+    failure is a navigation that never settles being treated as "nothing
+    observed", which would read as no_issue_observed.
+    """
+
+    from pathlib import Path
+
+    from authflowguard.evaluation.case_runner import (
+        FaultSpec,
+        fixture_for,
+        load_cases,
+        run_live_case,
+        serve,
+        with_injected_fault,
+    )
+    from authflowguard.models import CheckOutcome
+
+    case = next(
+        c
+        for c in load_cases(Path("evaluation/cases/formal_cases.json"))
+        if c.case_id == "A-CHK-005-secure"
+    )
+    hang = FaultSpec(
+        "GET",
+        "/account",
+        0,
+        "route",
+        "Protected resource stops responding.",
+        delay_seconds=45.0,
+    )
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as temporary:
+        fixture = with_injected_fault(fixture_for("A", "secure"), hang)
+        with serve(fixture) as origin:
+            result = run_live_case(case, origin, Path(temporary))
+
+    assert result.actual_outcome != CheckOutcome.NO_ISSUE_OBSERVED.value, (
+        "A target that stopped responding was reported as a security pass"
+    )
+    assert result.actual_outcome in (None, CheckOutcome.EXECUTION_ERROR.value)
+    assert result.detail, "A timeout must be explained, not left silent"

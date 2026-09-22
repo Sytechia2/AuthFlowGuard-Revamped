@@ -10,6 +10,7 @@ URLs are rewritten to it, so a run cannot fail because port 8001 happened to
 be busy; the origin actually used is recorded on every result.
 """
 
+import asyncio
 import json
 import socket
 import time
@@ -623,6 +624,7 @@ class FaultSpec:
     trigger_after: int
     scope: str
     description: str
+    delay_seconds: float = 0.0
 
 
 FAULTS: dict[str, FaultSpec] = {
@@ -737,6 +739,10 @@ def with_injected_fault(application: FastAPI, fault: FaultSpec) -> FastAPI:
             else is_named_route and state["matches"] > fault.trigger_after
         )
         if should_fail:
+            if fault.delay_seconds:
+                # Stop responding rather than answering with an error, so the
+                # scan meets a navigation that never settles.
+                await asyncio.sleep(fault.delay_seconds)
             response = PlainTextResponse("Service unavailable", status_code=503)
             await response(scope, receive, send)
             return

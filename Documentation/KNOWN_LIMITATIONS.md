@@ -96,16 +96,16 @@ property holds: an unsupported flow produced `execution_error`, never
 
 ### EVA-006 failure testing is partial
 
-Task 5.3 names seven failure conditions. Five are evidenced, one is partly
-covered, and one is blocked because the component does not exist yet.
-**EVA-006 should be reported as substantially covered, not complete.**
+Task 5.3 names seven failure conditions. **Six are evidenced. One is blocked**
+because the component it tests does not exist yet, so EVA-006 is as complete as
+it can be before RUN-002 lands.
 
 | Condition | State | Evidence or reason |
 | --- | --- | --- |
 | Stale saved flows | Covered | `test_enumeration_scans.py` returns a stale profile to `awaiting_guidance` before any check runs |
 | Cancellation | Covered | Cancellation tests in `test_enumeration_scans.py` and `test_app.py` |
 | Missing target features / target errors | Covered | Eleven fault-injection cases across three applications produce `execution_error` from the analyser |
-| Timeouts | Partly covered | Timeout paths appear in existing tests; no dedicated formal case |
+| Timeouts | Covered | `test_evaluation_failures.py` drives a real scan against a protected resource that stops responding, and asserts the result is never `no_issue_observed`. Model-request timeouts are covered separately by the active-time-limit test |
 | Unsupported authentication | Covered | Application B's two-step JSON login is unsupported by CHK-001 and by the guided fallback; both refuse rather than pass (Section 4.1) |
 | Bedrock outages | Covered | `test_evaluation_failures.py` drives the controller against an unreachable model: it escalates to guidance, never reports success, and does not leak the service error into the operator-facing reason |
 | Worker failure | **Blocked** | Scans run in a background thread; the separate worker process (RUN-002) does not exist yet |
