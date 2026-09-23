@@ -1,7 +1,9 @@
 """Append-only local storage for redacted scan evidence and result versions."""
 
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
@@ -30,6 +32,27 @@ _SENSITIVE_KEY_NAMES = {
     "value",
     "values",
 }
+
+_event_sink: ContextVar[Any] = ContextVar("authflowguard_event_sink", default=None)
+
+
+@contextmanager
+def incremental_event_sink(sink: Any) -> Iterator[None]:
+    """Install a scan-local sink for completed redacted events."""
+
+    token = _event_sink.set(sink)
+    try:
+        yield
+    finally:
+        _event_sink.reset(token)
+
+
+def publish_completed_events(events: Iterable[EvidenceEvent]) -> None:
+    """Flush completed events without coupling execution code to persistence."""
+
+    sink = _event_sink.get()
+    if sink is not None:
+        sink(list(events))
 
 
 def _redact_value(

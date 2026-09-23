@@ -18,6 +18,7 @@ from authflowguard.bedrock import (
     ObservedControlForModel,
     PageObservationForModel,
 )
+from authflowguard.cancellation import cancellation_checkpoint
 from authflowguard.models import (
     BrowserAction,
     BrowserActionType,
@@ -80,6 +81,7 @@ class AutomaticBrowserController:
         limits: ExecutionLimits,
         credential_references: list[str],
         progress_callback: ProgressCallback | None = None,
+        cancel_requested: Callable[[], bool] = lambda: False,
     ) -> None:
         self._page = page
         self._target = target
@@ -88,6 +90,7 @@ class AutomaticBrowserController:
         self._limits = limits
         self._credential_references = credential_references.copy()
         self._progress_callback = progress_callback
+        self._cancel_requested = cancel_requested
         self._executor = BrowserActionExecutor(
             page,
             target,
@@ -99,6 +102,7 @@ class AutomaticBrowserController:
     async def run(self, completion_check: CompletionCheck) -> AutomaticActionResult:
         """Run until the goal is reached or a configured boundary stops work."""
 
+        self._check_cancelled()
         events: list[EvidenceEvent] = []
         traffic: list[TrafficReference] = []
         decisions: list[BedrockActionDecision] = []
@@ -164,6 +168,7 @@ class AutomaticBrowserController:
             )
 
         while True:
+            self._check_cancelled()
             if time.monotonic() >= deadline:
                 events.append(self._stop_event("Automatic action time limit reached."))
                 return self._result(
@@ -195,6 +200,7 @@ class AutomaticBrowserController:
                 consecutive_failures > 0,
                 completed_fill_controls,
             )
+            self._check_cancelled()
             reserved_cost = self._action_client.estimate_maximum_cost(observation)
             if accounted_cost + reserved_cost > self._limits.maximum_inference_cost_usd:
                 events.append(self._stop_event("Automatic action cost limit reached."))
@@ -214,12 +220,15 @@ class AutomaticBrowserController:
             failure_phase = "model_selection"
             try:
                 decision = await asyncio.wait_for(
+                    # Task cancellation stops this await, but Python cannot kill an
+                    # SDK call that is already running in the helper thread.
                     asyncio.to_thread(
                         self._action_client.choose_action,
                         observation,
                     ),
                     timeout=self._remaining_seconds(deadline),
                 )
+                self._check_cancelled()
                 decisions.append(decision)
                 accounted_cost += decision.actual_cost_usd
                 failure_phase = "browser_execution"
@@ -405,6 +414,11 @@ class AutomaticBrowserController:
 
     def _remaining_seconds(self, deadline: float) -> float:
         return max(deadline - time.monotonic(), 0.0)
+
+    def _check_cancelled(self) -> None:
+        cancellation_checkpoint()
+        if self._cancel_requested():
+            raise asyncio.CancelledError("Automatic browser execution cancelled")
 
     def _required(self, control: Mapping[str, object], key: str) -> str:
         value = control.get(key)

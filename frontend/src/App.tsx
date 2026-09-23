@@ -35,6 +35,7 @@ type ScanStatus = {
   error?: string | null;
   profile_source?: "automatic" | "guided" | null;
   guidance_required?: boolean;
+  cancel_requested?: boolean;
 };
 
 type SafeControl = {
@@ -649,6 +650,61 @@ type DiscoveryViewProps = {
   onSubmitted: () => void;
 };
 
+type CancelScanButtonProps = {
+  scanId: string;
+  scan: ScanStatus | null;
+  onUpdated: (scan: ScanStatus) => void;
+  onError: (message: string | null) => void;
+};
+
+function CancelScanButton({
+  scanId,
+  scan,
+  onUpdated,
+  onError,
+}: CancelScanButtonProps) {
+  const [isCancelling, setIsCancelling] = useState(false);
+  const canCancel =
+    scan?.state === "running" || scan?.state === "awaiting_guidance";
+  const cancellationPending = isCancelling || scan?.cancel_requested === true;
+
+  if (!canCancel) return null;
+
+  async function cancelScan() {
+    setIsCancelling(true);
+    onError(null);
+    try {
+      const response = await fetch(
+        `/api/scans/${encodeURIComponent(scanId)}/cancel`,
+        { method: "POST" },
+      );
+      if (!response.ok) {
+        throw new Error("The scan could not be cancelled.");
+      }
+      onUpdated((await response.json()) as ScanStatus);
+    } catch (cancelError) {
+      onError(
+        cancelError instanceof Error
+          ? cancelError.message
+          : "Unable to cancel scan.",
+      );
+    } finally {
+      setIsCancelling(false);
+    }
+  }
+
+  return (
+    <button
+      className="secondary-button cancel-button"
+      disabled={cancellationPending}
+      onClick={() => void cancelScan()}
+      type="button"
+    >
+      {cancellationPending ? "Cancelling..." : "Cancel scan"}
+    </button>
+  );
+}
+
 function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
   const [scan, setScan] = useState<ScanStatus | null>(null);
   const [observation, setObservation] = useState<GuidanceObservation | null>(
@@ -874,14 +930,26 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
             this help step.
           </small>
         </div>
-        <button
-          className="secondary-button"
-          disabled={isObserving || scan?.state !== "awaiting_guidance"}
-          onClick={() => void observePage()}
-          type="button"
-        >
-          {isObserving ? "Finding fields..." : "Find login fields"}
-        </button>
+        <div className="button-row">
+          <button
+            className="secondary-button"
+            disabled={
+              isObserving ||
+              scan?.state !== "awaiting_guidance" ||
+              scan.cancel_requested === true
+            }
+            onClick={() => void observePage()}
+            type="button"
+          >
+            {isObserving ? "Finding fields..." : "Find login fields"}
+          </button>
+          <CancelScanButton
+            onError={setError}
+            onUpdated={setScan}
+            scan={scan}
+            scanId={scanId}
+          />
+        </div>
       </section>
 
       <section className="panel controls-panel">
@@ -1082,7 +1150,11 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
         )}
         <button
           className="primary-button"
-          disabled={isSubmitting}
+          disabled={
+            isSubmitting ||
+            scan?.state !== "awaiting_guidance" ||
+            scan.cancel_requested === true
+          }
           type="submit"
         >
           {isSubmitting
@@ -1108,7 +1180,6 @@ function TestingView({
 }: TestingViewProps) {
   const [scan, setScan] = useState<ScanStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [isCancelling, setIsCancelling] = useState(false);
 
   useEffect(() => {
     if (!scanId) {
@@ -1147,29 +1218,6 @@ function TestingView({
     };
   }, [scanId]);
 
-  async function cancelScan() {
-    setIsCancelling(true);
-    setError(null);
-    try {
-      const response = await fetch(
-        `/api/scans/${encodeURIComponent(scanId)}/cancel`,
-        { method: "POST" },
-      );
-      if (!response.ok) {
-        throw new Error("The scan could not be cancelled.");
-      }
-      setScan((await response.json()) as ScanStatus);
-    } catch (cancelError) {
-      setError(
-        cancelError instanceof Error
-          ? cancelError.message
-          : "Unable to cancel scan.",
-      );
-    } finally {
-      setIsCancelling(false);
-    }
-  }
-
   if (!scanId) {
     return (
       <EmptyWorkspace
@@ -1203,16 +1251,12 @@ function TestingView({
           {error}
         </p>
       )}
-      {scan?.state === "running" && (
-        <button
-          className="secondary-button"
-          disabled={isCancelling}
-          onClick={() => void cancelScan()}
-          type="button"
-        >
-          {isCancelling ? "Cancelling..." : "Cancel scan"}
-        </button>
-      )}
+      <CancelScanButton
+        onError={setError}
+        onUpdated={setScan}
+        scan={scan}
+        scanId={scanId}
+      />
       {scan?.state === "awaiting_guidance" && (
         <div className="guidance-callout">
           <strong>Automatic discovery needs your guidance.</strong>

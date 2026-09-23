@@ -20,6 +20,8 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
+from authflowguard.cancellation import cancellation_checkpoint
+from authflowguard.evidence import publish_completed_events
 from authflowguard.models import (
     ActionWaitCondition,
     BrowserAction,
@@ -104,7 +106,9 @@ class BrowserActionExecutor:
         self._scope_guard_installed = False
 
     async def execute(self, action: BrowserAction) -> ActionExecutionResult:
+        cancellation_checkpoint()
         await self._install_scope_guard()
+        cancellation_checkpoint()
 
         if action.action_type is not BrowserActionType.NAVIGATE and not url_is_in_scope(
             self._page.url, self._target
@@ -143,7 +147,9 @@ class BrowserActionExecutor:
             self._page.remove_listener("request", record_request)
             self._page.remove_listener("response", record_response)
 
+        cancellation_checkpoint()
         page_after = await self._take_page_snapshot()
+        cancellation_checkpoint()
         page_changes = self._compare_page_snapshots(page_before, page_after)
         completed_at = datetime.now(UTC)
 
@@ -164,7 +170,7 @@ class BrowserActionExecutor:
             self._make_page_change_event(action.action_id, page_after, page_changes)
         )
 
-        return ActionExecutionResult(
+        result = ActionExecutionResult(
             action_id=action.action_id,
             started_at=started_at,
             completed_at=completed_at,
@@ -174,6 +180,8 @@ class BrowserActionExecutor:
             events=events,
             traffic=traffic,
         )
+        publish_completed_events(result.events)
+        return result
 
     async def _execute_action(self, action: BrowserAction) -> None:
         if action.action_type is BrowserActionType.NAVIGATE:
