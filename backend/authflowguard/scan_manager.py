@@ -53,7 +53,12 @@ from authflowguard.checks.session_fixation import (
     analyse_session_fixation,
     run_session_fixation_check,
 )
-from authflowguard.evidence import EvidenceStore, incremental_event_sink
+from authflowguard.evidence import (
+    EvidenceStore,
+    incremental_event_sink,
+    redact_persisted_data,
+    transient_secret_redaction,
+)
 from authflowguard.models import (
     AuthProfile,
     BrowserAction,
@@ -67,7 +72,7 @@ from authflowguard.models import (
 )
 from authflowguard.reports import export_scan_reports
 from authflowguard.scope import url_without_query_or_fragment
-from authflowguard.secrets import RuntimeSecrets
+from authflowguard.secrets import RuntimeSecrets, redact_text
 
 ANALYSERS = {
     CheckId.LOGIN_ENUMERATION: analyse_login_enumeration,
@@ -118,6 +123,19 @@ class ScanExecutionInput(BaseModel):
     registration_url: HttpUrl | None = None
     reset_request_url: HttpUrl | None = None
     registration_password_reference: str | None = None
+
+    def secret_values(self) -> tuple[str, ...]:
+        return tuple(value for value in self.runtime_secrets.values() if value)
+
+    def redact_text(self, value: str) -> str:
+        return redact_text(value, self.runtime_secrets.values())
+
+    def discard_runtime_secrets(self) -> None:
+        """Release this transient owner's credential references idempotently."""
+
+        for reference_id in list(self.runtime_secrets):
+            self.runtime_secrets[reference_id] = ""
+        self.runtime_secrets.clear()
 
 
 class GuidanceSubmission(BaseModel):
@@ -195,20 +213,30 @@ class ScanManager:
             raise KeyError(f"Unknown scan '{scan_id}'") from error
 
     def start_scan(self, scan_id: UUID, execution: ScanExecutionInput) -> ScanRecord:
-        with self._lock:
-            record = self._get_scan_locked(scan_id)
-            if record.state is not ScanState.CREATED:
-                raise ValueError("Only a created scan can be started")
-            if any(self._is_active(other) for other in self._records.values()):
-                raise ValueError("Another scan is already running")
-            record.state = ScanState.RUNNING
-            self._persist_state(record)
-            record.future = self._executor.submit(
-                self._run_scan,
-                record,
-                execution,
-            )
-            return record
+        try:
+            with self._lock:
+                record = self._get_scan_locked(scan_id)
+                if record.state is not ScanState.CREATED:
+                    raise ValueError("Only a created scan can be started")
+                if any(self._is_active(other) for other in self._records.values()):
+                    raise ValueError("Another scan is already running")
+                record.state = ScanState.RUNNING
+                self._persist_state(record)
+                try:
+                    record.future = self._executor.submit(
+                        self._run_scan,
+                        record,
+                        execution,
+                    )
+                except BaseException:
+                    record.state = ScanState.FAILED
+                    record.error = "The scan worker could not be started"
+                    self._persist_state(record)
+                    raise
+                return record
+        except BaseException:
+            execution.discard_runtime_secrets()
+            raise
 
     def cancel_scan(self, scan_id: UUID) -> ScanRecord:
         with self._lock:
@@ -226,7 +254,7 @@ class ScanManager:
                 and record.pending_observations == 0
             ):
                 record.state = ScanState.CANCELLED
-                record.pending_execution = None
+                self._discard_pending_execution(record)
                 self._persist_state(record)
                 self._export_reports(record)
             else:
@@ -247,6 +275,11 @@ class ScanManager:
             if record.cancel_requested:
                 raise ValueError("The scan has been cancelled")
             record.pending_observations += 1
+            secret_values = (
+                record.pending_execution.secret_values()
+                if record.pending_execution is not None
+                else ()
+            )
         loop = asyncio.get_running_loop()
         try:
             observation = await loop.run_in_executor(
@@ -254,6 +287,7 @@ class ScanManager:
                 self._observe_guidance_in_worker,
                 record,
                 str(observation_url) if observation_url else None,
+                secret_values,
             )
         except asyncio.CancelledError:
             raise RuntimeError("Guidance observation cancelled") from None
@@ -267,27 +301,34 @@ class ScanManager:
                 self._finalize_cancelled(record)
         if record.cancel_requested:
             raise RuntimeError("Guidance observation cancelled")
-        self._save_events(record, [observation.event])
+        with transient_secret_redaction(secret_values):
+            safe_event = EvidenceEvent.model_validate(
+                redact_persisted_data(observation.event.model_dump(mode="json"))
+            )
+        self._save_events(record, [safe_event])
+        safe_controls = safe_event.redacted_details.get("controls", [])
         return {
             "scan_id": str(record.scan_id),
-            "event_id": str(observation.event.event_id),
-            "url": observation.event.redacted_details.get("url"),
-            "title": observation.event.redacted_details.get("title"),
-            "controls": observation.controls,
+            "event_id": str(safe_event.event_id),
+            "url": safe_event.redacted_details.get("url"),
+            "title": safe_event.redacted_details.get("title"),
+            "controls": safe_controls if isinstance(safe_controls, list) else [],
         }
 
     def _observe_guidance_in_worker(
         self,
         record: ScanRecord,
         observation_url: str | None,
+        secret_values: tuple[str, ...],
     ) -> GuidedPageObservation:
         async def run() -> GuidedPageObservation:
-            with record.cancellation.register_current_task():
-                return await observe_guidance_page(
-                    scan_id=record.scan_id,
-                    target=record.request.target,
-                    observation_url=observation_url,
-                )
+            with transient_secret_redaction(secret_values):
+                with record.cancellation.register_current_task():
+                    return await observe_guidance_page(
+                        scan_id=record.scan_id,
+                        target=record.request.target,
+                        observation_url=observation_url,
+                    )
 
         return asyncio.run(run())
 
@@ -309,7 +350,8 @@ class ScanManager:
             if any(self._is_active(other) for other in self._records.values()):
                 raise ValueError("Another scan is already running")
 
-            execution_data = record.pending_execution.model_dump()
+            pending_execution = record.pending_execution
+            execution_data = pending_execution.model_dump()
             for field_name in (
                 "protected_resource",
                 "account_marker_selector",
@@ -319,15 +361,24 @@ class ScanManager:
                 if value is not None:
                     execution_data[field_name] = value
             execution = ScanExecutionInput.model_validate(execution_data)
+            pending_execution.discard_runtime_secrets()
+            record.pending_execution = None
             record.state = ScanState.RUNNING
             record.error = None
             self._persist_state(record)
-            record.future = self._executor.submit(
-                self._run_guided_scan,
-                record,
-                execution,
-                guidance,
-            )
+            try:
+                record.future = self._executor.submit(
+                    self._run_guided_scan,
+                    record,
+                    execution,
+                    guidance,
+                )
+            except BaseException:
+                execution.discard_runtime_secrets()
+                record.state = ScanState.FAILED
+                record.error = "The guided scan worker could not be started"
+                self._persist_state(record)
+                raise
             return record
 
     def list_scans(self) -> list[ScanRecord]:
@@ -407,12 +458,19 @@ class ScanManager:
     ) -> None:
         try:
             asyncio.run(
-                self._run_registered(record, self._run_scan_async(record, execution))
+                self._run_registered(
+                    record,
+                    self._run_scan_async(record, execution),
+                    execution.secret_values(),
+                )
             )
         except asyncio.CancelledError:
             self._finalize_cancelled(record)
         except Exception as error:
             self._finalize_failed(record, error)
+        finally:
+            if record.pending_execution is not execution:
+                execution.discard_runtime_secrets()
 
     def _run_guided_scan(
         self,
@@ -423,7 +481,9 @@ class ScanManager:
         try:
             asyncio.run(
                 self._run_registered(
-                    record, self._run_guided_scan_async(record, execution, guidance)
+                    record,
+                    self._run_guided_scan_async(record, execution, guidance),
+                    execution.secret_values(),
                 )
             )
         except asyncio.CancelledError:
@@ -435,24 +495,33 @@ class ScanManager:
                     if record.cancel_requested
                     else ScanState.AWAITING_GUIDANCE
                 )
-                if record.state is ScanState.CANCELLED:
-                    record.pending_execution = None
-                record.error = str(error)
+                if record.state is ScanState.AWAITING_GUIDANCE:
+                    record.pending_execution = execution
+                else:
+                    self._discard_pending_execution(record)
+                record.error = execution.redact_text(str(error))
             self._persist_state(record)
         except Exception as error:
             self._finalize_failed(record, error)
+        finally:
+            if record.pending_execution is not execution:
+                execution.discard_runtime_secrets()
 
     async def _run_registered(
-        self, record: ScanRecord, coroutine: Coroutine[Any, Any, None]
+        self,
+        record: ScanRecord,
+        coroutine: Coroutine[Any, Any, None],
+        secret_values: tuple[str, ...],
     ) -> None:
         started = False
         try:
-            with record.cancellation.register_current_task():
-                with incremental_event_sink(
-                    lambda events: self._save_incremental_events(record, events)
-                ):
-                    started = True
-                    await coroutine
+            with transient_secret_redaction(secret_values):
+                with record.cancellation.register_current_task():
+                    with incremental_event_sink(
+                        lambda events: self._save_incremental_events(record, events)
+                    ):
+                        started = True
+                        await coroutine
         finally:
             if not started:
                 coroutine.close()
@@ -498,11 +567,12 @@ class ScanManager:
                         if record.cancel_requested
                         else ScanState.AWAITING_GUIDANCE
                     )
-                    record.error = (
+                    unsafe_error = (
                         f"Saved authentication flow needs guidance: {error}"
                         if saved_profile is not None
                         else str(error)
                     )
+                    record.error = runtime_secrets.redact_text(unsafe_error)
                     record.pending_execution = (
                         execution
                         if record.state is ScanState.AWAITING_GUIDANCE
@@ -532,7 +602,7 @@ class ScanManager:
                 account_marker_description=execution.account_marker_description,
             )
             await self._complete_profile_execution(record, execution, profile_execution)
-            record.pending_execution = None
+            self._discard_pending_execution(record)
         finally:
             runtime_secrets.discard_all()
 
@@ -542,8 +612,11 @@ class ScanManager:
         execution: ScanExecutionInput,
         profile_execution: VerifiedLoginExecution,
     ) -> None:
-        record.profile = profile_execution.profile
-        self._store.save_profile(record.scan_id, profile_execution.profile)
+        safe_profile = AuthProfile.model_validate(
+            redact_persisted_data(profile_execution.profile.model_dump(mode="json"))
+        )
+        record.profile = safe_profile
+        self._store.save_profile(record.scan_id, safe_profile)
         self._save_events(record, profile_execution.events)
 
         record.cancellation.checkpoint()
@@ -576,7 +649,7 @@ class ScanManager:
             try:
                 if check_id is CheckId.LOGIN_ENUMERATION:
                     run = await run_login_enumeration_check(
-                        profile=profile_execution.profile,
+                        profile=safe_profile,
                         scan_id=record.scan_id,
                         runtime_secrets=check_secrets,
                         known_identifier_reference=execution.username_reference,
@@ -586,7 +659,7 @@ class ScanManager:
                     )
                 elif check_id is CheckId.RESET_REQUEST_ENUMERATION:
                     run = await run_reset_request_enumeration_check(
-                        profile=profile_execution.profile,
+                        profile=safe_profile,
                         scan_id=record.scan_id,
                         runtime_secrets=check_secrets,
                         known_identifier_reference=execution.username_reference,
@@ -598,7 +671,7 @@ class ScanManager:
                     )
                 elif check_id is CheckId.LOGIN_THROTTLING:
                     run = await run_login_throttling_check(
-                        profile=profile_execution.profile,
+                        profile=safe_profile,
                         scan_id=record.scan_id,
                         runtime_secrets=check_secrets,
                         username_reference=execution.username_reference,
@@ -611,7 +684,7 @@ class ScanManager:
                     )
                 elif check_id is CheckId.SESSION_FIXATION:
                     run = await run_session_fixation_check(
-                        profile=profile_execution.profile,
+                        profile=safe_profile,
                         scan_id=record.scan_id,
                         runtime_secrets=check_secrets,
                         username_reference=execution.username_reference,
@@ -622,7 +695,7 @@ class ScanManager:
                     )
                 elif check_id is CheckId.LOGOUT_INVALIDATION:
                     run = await run_logout_invalidation_check(
-                        profile=profile_execution.profile,
+                        profile=safe_profile,
                         scan_id=record.scan_id,
                         runtime_secrets=check_secrets,
                         username_reference=execution.username_reference,
@@ -633,7 +706,7 @@ class ScanManager:
                     )
                 else:
                     run = await run_registration_enumeration_check(
-                        profile=profile_execution.profile,
+                        profile=safe_profile,
                         scan_id=record.scan_id,
                         runtime_secrets=check_secrets,
                         known_identifier_reference=execution.username_reference,
@@ -650,15 +723,21 @@ class ScanManager:
             finally:
                 check_secrets.discard_all()
             self._save_events(record, run.events)
-            record.evidence.append(run.evidence)
-            self._store.save_evidence(run.evidence)
+            safe_evidence = TestRunEvidence.model_validate(
+                redact_persisted_data(run.evidence.model_dump(mode="json"))
+            )
+            record.evidence.append(safe_evidence)
+            self._store.save_evidence(safe_evidence)
             result = ANALYSERS[check_id](
-                run.evidence,
-                profile_execution.profile,
+                safe_evidence,
+                safe_profile,
                 record.request.policy,
             )
-            record.results.append(result)
-            self._store.save_result(result)
+            safe_result = CheckResult.model_validate(
+                redact_persisted_data(result.model_dump(mode="json"))
+            )
+            record.results.append(safe_result)
+            self._store.save_result(safe_result)
             if record.cancel_requested:
                 break
             record.completed_checks.append(check_id)
@@ -677,7 +756,13 @@ class ScanManager:
         events: list[EvidenceEvent],
     ) -> None:
         known_ids = {event.event_id for event in record.events}
-        new_events = [event for event in events if event.event_id not in known_ids]
+        new_events = [
+            EvidenceEvent.model_validate(
+                redact_persisted_data(event.model_dump(mode="json"))
+            )
+            for event in events
+            if event.event_id not in known_ids
+        ]
         record.events.extend(new_events)
         for event in new_events:
             self._store.append_event(event)
@@ -703,6 +788,12 @@ class ScanManager:
             raise KeyError(f"Unknown scan '{scan_id}'") from error
 
     @staticmethod
+    def _discard_pending_execution(record: ScanRecord) -> None:
+        if record.pending_execution is not None:
+            record.pending_execution.discard_runtime_secrets()
+            record.pending_execution = None
+
+    @staticmethod
     def _is_active(record: ScanRecord) -> bool:
         return (
             record.state is ScanState.RUNNING
@@ -719,7 +810,7 @@ class ScanManager:
             self._preserve_interrupted_check(record)
             record.state = ScanState.CANCELLED
             record.error = "Scan execution cancelled"
-            record.pending_execution = None
+            self._discard_pending_execution(record)
             record.active_check = None
             self._persist_state(record)
         self._export_reports(record)
@@ -769,7 +860,7 @@ class ScanManager:
             elif record.state is not ScanState.CANCELLED:
                 record.state = ScanState.FAILED
                 record.error = type(error).__name__
-            record.pending_execution = None
+            self._discard_pending_execution(record)
             record.active_check = None
             self._persist_state(record)
         self._export_reports(record)

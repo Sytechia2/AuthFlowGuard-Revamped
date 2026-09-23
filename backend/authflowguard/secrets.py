@@ -1,5 +1,17 @@
 """Runtime-only secret handling for browser execution."""
 
+from collections.abc import Iterable
+
+
+def redact_text(text: str, secret_values: Iterable[str]) -> str:
+    """Replace live secret values in text without retaining them globally."""
+
+    redacted = text
+    for value in secret_values:
+        if value:
+            redacted = redacted.replace(value, "[redacted]")
+    return redacted
+
 
 class SecretReferenceNotFoundError(KeyError):
     """Raised when an action refers to a secret not supplied for this scan."""
@@ -24,13 +36,14 @@ class RuntimeSecrets:
             self._values[reference_id] = ""
         self._values.clear()
 
+    def redaction_values(self) -> tuple[str, ...]:
+        """Return values for a short-lived output-redaction scope."""
+
+        return tuple(value for value in self._values.values() if value)
+
     def redact_text(self, text: str) -> str:
         """Remove any currently-held secret values from user-facing text."""
-        redacted = text
-        for value in self._values.values():
-            if value:
-                redacted = redacted.replace(value, "[redacted]")
-        return redacted
+        return redact_text(text, self._values.values())
 
     def __len__(self) -> int:
         return len(self._values)

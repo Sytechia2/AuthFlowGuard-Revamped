@@ -91,6 +91,7 @@ class AutomaticBrowserController:
         self._credential_references = credential_references.copy()
         self._progress_callback = progress_callback
         self._cancel_requested = cancel_requested
+        self._runtime_secrets = runtime_secrets
         self._executor = BrowserActionExecutor(
             page,
             target,
@@ -359,11 +360,11 @@ class AutomaticBrowserController:
             ObservedControlForModel(
                 observed_control_id=self._required(control, "observed_control_id"),
                 tag=self._required(control, "tag"),
-                name=control.get("name"),
-                control_type=control.get("type"),
-                placeholder=control.get("placeholder"),
-                autocomplete=control.get("autocomplete"),
-                aria_label=control.get("aria_label"),
+                name=self._redact_optional(control.get("name")),
+                control_type=self._redact_optional(control.get("type")),
+                placeholder=self._redact_optional(control.get("placeholder")),
+                autocomplete=self._redact_optional(control.get("autocomplete")),
+                aria_label=self._redact_optional(control.get("aria_label")),
                 value_present=control.get("value_present"),
                 visible=control["visible"],
                 allowed_actions=self._allowed_actions(control),
@@ -374,8 +375,8 @@ class AutomaticBrowserController:
         ]
         model_controls.sort(key=self._control_priority)
         return PageObservationForModel(
-            page_url=self._page.url,
-            page_title=await self._page.title(),
+            page_url=self._runtime_secrets.redact_text(self._page.url),
+            page_title=self._runtime_secrets.redact_text(await self._page.title()),
             objective=(
                 "Complete the authentication flow using only the supplied "
                 "credential references."
@@ -425,6 +426,11 @@ class AutomaticBrowserController:
         if not isinstance(value, str):
             raise ValueError(f"Observed control is missing {key}")
         return value
+
+    def _redact_optional(self, value: object) -> str | None:
+        if value is None:
+            return None
+        return self._runtime_secrets.redact_text(str(value))
 
     def _stop_event(self, summary: str) -> EvidenceEvent:
         return EvidenceEvent(
