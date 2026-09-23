@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from threading import Thread
 
 import uvicorn
-from authflowguard.controlled_app import (
+from authflowguard.evaluation_targets.controlled_app import (
     KNOWN_PASSWORD,
     KNOWN_USERNAME,
     SESSION_COOKIE,

@@ -1,10 +1,11 @@
 """Tests for the controlled form-and-cookie evaluation application."""
 
 import re
+from typing import cast
 
-import httpx2
+import httpx
 import pytest
-from authflowguard.controlled_app import (
+from authflowguard.evaluation_targets.controlled_app import (
     KNOWN_PASSWORD,
     KNOWN_USERNAME,
     LOCKOUT_THRESHOLD,
@@ -27,10 +28,13 @@ def post_form(
     values: dict[str, str],
     *,
     follow_redirects: bool = False,
-) -> httpx2.Response:
+) -> httpx.Response:
     form = client.get(path)
     values = {"csrf_token": csrf_token(form.text), **values}
-    return client.post(path, data=values, follow_redirects=follow_redirects)
+    return cast(
+        httpx.Response,
+        client.post(path, data=values, follow_redirects=follow_redirects),
+    )
 
 
 @pytest.mark.parametrize("mode", list(EvaluationMode))

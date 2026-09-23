@@ -120,7 +120,7 @@ after the applied quota values are nonzero.
 Run the server-rendered form/cookie fixture in secure mode:
 
 ```powershell
-.\.venv\Scripts\python -m authflowguard.controlled_app --mode secure --port 8001
+.\.venv\Scripts\python -m authflowguard.evaluation_targets.controlled_app --mode secure --port 8001
 ```
 
 Use `--mode vulnerable` on a different port to expose the intentionally weak
@@ -255,7 +255,7 @@ verification code through JSON, receives a bearer token through JSON, and stores
 that token in browser localStorage. Start it separately from the form fixture:
 
 ```powershell
-.\.venv\Scripts\python -m authflowguard.react_json_app --mode secure --port 8003
+.\.venv\Scripts\python -m authflowguard.evaluation_targets.react_json_app --mode secure --port 8003
 ```
 
 Use these Setup values:
@@ -279,7 +279,7 @@ is never included in evidence; only a local-storage fingerprint is retained.
 Use this command for the intentionally vulnerable variant:
 
 ```powershell
-.\.venv\Scripts\python -m authflowguard.react_json_app --mode vulnerable --port 8004
+.\.venv\Scripts\python -m authflowguard.evaluation_targets.react_json_app --mode vulnerable --port 8004
 ```
 
 Then change the Setup target, permitted origin, and protected-resource URL to
@@ -480,3 +480,28 @@ pre-login session and leaves the logged-out session valid. The browser and
 offline tests cover secure and vulnerable outcomes, deterministic reanalysis,
 malformed evidence, execution failures, scan persistence, and report code
 mapping.
+
+## 15. Independent Evaluation Application (Application C)
+
+Run the independently-designed workshop-desk fixture in secure mode:
+
+```powershell
+.\.venv\Scripts\python -m authflowguard.evaluation_targets.site_app --mode secure --port 8005
+```
+
+Use `--mode vulnerable` on a different port to expose the intentionally weak
+comparison behaviours. Unlike the controlled application, this fixture was
+built without reusing its labels, routes, or page layout, to give discovery an
+unfamiliar target. It has a login page at `/desk/entry` and a protected page
+at `/desk/bookings`; it deliberately has no registration or password-reset
+forms, so CHK-002 and CHK-003 are not applicable to it. It targets CHK-001
+(login enumeration), CHK-004 (login throttling), CHK-005 (session fixation),
+and CHK-006 (logout invalidation) instead. Its built-in credentials are test
+data only:
+
+- Member ID: `MBR-40817`
+- Passphrase: `lantern-orchard-47`
+
+All state is held in memory, so restarting the process resets it — there is no
+separate reset command. This application binds to `127.0.0.1` by default and
+must not be deployed as a production service.

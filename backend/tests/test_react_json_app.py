@@ -10,18 +10,18 @@ from uuid import uuid4
 
 import uvicorn
 from authflowguard.authentication import execute_verified_login_flow
-from authflowguard.models import (
-    AuthFeature,
-    BrowserActionType,
-    FeatureStatus,
-    TargetScope,
-)
-from authflowguard.react_json_app import (
+from authflowguard.evaluation_targets.react_json_app import (
     BEARER_STORAGE_KEY,
     KNOWN_USERNAME,
     KNOWN_VERIFICATION_CODE,
     EvaluationMode,
     create_react_json_app,
+)
+from authflowguard.models import (
+    AuthFeature,
+    BrowserActionType,
+    FeatureStatus,
+    TargetScope,
 )
 from authflowguard.secrets import RuntimeSecrets
 from fastapi.testclient import TestClient

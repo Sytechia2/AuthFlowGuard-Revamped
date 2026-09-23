@@ -17,7 +17,7 @@ from authflowguard.checks.login_enumeration import (
     analyse_login_enumeration,
     run_login_enumeration_check,
 )
-from authflowguard.controlled_app import (
+from authflowguard.evaluation_targets.controlled_app import (
     KNOWN_PASSWORD,
     KNOWN_USERNAME,
     EvaluationMode,
