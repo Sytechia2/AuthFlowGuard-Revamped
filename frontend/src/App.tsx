@@ -43,6 +43,10 @@ type ScanStatus = {
   partial_results_available?: boolean;
   reanalysis_available?: boolean;
   report_available?: boolean;
+  worker_active?: boolean;
+  worker_generation?: number;
+  worker_cleanup?: "graceful" | "forced" | "crashed" | null;
+  worker_cleanup_seconds?: number | null;
 };
 
 type SafeControl = {

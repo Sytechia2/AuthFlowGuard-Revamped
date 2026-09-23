@@ -1,6 +1,9 @@
 """FastAPI entry point for the local AuthFlowGuard backend."""
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 from uuid import UUID
 
 from fastapi import FastAPI, Request
@@ -26,12 +29,25 @@ DEFAULT_DATA_ROOT = PROJECT_ROOT / ".authflowguard-data"
 def create_app(
     frontend_dist: Path | None = None,
     data_root: Path | None = None,
+    worker_backend: Literal["process", "thread", "inline"] = "process",
 ) -> FastAPI:
+    scan_manager = ScanManager(
+        data_root or DEFAULT_DATA_ROOT,
+        worker_backend=worker_backend,
+    )
+
+    @asynccontextmanager
+    async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            scan_manager.shutdown()
+
     application = FastAPI(
         title="AuthFlowGuard AI",
         version="0.1.0",
+        lifespan=lifespan,
     )
-    scan_manager = ScanManager(data_root or DEFAULT_DATA_ROOT)
     application.state.scan_manager = scan_manager
 
     @application.exception_handler(RequestValidationError)

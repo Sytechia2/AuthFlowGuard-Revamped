@@ -58,7 +58,7 @@ def test_start_has_one_error_contract_in_every_invalid_state(
     tmp_path: Path,
     state: ScanState,
 ) -> None:
-    application = create_app(data_root=tmp_path)
+    application = create_app(data_root=tmp_path, worker_backend="thread")
     manager: ScanManager = application.state.scan_manager
     record = manager.create_scan(_request())
     record.state = state
@@ -88,7 +88,7 @@ def test_unknown_scan_actions_share_not_found_contract(
     endpoint: str,
     method: str,
 ) -> None:
-    client = TestClient(create_app(data_root=tmp_path))
+    client = TestClient(create_app(data_root=tmp_path, worker_backend="thread"))
 
     response = getattr(client, method)(f"/api/scans/{uuid4()}{endpoint}")
 
@@ -97,7 +97,7 @@ def test_unknown_scan_actions_share_not_found_contract(
 
 
 def test_report_and_evidence_errors_are_distinct(tmp_path: Path) -> None:
-    application = create_app(data_root=tmp_path)
+    application = create_app(data_root=tmp_path, worker_backend="thread")
     manager: ScanManager = application.state.scan_manager
     record = manager.create_scan(_request())
     client = TestClient(application)
@@ -120,7 +120,9 @@ def test_report_and_evidence_errors_are_distinct(tmp_path: Path) -> None:
 
 
 def test_malformed_uuid_uses_safe_invalid_request_contract(tmp_path: Path) -> None:
-    response = TestClient(create_app(data_root=tmp_path)).get("/api/scans/not-a-uuid")
+    response = TestClient(create_app(data_root=tmp_path, worker_backend="thread")).get(
+        "/api/scans/not-a-uuid"
+    )
 
     assert response.status_code == 422
     assert response.json()["code"] == "invalid_request"
@@ -130,7 +132,7 @@ def test_malformed_uuid_uses_safe_invalid_request_contract(tmp_path: Path) -> No
 def test_transition_timestamps_are_persisted_and_terminal_state_wins(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    manager = ScanManager(tmp_path)
+    manager = ScanManager(tmp_path, worker_backend="thread")
     record = manager.create_scan(_request())
     monkeypatch.setattr(manager._executor, "submit", _unscheduled_future)
 
@@ -156,7 +158,7 @@ def test_transition_timestamps_are_persisted_and_terminal_state_wins(
 def test_cancelling_terminal_scan_is_an_idempotent_no_op(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    manager = ScanManager(tmp_path)
+    manager = ScanManager(tmp_path, worker_backend="thread")
     record = manager.create_scan(_request())
     monkeypatch.setattr(manager._executor, "submit", _unscheduled_future)
     manager.start_scan(record.scan_id, _execution())
@@ -173,7 +175,7 @@ def test_cancelling_terminal_scan_is_an_idempotent_no_op(
 def test_stale_worker_generation_cannot_finalize_newer_execution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    manager = ScanManager(tmp_path)
+    manager = ScanManager(tmp_path, worker_backend="thread")
     record = manager.create_scan(_request())
     monkeypatch.setattr(manager._executor, "submit", _unscheduled_future)
     manager.start_scan(record.scan_id, _execution())
@@ -212,14 +214,14 @@ def test_restart_reconciles_interrupted_scans_without_resuming_work(
     expected_state: ScanState,
     expected_code: str,
 ) -> None:
-    manager = ScanManager(tmp_path)
+    manager = ScanManager(tmp_path, worker_backend="thread")
     record = manager.create_scan(_request())
     monkeypatch.setattr(manager._executor, "submit", _unscheduled_future)
     manager.start_scan(record.scan_id, _execution())
     if cancel_requested:
         manager.cancel_scan(record.scan_id)
 
-    recovered = ScanManager(tmp_path).get_scan(record.scan_id)
+    recovered = ScanManager(tmp_path, worker_backend="thread").get_scan(record.scan_id)
 
     assert recovered.state is expected_state
     assert recovered.error_code == expected_code
@@ -229,12 +231,12 @@ def test_restart_reconciles_interrupted_scans_without_resuming_work(
 
 
 def test_corrupt_scan_metadata_is_reported_instead_of_hidden(tmp_path: Path) -> None:
-    manager = ScanManager(tmp_path)
+    manager = ScanManager(tmp_path, worker_backend="thread")
     record = manager.create_scan(_request())
     metadata_path = tmp_path / str(record.scan_id) / "metadata.json"
     metadata_path.write_text("{truncated", encoding="utf-8")
 
-    response = TestClient(create_app(data_root=tmp_path)).get(
+    response = TestClient(create_app(data_root=tmp_path, worker_backend="thread")).get(
         f"/api/scans/{record.scan_id}"
     )
 

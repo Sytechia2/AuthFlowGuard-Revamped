@@ -78,7 +78,7 @@ def test_backend_returns_not_found_when_frontend_has_not_been_built(
 
 def test_validation_errors_do_not_echo_submitted_credentials(tmp_path: Path) -> None:
     canary = "invalid-credential-canary-2-2"
-    client = TestClient(create_app(data_root=tmp_path))
+    client = TestClient(create_app(data_root=tmp_path, worker_backend="thread"))
 
     response = client.post(
         f"/api/scans/{uuid4()}/start",
@@ -100,7 +100,7 @@ def test_validation_errors_do_not_echo_submitted_credentials(tmp_path: Path) -> 
 
 
 def test_scan_api_creates_reports_status_and_cancellation(tmp_path: Path) -> None:
-    client = TestClient(create_app(data_root=tmp_path))
+    client = TestClient(create_app(data_root=tmp_path, worker_backend="thread"))
     scan_request = {
         "target": {
             "target_url": "https://app.example/login",
@@ -145,7 +145,9 @@ def test_scan_api_creates_reports_status_and_cancellation(tmp_path: Path) -> Non
     assert cannot_start.status_code == 409
     assert "must-not-be-saved" not in (tmp_path / scan_id / "metadata.json").read_text()
 
-    reopened_client = TestClient(create_app(data_root=tmp_path))
+    reopened_client = TestClient(
+        create_app(data_root=tmp_path, worker_backend="thread")
+    )
     persisted = reopened_client.get(f"/api/scans/{scan_id}")
     assert persisted.status_code == 200
     assert persisted.json()["state"] == "cancelled"
@@ -157,7 +159,7 @@ def test_scan_api_creates_reports_status_and_cancellation(tmp_path: Path) -> Non
 def test_automatic_discovery_failure_pauses_for_guidance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    client = TestClient(create_app(data_root=tmp_path))
+    client = TestClient(create_app(data_root=tmp_path, worker_backend="thread"))
     created = client.post(
         "/api/scans",
         json={
@@ -206,7 +208,7 @@ def test_automatic_discovery_failure_pauses_for_guidance(
 def test_new_scan_revalidates_and_reuses_a_matching_saved_profile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    application = create_app(data_root=tmp_path)
+    application = create_app(data_root=tmp_path, worker_backend="thread")
     manager = application.state.scan_manager
     target = TargetScope(
         target_url="https://app.example/login",
@@ -291,7 +293,7 @@ def test_guidance_api_observes_safe_controls_and_accepts_structured_flow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     canary = "guidance-observation-canary-2-2"
-    application = create_app(data_root=tmp_path)
+    application = create_app(data_root=tmp_path, worker_backend="thread")
     manager = application.state.scan_manager
     record = manager.create_scan(
         ScanRequest(

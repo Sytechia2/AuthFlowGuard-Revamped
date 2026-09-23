@@ -39,7 +39,7 @@ def _execution() -> ScanExecutionInput:
 def test_cancellation_interrupts_active_await_and_waits_for_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    manager = ScanManager(tmp_path)
+    manager = ScanManager(tmp_path, worker_backend="thread")
     record = manager.create_scan(_request())
     started = Event()
     cleaned = Event()
@@ -75,7 +75,7 @@ def test_cancellation_interrupts_active_await_and_waits_for_cleanup(
 
 
 def test_repeated_cancellation_is_idempotent(tmp_path: Path) -> None:
-    manager = ScanManager(tmp_path)
+    manager = ScanManager(tmp_path, worker_backend="thread")
     record = manager.create_scan(_request())
 
     first = manager.cancel_scan(record.scan_id)
@@ -93,7 +93,7 @@ def test_guidance_retains_credentials_only_until_cancellation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     canary = "guidance-credential-canary-2-2"
-    manager = ScanManager(tmp_path)
+    manager = ScanManager(tmp_path, worker_backend="thread")
     record = manager.create_scan(_request())
     execution = _execution()
     execution.runtime_secrets["password"] = canary
@@ -126,7 +126,7 @@ def test_guidance_retains_credentials_only_until_cancellation(
 
 
 def test_rejected_start_discards_submitted_credentials(tmp_path: Path) -> None:
-    manager = ScanManager(tmp_path)
+    manager = ScanManager(tmp_path, worker_backend="thread")
     record = manager.create_scan(_request())
     manager.cancel_scan(record.scan_id)
     execution = _execution()
@@ -140,7 +140,7 @@ def test_rejected_start_discards_submitted_credentials(tmp_path: Path) -> None:
 def test_failed_execution_discards_submitted_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    manager = ScanManager(tmp_path)
+    manager = ScanManager(tmp_path, worker_backend="thread")
     record = manager.create_scan(_request())
     execution = _execution()
 
@@ -161,7 +161,7 @@ def test_failed_execution_discards_submitted_credentials(
 def test_successful_execution_discards_submitted_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    manager = ScanManager(tmp_path)
+    manager = ScanManager(tmp_path, worker_backend="thread")
     record = manager.create_scan(_request())
     execution = _execution()
 
@@ -200,11 +200,11 @@ def test_pre_start_cancellation_prevents_registered_work() -> None:
 
 
 def test_cancelled_state_and_progress_reload(tmp_path: Path) -> None:
-    manager = ScanManager(tmp_path)
+    manager = ScanManager(tmp_path, worker_backend="thread")
     record = manager.create_scan(_request())
     manager.cancel_scan(record.scan_id)
 
-    reloaded = ScanManager(tmp_path).get_scan(record.scan_id)
+    reloaded = ScanManager(tmp_path, worker_backend="thread").get_scan(record.scan_id)
 
     assert reloaded.state is ScanState.CANCELLED
     assert reloaded.cancel_requested is True
