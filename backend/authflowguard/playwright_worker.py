@@ -14,6 +14,7 @@ from playwright.async_api import (
     async_playwright,
 )
 
+from authflowguard.cancellation import close_resources
 from authflowguard.models import (
     EvidenceEvent,
     EvidenceKind,
@@ -62,13 +63,13 @@ class PlaywrightWorker:
 
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
-            context = await browser.new_context()
+            context: BrowserContext | None = None
 
             try:
+                context = await browser.new_context()
                 return await self._observe_in_context(scan_id, target, context)
             finally:
-                await context.close()
-                await browser.close()
+                await close_resources(context, browser)
 
     async def _observe_in_context(
         self,

@@ -50,6 +50,17 @@ type DiscoveryProvenance = {
   model_id: string | null;
 };
 
+type UsageSummary = {
+  input_tokens?: number;
+  output_tokens?: number;
+  settled_cost_usd?: string;
+  outstanding_reserved_cost_usd?: string;
+  limit_usd?: string;
+  uncertain_requests?: number;
+  estimator_violations?: number;
+  accounting_error?: boolean;
+};
+
 type ScanStatus = {
   scan_id: string;
   state: string;
@@ -60,6 +71,7 @@ type ScanStatus = {
   result_count: number;
   results: ScanResult[];
   error?: string | null;
+  error_code?: string | null;
   profile_source?: "automatic" | "guided" | null;
   guidance_required?: boolean;
   phase?: string;
@@ -73,6 +85,18 @@ type ScanStatus = {
   provenance?: DiscoveryProvenance | null;
   discovery_mode?: "bedrock" | "rules";
   reuse_saved_profile?: boolean;
+  cancel_requested?: boolean;
+  state_changed_at?: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  partial_results_available?: boolean;
+  reanalysis_available?: boolean;
+  report_available?: boolean;
+  worker_active?: boolean;
+  worker_generation?: number;
+  worker_cleanup?: "graceful" | "forced" | "crashed" | null;
+  worker_cleanup_seconds?: number | null;
+  usage?: UsageSummary;
 };
 
 type SafeControl = {
@@ -896,6 +920,61 @@ type DiscoveryViewProps = {
   onSubmitted: () => void;
 };
 
+type CancelScanButtonProps = {
+  scanId: string;
+  scan: ScanStatus | null;
+  onUpdated: (scan: ScanStatus) => void;
+  onError: (message: string | null) => void;
+};
+
+function CancelScanButton({
+  scanId,
+  scan,
+  onUpdated,
+  onError,
+}: CancelScanButtonProps) {
+  const [isCancelling, setIsCancelling] = useState(false);
+  const canCancel =
+    scan?.state === "running" || scan?.state === "awaiting_guidance";
+  const cancellationPending = isCancelling || scan?.cancel_requested === true;
+
+  if (!canCancel) return null;
+
+  async function cancelScan() {
+    setIsCancelling(true);
+    onError(null);
+    try {
+      const response = await fetch(
+        `/api/scans/${encodeURIComponent(scanId)}/cancel`,
+        { method: "POST" },
+      );
+      if (!response.ok) {
+        throw new Error("The scan could not be cancelled.");
+      }
+      onUpdated((await response.json()) as ScanStatus);
+    } catch (cancelError) {
+      onError(
+        cancelError instanceof Error
+          ? cancelError.message
+          : "Unable to cancel scan.",
+      );
+    } finally {
+      setIsCancelling(false);
+    }
+  }
+
+  return (
+    <button
+      className="secondary-button cancel-button"
+      disabled={cancellationPending}
+      onClick={() => void cancelScan()}
+      type="button"
+    >
+      {cancellationPending ? "Cancelling..." : "Cancel scan"}
+    </button>
+  );
+}
+
 function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
   const [scan, setScan] = useState<ScanStatus | null>(null);
   const [observation, setObservation] = useState<GuidanceObservation | null>(
@@ -1121,14 +1200,26 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
             this help step.
           </small>
         </div>
-        <button
-          className="secondary-button"
-          disabled={isObserving || scan?.state !== "awaiting_guidance"}
-          onClick={() => void observePage()}
-          type="button"
-        >
-          {isObserving ? "Finding fields..." : "Find login fields"}
-        </button>
+        <div className="button-row">
+          <button
+            className="secondary-button"
+            disabled={
+              isObserving ||
+              scan?.state !== "awaiting_guidance" ||
+              scan.cancel_requested === true
+            }
+            onClick={() => void observePage()}
+            type="button"
+          >
+            {isObserving ? "Finding fields..." : "Find login fields"}
+          </button>
+          <CancelScanButton
+            onError={setError}
+            onUpdated={setScan}
+            scan={scan}
+            scanId={scanId}
+          />
+        </div>
       </section>
 
       <section className="panel controls-panel">
@@ -1329,7 +1420,11 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
         )}
         <button
           className="primary-button"
-          disabled={isSubmitting}
+          disabled={
+            isSubmitting ||
+            scan?.state !== "awaiting_guidance" ||
+            scan.cancel_requested === true
+          }
           type="submit"
         >
           {isSubmitting
@@ -1355,7 +1450,6 @@ function TestingView({
 }: TestingViewProps) {
   const [scan, setScan] = useState<ScanStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [isCancelling, setIsCancelling] = useState(false);
 
   useEffect(() => {
     if (!scanId) {
@@ -1393,29 +1487,6 @@ function TestingView({
       window.clearInterval(interval);
     };
   }, [scanId]);
-
-  async function cancelScan() {
-    setIsCancelling(true);
-    setError(null);
-    try {
-      const response = await fetch(
-        `/api/scans/${encodeURIComponent(scanId)}/cancel`,
-        { method: "POST" },
-      );
-      if (!response.ok) {
-        throw new Error("The scan could not be cancelled.");
-      }
-      setScan((await response.json()) as ScanStatus);
-    } catch (cancelError) {
-      setError(
-        cancelError instanceof Error
-          ? cancelError.message
-          : "Unable to cancel scan.",
-      );
-    } finally {
-      setIsCancelling(false);
-    }
-  }
 
   if (!scanId) {
     return (
@@ -1456,6 +1527,13 @@ function TestingView({
         <span>{scan?.evidence_count ?? 0} evidence packages</span>
         <span>{scan?.result_count ?? 0} results</span>
         {scan?.profile_source && <span>discovery: {scan.profile_source}</span>}
+        {scan?.usage && !scan.usage.accounting_error && (
+          <span>
+            AI cost: ${scan.usage.settled_cost_usd ?? "0.00000000"}
+            {scan.usage.outstanding_reserved_cost_usd !== "0.00000000" &&
+              ` + $${scan.usage.outstanding_reserved_cost_usd} reserved`}
+          </span>
+        )}
       </div>
 
       {(scan?.discovery_mode === "bedrock" ||
@@ -1513,16 +1591,12 @@ function TestingView({
           {error}
         </p>
       )}
-      {scan?.state === "running" && (
-        <button
-          className="secondary-button"
-          disabled={isCancelling}
-          onClick={() => void cancelScan()}
-          type="button"
-        >
-          {isCancelling ? "Cancelling..." : "Cancel scan"}
-        </button>
-      )}
+      <CancelScanButton
+        onError={setError}
+        onUpdated={setScan}
+        scan={scan}
+        scanId={scanId}
+      />
       {scan?.state === "awaiting_guidance" && (
         <div className="guidance-callout">
           <strong>Automatic discovery needs your guidance.</strong>
@@ -1724,6 +1798,17 @@ function ResultsView({ scanId, onScanIdChange }: ResultsViewProps) {
           <p>
             Authentication profile: {scan.profile_source ?? "not verified yet"}
           </p>
+          {scan.usage && !scan.usage.accounting_error && (
+            <p>
+              AI usage: {scan.usage.input_tokens ?? 0} input /{" "}
+              {scan.usage.output_tokens ?? 0} output tokens; estimated cost ${
+                scan.usage.settled_cost_usd ?? "0.00000000"
+              } of ${scan.usage.limit_usd ?? "unknown"}
+              {(scan.usage.uncertain_requests ?? 0) > 0 &&
+                `; ${scan.usage.uncertain_requests} uncertain request(s) remain reserved`}
+              .
+            </p>
+          )}
           <div className="result-actions">
             <a
               href={`/api/scans/${encodeURIComponent(scan.scan_id)}/report/json`}

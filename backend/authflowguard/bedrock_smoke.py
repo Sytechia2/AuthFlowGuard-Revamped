@@ -1,6 +1,8 @@
 """Run one deliberately small live Bedrock structured-action request."""
 
 import argparse
+from pathlib import Path
+from uuid import UUID, uuid4
 
 from botocore.exceptions import ClientError
 
@@ -11,6 +13,7 @@ from authflowguard.bedrock import (
     PageObservationForModel,
 )
 from authflowguard.models import BrowserActionType
+from authflowguard.usage_ledger import DurableUsageLedger
 
 
 def read_arguments() -> argparse.Namespace:
@@ -20,6 +23,8 @@ def read_arguments() -> argparse.Namespace:
     parser.add_argument("--profile", required=True)
     parser.add_argument("--region", required=True)
     parser.add_argument("--model-id", required=True)
+    parser.add_argument("--run-id", type=UUID)
+    parser.add_argument("--usage-root", type=Path, default=Path(".authflowguard-smoke"))
     parser.add_argument(
         "--confirm-live-call",
         action="store_true",
@@ -56,8 +61,14 @@ def main() -> None:
         credential_references=["known-account-username"],
     )
 
+    run_id = arguments.run_id or uuid4()
+    ledger = DurableUsageLedger(
+        arguments.usage_root / str(run_id) / "usage.ndjson", run_id, 0.001
+    )
     try:
-        decision = BedrockActionClient(configuration).choose_action(observation)
+        decision = BedrockActionClient(
+            configuration, usage_accountant=ledger
+        ).choose_action(observation)
     except ClientError as error:
         aws_error = error.response.get("Error", {})
         error_code = aws_error.get("Code", "UnknownAwsError")
@@ -67,6 +78,7 @@ def main() -> None:
         ) from error
 
     print("Bedrock structured-action smoke test succeeded.")
+    print(f"Run ID: {run_id}")
     print(f"Action type: {decision.action.action_type.value}")
     print(f"Input tokens: {decision.input_tokens}")
     print(f"Output tokens: {decision.output_tokens}")

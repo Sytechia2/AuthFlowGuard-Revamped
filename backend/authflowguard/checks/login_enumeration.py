@@ -1,8 +1,10 @@
 """Runner and deterministic offline analyser for login account enumeration."""
 
+import asyncio
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -126,6 +128,7 @@ async def _run_failed_login_attempt(
     failure_password: str,
     label: str,
     events: list[EvidenceEvent],
+    cancel_requested: Callable[[], bool],
 ) -> dict[str, Any]:
     context: BrowserContext | None = None
     attempt_secrets = RuntimeSecrets(
@@ -145,6 +148,8 @@ async def _run_failed_login_attempt(
         )
         action_events: list[EvidenceEvent] = []
         for step in steps:
+            if cancel_requested():
+                raise asyncio.CancelledError("Login enumeration cancelled")
             result = await executor.execute(_new_attempt_action(step))
             action_events.extend(_event_for_check(event) for event in result.events)
             events.extend(_event_for_check(event) for event in result.events)
@@ -188,6 +193,7 @@ async def run_login_enumeration_check(
     failure_password_reference: str,
     username_action_reference: str | None = None,
     password_action_reference: str | None = None,
+    cancel_requested: Callable[[], bool] = lambda: False,
 ) -> LoginEnumerationRun:
     """Compare failed logins for known and nonexistent identifiers three times."""
 
@@ -216,6 +222,8 @@ async def run_login_enumeration_check(
         browser = await playwright.chromium.launch(headless=True)
         try:
             for pair_number in range(1, PAIR_COUNT + 1):
+                if cancel_requested():
+                    raise asyncio.CancelledError("Login enumeration cancelled")
                 pair: dict[str, Any] = {"pair_number": pair_number}
                 for label, identifier in [
                     ("known", known_identifier),
@@ -235,6 +243,7 @@ async def run_login_enumeration_check(
                             failure_password=failure_password,
                             label=label,
                             events=events,
+                            cancel_requested=cancel_requested,
                         )
                         completed_steps.append(step_label)
                     except Exception as error:

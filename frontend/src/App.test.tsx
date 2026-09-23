@@ -438,12 +438,18 @@ describe("setup workflow", () => {
         screen.getByRole("button", { name: "Open Discovery" }),
       ).toBeInTheDocument();
     });
+    expect(
+      screen.getByRole("button", { name: "Cancel scan" }),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Open Discovery" }));
     await waitFor(() => {
       expect(
         screen.getByRole("heading", { name: "Help us log in" }),
       ).toBeInTheDocument();
     });
+    expect(
+      screen.getByRole("button", { name: "Cancel scan" }),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Find login fields" }));
     await waitFor(() => {
       expect(screen.getByText("control-5")).toBeInTheDocument();
