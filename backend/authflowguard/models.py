@@ -75,6 +75,20 @@ class DiscoverySource(StrEnum):
     GUIDED = "guided"
 
 
+class DiscoveryMode(StrEnum):
+    BEDROCK = "bedrock"
+    RULES = "rules"
+
+
+class DiscoveryProvenance(ContractModel):
+    requested_mode: DiscoveryMode
+    actual_engine: str | None = None
+    usage_source: str = "none"
+    reused_profile: bool = False
+    guidance_used: bool = False
+    model_id: str | None = None
+
+
 class EvidenceKind(StrEnum):
     ACTION = "action"
     REQUEST = "request"
@@ -113,6 +127,8 @@ class ScanRequest(ContractModel):
     schema_version: str = SCHEMA_VERSION
     target: TargetScope
     selected_checks: list[CheckId] = Field(min_length=1)
+    discovery_mode: DiscoveryMode = DiscoveryMode.RULES
+    reuse_saved_profile: bool = True
     credential_references: list[CredentialReference] = Field(default_factory=list)
     disposable_identifier_references: list[CredentialReference] = Field(
         default_factory=list
@@ -247,6 +263,7 @@ class AuthProfile(ContractModel):
     relevant_traffic: list[TrafficReference] = Field(default_factory=list)
     session_references: list[SessionReference] = Field(default_factory=list)
     control_signatures: dict[str, str] = Field(default_factory=dict)
+    step_control_signatures: list[dict[str, str]] = Field(default_factory=list)
     protected_resource_check: ProtectedResourceCheck | None = None
     discovery_history: list[DiscoveryRecord] = Field(default_factory=list)
 

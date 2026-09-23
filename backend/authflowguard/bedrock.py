@@ -59,6 +59,9 @@ class ObservedControlForModel(BaseModel):
     placeholder: str | None = None
     autocomplete: str | None = None
     aria_label: str | None = None
+    text: str | None = None
+    role: str | None = None
+    form_action: str | None = None
     value_present: bool | None = None
     visible: bool = True
     allowed_actions: list[BrowserActionType] = Field(default_factory=list)
@@ -98,6 +101,18 @@ class BedrockCostLimitError(RuntimeError):
 class BedrockResponseError(RuntimeError):
     """Raised when Bedrock does not return one valid structured action."""
 
+    def __init__(
+        self,
+        message: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        actual_cost_usd: float = 0.0,
+    ) -> None:
+        super().__init__(message)
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.actual_cost_usd = actual_cost_usd
+
 
 @dataclass(frozen=True)
 class BedrockActionDecision:
@@ -132,15 +147,30 @@ class BedrockActionClient:
             )
 
         response = self._runtime_client.converse(**request)
-        action = self._read_action(response)
-        self._validate_action_references(action, observation)
         input_tokens, output_tokens = self._read_usage(response)
+        actual_cost = self._calculate_cost(input_tokens, output_tokens)
+
+        try:
+            action = self._read_action(response)
+            self._validate_action_references(action, observation)
+        except BedrockResponseError as error:
+            error.input_tokens = input_tokens
+            error.output_tokens = output_tokens
+            error.actual_cost_usd = actual_cost
+            raise
+        except Exception as error:
+            raise BedrockResponseError(
+                f"Invalid model action response: {error}",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                actual_cost_usd=actual_cost,
+            ) from error
 
         return BedrockActionDecision(
             action=action,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            actual_cost_usd=self._calculate_cost(input_tokens, output_tokens),
+            actual_cost_usd=actual_cost,
             reserved_cost_usd=reserved_cost,
         )
 
@@ -153,6 +183,8 @@ class BedrockActionClient:
         return self._estimate_maximum_request_cost(self._build_request(observation))
 
     def _create_runtime_client(self) -> BedrockRuntimeClient:
+        from botocore.config import Config
+
         session = boto3.Session(
             profile_name=self._configuration.aws_profile,
             region_name=self._configuration.aws_region,
@@ -162,6 +194,11 @@ class BedrockActionClient:
             session.client(
                 "bedrock-runtime",
                 region_name=self._configuration.aws_region,
+                config=Config(
+                    connect_timeout=5,
+                    read_timeout=15,
+                    retries={"max_attempts": 1},
+                ),
             ),
         )
 

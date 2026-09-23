@@ -1,5 +1,4 @@
-"""FastAPI entry point for the local AuthFlowGuard backend."""
-
+from collections.abc import Callable
 from pathlib import Path
 from uuid import UUID
 
@@ -7,6 +6,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from authflowguard.automatic_actions import ActionSelectionClient
+from authflowguard.config import get_capabilities
 from authflowguard.models import ScanRequest
 from authflowguard.scan_manager import (
     GuidanceObservationRequest,
@@ -23,17 +24,25 @@ DEFAULT_DATA_ROOT = PROJECT_ROOT / ".authflowguard-data"
 def create_app(
     frontend_dist: Path | None = None,
     data_root: Path | None = None,
+    action_client_factory: Callable[[], ActionSelectionClient] | None = None,
 ) -> FastAPI:
     application = FastAPI(
         title="AuthFlowGuard AI",
         version="0.1.0",
     )
-    scan_manager = ScanManager(data_root or DEFAULT_DATA_ROOT)
+    scan_manager = ScanManager(
+        data_root or DEFAULT_DATA_ROOT,
+        action_client_factory=action_client_factory,
+    )
     application.state.scan_manager = scan_manager
 
     @application.get("/api/health", tags=["system"])
     async def read_health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @application.get("/api/capabilities", tags=["system"])
+    async def read_capabilities() -> dict[str, object]:
+        return get_capabilities()
 
     @application.post("/api/scans", status_code=201)
     async def create_scan(request: ScanRequest) -> dict[str, str]:

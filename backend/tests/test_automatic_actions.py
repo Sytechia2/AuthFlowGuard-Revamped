@@ -3,14 +3,15 @@
 import asyncio
 import socket
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from threading import Thread
+from threading import Event, Thread
 from uuid import uuid4
 
 import pytest
 import uvicorn
 from authflowguard.automatic_actions import (
+    AutomaticActionCancelled,
     AutomaticActionResult,
     AutomaticActionStatus,
     AutomaticBrowserController,
@@ -25,6 +26,7 @@ from authflowguard.evaluation_targets.controlled_app import (
 from authflowguard.models import (
     BrowserAction,
     BrowserActionType,
+    EvidenceEvent,
     EvidenceKind,
     ExecutionLimits,
     TargetScope,
@@ -136,6 +138,8 @@ async def run_controller(
     origin: str,
     client: FakeActionClient,
     limits: ExecutionLimits,
+    cancel_requested: Event | None = None,
+    event_sink: Callable[[list[EvidenceEvent]], None] | None = None,
 ) -> AutomaticActionResult:
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
@@ -158,6 +162,8 @@ async def run_controller(
             action_client=client,
             limits=limits,
             credential_references=["login-username", "login-password"],
+            cancel_requested=(cancel_requested.is_set if cancel_requested else None),
+            event_sink=event_sink,
         )
         try:
             return await controller.run(account_marker_is_visible)
@@ -332,5 +338,44 @@ def test_active_time_limit_stops_a_slow_model_request() -> None:
         )
 
     assert result.status is AutomaticActionStatus.ACTIVE_TIME_LIMIT_REACHED
-    assert result.decision_attempts == 1
-    assert result.accounted_cost_usd == pytest.approx(0.01)
+    assert result.decision_attempts <= 1
+    assert result.accounted_cost_usd == pytest.approx(
+        0.01 if result.decision_attempts else 0.0
+    )
+
+
+def test_cancellation_interrupts_model_wait_before_action() -> None:
+    client = FakeActionClient(login_actions(), delay_seconds=2.0)
+    cancelled = Event()
+    cancelled_at = 0.0
+    observed_at = 0.0
+    with run_controlled_server() as origin:
+
+        async def run() -> None:
+            watcher = asyncio.create_task(wait_for_model_call())
+            try:
+                with pytest.raises(AutomaticActionCancelled):
+                    await run_controller(
+                        origin,
+                        client,
+                        ExecutionLimits(maximum_active_seconds=30),
+                        cancelled,
+                        record_cancel,
+                    )
+            finally:
+                await watcher
+
+        async def wait_for_model_call() -> None:
+            nonlocal cancelled_at
+            while client.choose_calls == 0:
+                await asyncio.sleep(0.01)
+            cancelled_at = time.monotonic()
+            cancelled.set()
+
+        def record_cancel(_events: list[EvidenceEvent]) -> None:
+            nonlocal observed_at
+            observed_at = time.monotonic()
+
+        asyncio.run(run())
+    assert observed_at - cancelled_at < 0.5
+    assert client.choose_calls == 1

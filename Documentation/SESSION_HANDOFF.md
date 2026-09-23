@@ -16,6 +16,7 @@ happens to any single machine's session history.
 | Freeze features, list limitations | REL-001 | **Done** | `Documentation/KNOWN_LIMITATIONS.md` |
 | Discovery reliability | EVA-004 | **Measured for web scans** | `evaluation/reports/discovery-reliability.md` — A 5/5, B 2/5, C 0/5 automatic |
 | Usage, cost, duration | EVA-008 | **Measured except model cost** | `evaluation/reports/measurements.md` — 22 scans, requests and durations |
+| Connect Bedrock discovery to web scans | INT-011 / Task 2.6 | **In progress** | Offline integration under review; live UI-to-Bedrock validation outstanding. |
 
 ## How to reproduce every number
 
@@ -78,7 +79,13 @@ Raw scan data under `evaluation/results/*/scan-data/` is gitignored; the
    separate worker process exists (RUN-002).
 5. Correct `pyproject.toml` to depend on `httpx2`.
 6. Assign the `test_react_json_app` fixture-isolation defect (Member 2).
-7. Terminal-agent reliability and live cost figures unblock only when Bedrock is wired into web scans.
+7. Bedrock discovery is wired into web scans (Task 2.6 / INT-011 offline integration under review). Live UI-to-Bedrock behavior has not been validated. Automated evaluation and tests use `DeterministicModelDouble` unless live calls are explicitly enabled.
+
+## 23 September 2026 integration review
+
+The web integration now saves only executed login steps, validates positional controls per replay step, persists partial controller evidence, counts model requests independently of browser success, enforces server caps, and shares one budget across discovery reliability attempts. Controller and proof waits check cancellation; synchronous SDK threads still require bounded timeouts and RUN-002 remains open. No real UI-to-Bedrock scan was run.
+
+The fresh rules-mode formal run at `evaluation/results/bedrock-review-20260923/results.json` yielded 41/44 passing, with the same three Application B CHK-001 limitations as the historical baseline. Its separate report is `evaluation/reports/formal-cases-bedrock-review-20260923.md`. Offline reanalysis yielded 6/6 passing in `evaluation/reports/offline-verification-bedrock-review-20260923.md`. These are offline results, not live Bedrock reliability measurements.
 
 ## Resuming the Claude Code session on another machine
 

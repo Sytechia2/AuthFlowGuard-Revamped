@@ -36,6 +36,7 @@ def build_verified_login_profile(
     traffic: list[TrafficReference] | None = None,
     session_references: list[SessionReference] | None = None,
     control_signatures: dict[str, str] | None = None,
+    step_control_signatures: list[dict[str, str]] | None = None,
 ) -> AuthProfile:
     """Create a verified profile only when the two required controls agree."""
 
@@ -85,6 +86,7 @@ def build_verified_login_profile(
         relevant_traffic=traffic or [],
         session_references=session_references or [],
         control_signatures=control_signatures or {},
+        step_control_signatures=step_control_signatures or [],
         protected_resource_check=ProtectedResourceCheck(
             resource=url_without_query_or_fragment(protected_resource),
             authenticated_evidence_ids=[authenticated_event_id],

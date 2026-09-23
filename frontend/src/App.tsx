@@ -23,6 +23,33 @@ type ScanResult = {
   explanation: string;
 };
 
+type SystemCapabilities = {
+  bedrock_configured: boolean;
+  model_id: string;
+  model_name: string;
+  pricing_configured: boolean;
+  note: string;
+  default_limits: {
+    maximum_ai_decisions: number;
+    maximum_active_seconds: number;
+    maximum_inference_cost_usd: number;
+  };
+  server_max_limits: {
+    maximum_ai_decisions: number;
+    maximum_active_seconds: number;
+    maximum_inference_cost_usd: number;
+  };
+};
+
+type DiscoveryProvenance = {
+  requested_mode: "bedrock" | "rules";
+  actual_engine: string | null;
+  usage_source: string;
+  reused_profile: boolean;
+  guidance_used: boolean;
+  model_id: string | null;
+};
+
 type ScanStatus = {
   scan_id: string;
   state: string;
@@ -35,6 +62,17 @@ type ScanStatus = {
   error?: string | null;
   profile_source?: "automatic" | "guided" | null;
   guidance_required?: boolean;
+  phase?: string;
+  decision_count?: number;
+  model_request_count?: number;
+  total_input_tokens?: number;
+  total_output_tokens?: number;
+  estimated_cost_usd?: number;
+  unresolved_reservations_usd?: number;
+  stop_reason?: string | null;
+  provenance?: DiscoveryProvenance | null;
+  discovery_mode?: "bedrock" | "rules";
+  reuse_saved_profile?: boolean;
 };
 
 type SafeControl = {
@@ -295,8 +333,41 @@ function SetupView({ onStarted }: SetupViewProps) {
   const [selectedChecks, setSelectedChecks] = useState<string[]>(
     securityChecks.map((check) => check.id),
   );
+  const [capabilities, setCapabilities] = useState<SystemCapabilities | null>(
+    null,
+  );
+  const [discoveryMode, setDiscoveryMode] = useState<"bedrock" | "rules">(
+    "bedrock",
+  );
+  const [reuseSavedProfile, setReuseSavedProfile] = useState<boolean>(false);
+  const [maxDecisions, setMaxDecisions] = useState<number>(40);
+  const [maxSeconds, setMaxSeconds] = useState<number>(900);
+  const [maxCostUsd, setMaxCostUsd] = useState<number>(0.25);
   const [isStarting, setIsStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    async function loadCapabilities() {
+      try {
+        const response = await fetch("/api/capabilities");
+        if (response.ok) {
+          const data = (await response.json()) as SystemCapabilities;
+          setCapabilities(data);
+          if (!data.bedrock_configured) {
+            setDiscoveryMode("rules");
+            setReuseSavedProfile(true);
+          } else {
+            setDiscoveryMode("bedrock");
+            setReuseSavedProfile(false);
+          }
+        }
+      } catch {
+        setDiscoveryMode("rules");
+        setReuseSavedProfile(true);
+      }
+    }
+    void loadCapabilities();
+  }, []);
 
   function toggleCheck(checkId: string) {
     if (selectedChecks.includes(checkId)) {
@@ -329,6 +400,13 @@ function SetupView({ onStarted }: SetupViewProps) {
             permitted_origins: origins,
           },
           selected_checks: selectedBackendChecks,
+          discovery_mode: discoveryMode,
+          reuse_saved_profile: reuseSavedProfile,
+          limits: {
+            maximum_ai_decisions: maxDecisions,
+            maximum_active_seconds: maxSeconds,
+            maximum_inference_cost_usd: maxCostUsd,
+          },
           credential_references: [
             { reference_id: "username", purpose: "Known account username" },
             { reference_id: "password", purpose: "Known account password" },
@@ -470,10 +548,179 @@ function SetupView({ onStarted }: SetupViewProps) {
         </div>
       </section>
 
-      <section className="panel checks-panel">
+      <section className="panel discovery-engine-panel">
         <div className="section-heading">
           <div>
             <p className="section-number">B</p>
+            <h2>Discovery engine</h2>
+          </div>
+          <span className="required-label">Required</span>
+        </div>
+
+        <div
+          className="discovery-modes"
+          role="radiogroup"
+          aria-label="Discovery engine"
+        >
+          <label
+            className={`mode-card ${discoveryMode === "bedrock" ? "mode-card-selected" : ""}`}
+          >
+            <input
+              type="radio"
+              name="discovery-mode"
+              value="bedrock"
+              checked={discoveryMode === "bedrock"}
+              onChange={() => {
+                setDiscoveryMode("bedrock");
+                setReuseSavedProfile(false);
+              }}
+            />
+            <div className="mode-card-body">
+              <strong>Bedrock AI discovery</strong>
+              <small>
+                Autonomous browser exploration using Amazon Bedrock Claude model
+                with bounded execution.
+              </small>
+            </div>
+          </label>
+
+          <label
+            className={`mode-card ${discoveryMode === "rules" ? "mode-card-selected" : ""}`}
+          >
+            <input
+              type="radio"
+              name="discovery-mode"
+              value="rules"
+              checked={discoveryMode === "rules"}
+              onChange={() => {
+                setDiscoveryMode("rules");
+                setReuseSavedProfile(true);
+              }}
+            />
+            <div className="mode-card-body">
+              <strong>Deterministic rules</strong>
+              <small>
+                Heuristic discovery following standard authentication forms with
+                manual guidance fallback.
+              </small>
+            </div>
+          </label>
+        </div>
+
+        {capabilities && (
+          <div
+            className={`capability-banner ${
+              capabilities.bedrock_configured
+                ? "capability-banner-success"
+                : "capability-banner-warning"
+            }`}
+            role={capabilities.bedrock_configured ? undefined : "alert"}
+          >
+            <span aria-hidden="true">
+              {capabilities.bedrock_configured ? "✓" : "!"}
+            </span>
+            <div>
+              <strong>
+                {capabilities.bedrock_configured
+                  ? `Bedrock online: ${capabilities.model_name || capabilities.model_id}`
+                  : "Bedrock not configured on backend"}
+              </strong>
+              <p>
+                {capabilities.bedrock_configured
+                  ? `Model: ${capabilities.model_id}. Pricing configured. AWS credentials validated.`
+                  : capabilities.note ||
+                    "AWS Bedrock credentials are not configured on the backend server. Choose deterministic rules or configure credentials."}
+              </p>
+            </div>
+          </div>
+        )}
+
+        <div className="profile-reuse-setting">
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={reuseSavedProfile}
+              onChange={(e) => setReuseSavedProfile(e.target.checked)}
+            />
+            <span className="checkbox-copy">
+              <strong>Reuse verified authentication profile</strong>
+              <small>
+                Skip exploration and reuse the verified profile if already known
+                for this target.
+              </small>
+            </span>
+          </label>
+        </div>
+
+        <details
+          className="advanced-settings"
+          open={discoveryMode === "bedrock"}
+        >
+          <summary>Bounded execution limits</summary>
+          <p className="panel-help">
+            Exploration automatically halts when any limit is reached. Model
+            requests are priced and budgeted.
+          </p>
+          <div className="credential-fields">
+            <div className="field">
+              <label htmlFor="max-decisions">Maximum decisions</label>
+              <input
+                id="max-decisions"
+                type="number"
+                min={1}
+                max={
+                  capabilities?.server_max_limits?.maximum_ai_decisions ?? 100
+                }
+                value={maxDecisions}
+                onChange={(e) =>
+                  setMaxDecisions(Math.max(1, Number(e.target.value)))
+                }
+              />
+              <small>AI navigation action cap.</small>
+            </div>
+            <div className="field">
+              <label htmlFor="max-seconds">Active time limit (seconds)</label>
+              <input
+                id="max-seconds"
+                type="number"
+                min={10}
+                max={
+                  capabilities?.server_max_limits?.maximum_active_seconds ??
+                  1800
+                }
+                value={maxSeconds}
+                onChange={(e) =>
+                  setMaxSeconds(Math.max(10, Number(e.target.value)))
+                }
+              />
+              <small>Wall-clock runtime limit.</small>
+            </div>
+            <div className="field">
+              <label htmlFor="max-cost">Max inference budget (USD)</label>
+              <input
+                id="max-cost"
+                type="number"
+                step="0.01"
+                min={0.01}
+                max={
+                  capabilities?.server_max_limits?.maximum_inference_cost_usd ??
+                  10.0
+                }
+                value={maxCostUsd}
+                onChange={(e) =>
+                  setMaxCostUsd(Math.max(0.01, Number(e.target.value)))
+                }
+              />
+              <small>Budget limit for model spend.</small>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <section className="panel checks-panel">
+        <div className="section-heading">
+          <div>
+            <p className="section-number">C</p>
             <h2>Security checks</h2>
           </div>
           <span className="selection-count">
@@ -504,7 +751,7 @@ function SetupView({ onStarted }: SetupViewProps) {
       <section className="panel credentials-panel">
         <div className="section-heading">
           <div>
-            <p className="section-number">C</p>
+            <p className="section-number">D</p>
             <h2>Runtime login data</h2>
           </div>
           <span className="required-label">Local only</span>
@@ -1187,7 +1434,19 @@ function TestingView({
           <p className="section-number">C</p>
           <h2>Check status</h2>
         </div>
-        <span className="status-pill">{scan?.state ?? "loading"}</span>
+        <div className="status-badges">
+          {scan?.phase && (
+            <span className="phase-pill">
+              Phase: {scan.phase.replaceAll("_", " ")}
+            </span>
+          )}
+          {scan?.provenance?.actual_engine && (
+            <span className="engine-pill">
+              Engine: {scan.provenance.actual_engine}
+            </span>
+          )}
+          <span className="status-pill">{scan?.state ?? "loading"}</span>
+        </div>
       </div>
       <p>
         Scan ID: <code>{scanId}</code>
@@ -1198,6 +1457,57 @@ function TestingView({
         <span>{scan?.result_count ?? 0} results</span>
         {scan?.profile_source && <span>discovery: {scan.profile_source}</span>}
       </div>
+
+      {(scan?.discovery_mode === "bedrock" ||
+        (scan?.decision_count ?? 0) > 0 ||
+        scan?.provenance?.actual_engine === "bedrock") && (
+        <div className="ai-metrics-panel">
+          <div className="ai-metrics-heading">
+            <strong>AI Exploration Metrics</strong>
+            {scan?.stop_reason && (
+              <span className="stop-reason-pill">Stop: {scan.stop_reason}</span>
+            )}
+          </div>
+          <div className="ai-metrics-grid">
+            <div className="ai-metric-card">
+              <span className="ai-metric-value">
+                {scan?.decision_count ?? 0}
+              </span>
+              <span className="ai-metric-label">Decisions</span>
+            </div>
+            <div className="ai-metric-card">
+              <span className="ai-metric-value">
+                {scan?.model_request_count ?? 0}
+              </span>
+              <span className="ai-metric-label">Model Calls</span>
+            </div>
+            <div className="ai-metric-card">
+              <span className="ai-metric-value">
+                {(
+                  (scan?.total_input_tokens ?? 0) +
+                  (scan?.total_output_tokens ?? 0)
+                ).toLocaleString()}
+              </span>
+              <span className="ai-metric-label">
+                Tokens ({scan?.total_input_tokens ?? 0} in /{" "}
+                {scan?.total_output_tokens ?? 0} out)
+              </span>
+            </div>
+            <div className="ai-metric-card">
+              <span className="ai-metric-value">
+                ${(scan?.estimated_cost_usd ?? 0).toFixed(4)}
+              </span>
+              <span className="ai-metric-label">Observed Cost</span>
+            </div>
+            <div className="ai-metric-card">
+              <span className="ai-metric-value">
+                ${(scan?.unresolved_reservations_usd ?? 0).toFixed(4)}
+              </span>
+              <span className="ai-metric-label">Pending Resv.</span>
+            </div>
+          </div>
+        </div>
+      )}
       {error && (
         <p className="form-error" role="alert">
           {error}
@@ -1425,6 +1735,88 @@ function ResultsView({ scanId, onScanIdChange }: ResultsViewProps) {
             >
               Open HTML report
             </a>
+          </div>
+
+          <div className="provenance-panel">
+            <div className="section-heading">
+              <div>
+                <h3>Discovery provenance & assurance</h3>
+              </div>
+              <span className="engine-pill">
+                Engine:{" "}
+                {scan.provenance?.actual_engine ??
+                  scan.discovery_mode ??
+                  "rules"}
+              </span>
+            </div>
+            <div className="provenance-grid">
+              <div className="provenance-item">
+                <span className="provenance-label">Requested mode</span>
+                <strong className="provenance-value">
+                  {scan.provenance?.requested_mode ??
+                    scan.discovery_mode ??
+                    "rules"}
+                </strong>
+              </div>
+              <div className="provenance-item">
+                <span className="provenance-label">Actual engine</span>
+                <strong className="provenance-value">
+                  {scan.provenance?.actual_engine ?? "rules"}
+                </strong>
+              </div>
+              <div className="provenance-item">
+                <span className="provenance-label">Profile reused</span>
+                <strong className="provenance-value">
+                  {scan.provenance?.reused_profile ? "Yes" : "No"}
+                </strong>
+              </div>
+              <div className="provenance-item">
+                <span className="provenance-label">Usage source</span>
+                <strong className="provenance-value">
+                  {scan.provenance?.usage_source ?? "none"}
+                </strong>
+              </div>
+              <div className="provenance-item">
+                <span className="provenance-label">Model ID</span>
+                <strong className="provenance-value">
+                  {scan.provenance?.model_id ?? "N/A"}
+                </strong>
+              </div>
+              <div className="provenance-item">
+                <span className="provenance-label">Decisions / Requests</span>
+                <strong className="provenance-value">
+                  {scan.decision_count ?? 0} decisions /{" "}
+                  {scan.model_request_count ?? 0} requests
+                </strong>
+              </div>
+              <div className="provenance-item">
+                <span className="provenance-label">Tokens</span>
+                <strong className="provenance-value">
+                  {(
+                    (scan.total_input_tokens ?? 0) +
+                    (scan.total_output_tokens ?? 0)
+                  ).toLocaleString()}{" "}
+                  total ({scan.total_input_tokens ?? 0} in /{" "}
+                  {scan.total_output_tokens ?? 0} out)
+                </strong>
+              </div>
+              <div className="provenance-item">
+                <span className="provenance-label">Inference spend</span>
+                <strong className="provenance-value">
+                  ${(scan.estimated_cost_usd ?? 0).toFixed(4)} USD
+                </strong>
+              </div>
+            </div>
+            <div className="security-notice">
+              <span aria-hidden="true">🔒</span>
+              <p>
+                <strong>Offline assurance:</strong> All security checks, test
+                execution, and evidence reporting are executed 100%
+                deterministically and offline. Runtime secrets and
+                authentication credentials were strictly scrubbed and never
+                transmitted to external model providers.
+              </p>
+            </div>
           </div>
           {scan.results.length === 0 ? (
             <p>No completed results are available yet.</p>

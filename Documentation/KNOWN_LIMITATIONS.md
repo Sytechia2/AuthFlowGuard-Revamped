@@ -24,18 +24,25 @@ None of these can produce a false pass. Unsupported logout discovery yields
 `execution_error`, and an analyser given incomplete evidence yields
 `inconclusive`. Both are distinct from `no_issue_observed` in the reports.
 
-## 2. AI integration
+## 2. AI integration (Updated for INT-011)
 
-Scans started from the web interface **do not call Amazon Bedrock**. Login
-discovery in the web application uses programmed rules. The Bedrock browser
-agent exists but runs only from the terminal (`authflowguard.agent_cli`), stops
-when its account marker becomes visible, and does not perform the full
-signed-in/signed-out comparison, run the six checks, or persist a scan through
-ScanManager.
+Task 2.6 / INT-011 connects the Bedrock browser controller directly to web scans
+initiated from the React interface via FastAPI. Users can select Bedrock AI discovery,
+configure bounded execution limits, observe real-time decision metrics and token spend,
+obtain verified authentication profiles with multi-page replay support, and run all six
+security checks through the existing reporting pipeline.
 
-Consequently the measurements that depend on live model behaviour — discovery
-reliability (EVA-004) and model token/cost measurement — could not be taken.
-See Section 5.
+**Live AWS Session Prerequisite:**
+Live model dispatch requires an active AWS profile session with Bedrock Converse
+entitlements:
+```bash
+aws sso login --profile authflowguard-dev
+# or: aws login --profile authflowguard-dev
+```
+Automated tests and the evaluation harness use `DeterministicModelDouble`
+(`UsageSource.MOCK`) unless live calls are explicitly enabled. A user-selected
+Bedrock web scan does not silently switch to the double or rules when AWS is
+unconfigured. Mock usage is labeled in scan provenance and evaluation output.
 
 ## 3. Runtime
 
@@ -181,3 +188,7 @@ Keep two distinctions apart, because they are easy to conflate:
 was produced without a single model call. The Bedrock agent is a separate
 command-line tool that is not wired into scans at all, which is why its
 reliability is the only part left unmeasured.
+
+## Bedrock web integration review (23 September 2026)
+
+Offline integration tests do not establish live AWS model access, quota, or discovery reliability. Active synchronous SDK requests have bounded network timeouts, but cancellation cannot terminate the underlying thread; worker-process termination remains RUN-002.

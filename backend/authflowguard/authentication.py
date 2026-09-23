@@ -1,7 +1,8 @@
 """Execute and verify a browser-based login without persisting live secrets."""
 
+import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from hashlib import sha256
 from uuid import UUID
@@ -21,6 +22,17 @@ from authflowguard.auth_profiles import (
     ProtectedResourceObservation,
     build_verified_login_profile,
 )
+from authflowguard.automatic_actions import (
+    ActionSelectionClient,
+    AutomaticActionStatus,
+    AutomaticBrowserController,
+    ProgressCallback,
+)
+from authflowguard.evaluation.cost_tracking import (
+    CostLedger,
+    CostLedgerStore,
+    UsageSource,
+)
 from authflowguard.models import (
     ActionWaitCondition,
     AuthFeature,
@@ -29,6 +41,7 @@ from authflowguard.models import (
     BrowserActionType,
     DiscoverySource,
     EvidenceEvent,
+    ExecutionLimits,
     FeatureStatus,
     TargetScope,
     TrafficReference,
@@ -40,6 +53,27 @@ from authflowguard.secrets import RuntimeSecrets
 
 class LoginFormDiscoveryError(ValueError):
     """Raised when a usable login form cannot be identified unambiguously."""
+
+
+async def _proof_wait[ProofResult](
+    operation: Awaitable[ProofResult],
+    cancel_requested: Callable[[], bool] | None,
+) -> ProofResult:
+    """Bound proof operations and interrupt active Playwright waits on cancel."""
+
+    task = asyncio.ensure_future(operation)
+    try:
+        for _ in range(300):
+            if cancel_requested is not None and cancel_requested():
+                raise LoginFormDiscoveryError("Scan cancellation was requested.")
+            done, _ = await asyncio.wait({task}, timeout=0.1)
+            if done:
+                return task.result()
+        raise LoginFormDiscoveryError("Authentication proof timed out.")
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 class StaleAuthProfileError(LoginFormDiscoveryError):
@@ -337,12 +371,38 @@ async def _execute_steps(
     runtime_secrets: RuntimeSecrets,
     scan_id: UUID,
     steps: list[BrowserAction],
+    step_control_signatures: list[dict[str, str]] | None = None,
+    control_signatures_expected: dict[str, str] | None = None,
 ) -> tuple[list[EvidenceEvent], list[TrafficReference], dict[str, str]]:
     events: list[EvidenceEvent] = []
     traffic: list[TrafficReference] = []
     control_signatures: dict[str, str] = {}
     executor = BrowserActionExecutor(page, target, runtime_secrets, scan_id)
-    for action in steps:
+    recorder = PlaywrightWorker()
+    for step_idx, action in enumerate(steps):
+        if action.observed_control_id:
+            controls = await recorder.read_controls(page)
+            current_sigs = {_control_id(c): _control_signature(c) for c in controls}
+            current_sig = current_sigs.get(action.observed_control_id)
+            if current_sig is None:
+                raise StaleAuthProfileError(
+                    f"The recorded control '{action.observed_control_id}' "
+                    "is missing during replay"
+                )
+            expected_sig = None
+            if step_control_signatures and step_idx < len(step_control_signatures):
+                expected_sig = step_control_signatures[step_idx].get(
+                    action.observed_control_id
+                )
+            elif control_signatures_expected:
+                expected_sig = control_signatures_expected.get(
+                    action.observed_control_id
+                )
+            if expected_sig and current_sig != expected_sig:
+                raise StaleAuthProfileError(
+                    f"The recorded control '{action.observed_control_id}' "
+                    "changed signature during replay"
+                )
         _collect_result(await executor.execute(action), events, traffic)
         await _capture_control_signatures(page, control_signatures)
     return events, traffic, control_signatures
@@ -521,6 +581,9 @@ async def execute_guided_verified_login_flow(
                 traffic=traffic,
                 session_references=session_references,
                 control_signatures=control_signatures,
+                step_control_signatures=[
+                    control_signatures.copy() for _ in recorded_actions
+                ],
             )
             return VerifiedLoginExecution(
                 profile=profile,
@@ -538,16 +601,85 @@ async def revalidate_auth_profile(
     *,
     profile: AuthProfile,
     scan_id: UUID,
+    runtime_secrets: RuntimeSecrets | None = None,
 ) -> None:
     """Confirm that a saved flow still describes the current login page."""
 
     login_steps = profile.authentication_steps.get(AuthFeature.LOGIN, [])
     if not login_steps:
         raise StaleAuthProfileError("The saved login flow has no login steps")
-    if not profile.control_signatures:
+    if not profile.control_signatures and not profile.step_control_signatures:
         raise StaleAuthProfileError(
             "The saved login flow has no page-control signatures; guidance is required"
         )
+
+    if profile.step_control_signatures:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await _new_context(browser)
+            try:
+                page = await context.new_page()
+                executor = BrowserActionExecutor(
+                    page,
+                    profile.target,
+                    RuntimeSecrets({}),
+                    scan_id,
+                )
+                recorder = PlaywrightWorker()
+
+                if runtime_secrets is not None:
+                    executor = BrowserActionExecutor(
+                        page, profile.target, runtime_secrets, scan_id
+                    )
+                for step_idx, action in enumerate(login_steps):
+                    if step_idx == 1 and profile.control_signatures:
+                        first_controls = await recorder.read_controls(page)
+                        first_sigs = {
+                            _control_id(c): _control_signature(c)
+                            for c in first_controls
+                        }
+                        for (
+                            control_id,
+                            expected_sig,
+                        ) in profile.control_signatures.items():
+                            if first_sigs.get(control_id) != expected_sig:
+                                raise StaleAuthProfileError(
+                                    "The saved login flow is stale: changed "
+                                    f"{control_id}"
+                                )
+                    if action.observed_control_id:
+                        controls = await recorder.read_controls(page)
+                        current_sigs = {
+                            _control_id(c): _control_signature(c) for c in controls
+                        }
+                        expected = (
+                            profile.step_control_signatures[step_idx].get(
+                                action.observed_control_id
+                            )
+                            if step_idx < len(profile.step_control_signatures)
+                            else None
+                        )
+                        if expected is None:
+                            raise StaleAuthProfileError(
+                                "The saved login flow lacks a step signature for "
+                                f"'{action.observed_control_id}'"
+                            )
+                        current = current_sigs.get(action.observed_control_id)
+                        if current is None or current != expected:
+                            raise StaleAuthProfileError(
+                                "The saved login flow is stale: changed "
+                                f"{action.observed_control_id}"
+                            )
+                    if (
+                        action.action_type is BrowserActionType.FILL
+                        and runtime_secrets is None
+                    ):
+                        break
+                    await executor.execute(action)
+            finally:
+                await context.close()
+                await browser.close()
+        return
 
     navigation = next(
         (
@@ -648,6 +780,8 @@ async def replay_verified_auth_profile(
                 runtime_secrets=runtime_secrets,
                 scan_id=scan_id,
                 steps=replayed_steps,
+                step_control_signatures=profile.step_control_signatures,
+                control_signatures_expected=profile.control_signatures,
             )
             events.extend(action_events)
             traffic.extend(action_traffic)
@@ -719,6 +853,7 @@ async def replay_verified_auth_profile(
                 traffic=traffic,
                 session_references=session_references,
                 control_signatures=profile.control_signatures,
+                step_control_signatures=profile.step_control_signatures,
             )
             return VerifiedLoginExecution(
                 profile=replayed_profile,
@@ -854,6 +989,9 @@ async def execute_verified_login_flow(
                 traffic=traffic,
                 session_references=session_references,
                 control_signatures=control_signatures,
+                step_control_signatures=[
+                    control_signatures.copy() for _ in login_steps
+                ],
             )
             return VerifiedLoginExecution(
                 profile=profile,
@@ -861,6 +999,222 @@ async def execute_verified_login_flow(
                 traffic=traffic,
             )
         finally:
+            if anonymous_context is not None:
+                await anonymous_context.close()
+            await authenticated_context.close()
+            await browser.close()
+
+
+async def execute_ai_verified_login_flow(
+    *,
+    scan_id: UUID,
+    target: TargetScope,
+    runtime_secrets: RuntimeSecrets,
+    username_reference: str,
+    password_reference: str,
+    second_factor_reference: str | None = None,
+    protected_resource: str,
+    account_marker_selector: str,
+    account_marker_description: str,
+    action_client: ActionSelectionClient,
+    limits: ExecutionLimits,
+    cancel_requested: Callable[[], bool] | None = None,
+    progress_callback: ProgressCallback | None = None,
+    usage_callback: Callable[[int | None, int | None], None] | None = None,
+    event_sink: Callable[[list[EvidenceEvent]], None] | None = None,
+    cost_ledger_store: CostLedgerStore | None = None,
+    cost_ledger: CostLedger | None = None,
+    usage_source: UsageSource | str = UsageSource.NONE,
+    model_id: str | None = None,
+) -> VerifiedLoginExecution:
+    """Discover, execute, and prove a login using Bedrock browser orchestration."""
+
+    if not url_is_in_scope(protected_resource, target):
+        raise ValueError("The protected resource is outside permitted_origins")
+    if not account_marker_selector.strip():
+        raise ValueError("The account marker selector must not be empty")
+
+    events: list[EvidenceEvent] = []
+    traffic: list[TrafficReference] = []
+    recorder = PlaywrightWorker()
+
+    credential_references = [username_reference, password_reference]
+    if second_factor_reference is not None:
+        credential_references.append(second_factor_reference)
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        authenticated_context = await _new_context(browser)
+        anonymous_context: BrowserContext | None = None
+
+        try:
+            authenticated_page = await authenticated_context.new_page()
+
+            async def completion_check(page: Page) -> bool:
+                marker = page.locator(account_marker_selector)
+                try:
+                    await marker.first.wait_for(state="visible", timeout=1000)
+                except PlaywrightTimeoutError:
+                    pass
+                if await marker.count() > 0 and await marker.first.is_visible():
+                    return True
+                return False
+
+            controller = AutomaticBrowserController(
+                page=authenticated_page,
+                target=target,
+                runtime_secrets=runtime_secrets,
+                scan_id=scan_id,
+                action_client=action_client,
+                limits=limits,
+                credential_references=credential_references,
+                progress_callback=progress_callback,
+                usage_callback=usage_callback,
+                event_sink=event_sink,
+                cancel_requested=cancel_requested,
+                cost_ledger_store=cost_ledger_store,
+                cost_ledger=cost_ledger,
+                usage_source=usage_source,
+                model_id=model_id,
+            )
+
+            result = await controller.run(completion_check)
+            events.extend(result.events)
+            traffic.extend(result.traffic)
+            if event_sink is not None:
+                event_sink(result.events)
+
+            if result.status is AutomaticActionStatus.CANCELLED:
+                raise LoginFormDiscoveryError("Scan cancellation was requested.")
+            if result.status is not AutomaticActionStatus.COMPLETED:
+                raise LoginFormDiscoveryError(
+                    f"Automatic login discovery did not complete: {result.reason}"
+                )
+
+            raw_actions = result.executed_actions
+            login_steps = _prepare_guided_actions(raw_actions, target, runtime_secrets)
+
+            def check_cancelled() -> None:
+                if cancel_requested is not None and cancel_requested():
+                    raise LoginFormDiscoveryError("Scan cancellation was requested.")
+
+            # Independent authentication proof
+            authenticated_executor = BrowserActionExecutor(
+                authenticated_page,
+                target,
+                runtime_secrets,
+                scan_id,
+            )
+            protected_action = BrowserAction(
+                action_type=BrowserActionType.NAVIGATE,
+                url=protected_resource,
+                description="Open the protected resource after login",
+            )
+            check_cancelled()
+            _collect_result(
+                await _proof_wait(
+                    authenticated_executor.execute(protected_action), cancel_requested
+                ),
+                events,
+                traffic,
+            )
+            check_cancelled()
+            authenticated_observation = await _proof_wait(
+                _record_marker_observation(
+                    recorder, scan_id, authenticated_page, account_marker_selector
+                ),
+                cancel_requested,
+            )
+            events.append(authenticated_observation.evidence)
+
+            if not authenticated_observation.account_marker_present:
+                raise LoginFormDiscoveryError(
+                    f"Authentication proof failed: marker '{account_marker_selector}' "
+                    f"absent in authenticated context on {protected_resource}"
+                )
+
+            check_cancelled()
+            storage_event, session_references = await _proof_wait(
+                recorder.record_session_state(
+                    scan_id, authenticated_context, authenticated_page
+                ),
+                cancel_requested,
+            )
+            events.append(storage_event)
+
+            # Isolated fresh anonymous context check
+            check_cancelled()
+            anonymous_context = await _proof_wait(
+                _new_context(browser), cancel_requested
+            )
+            anonymous_page = await _proof_wait(
+                anonymous_context.new_page(), cancel_requested
+            )
+            anonymous_executor = BrowserActionExecutor(
+                anonymous_page,
+                target,
+                RuntimeSecrets({}),
+                scan_id,
+            )
+            anonymous_protected_action = BrowserAction(
+                action_type=BrowserActionType.NAVIGATE,
+                url=protected_resource,
+                description="Open the protected resource anonymously",
+            )
+            check_cancelled()
+            _collect_result(
+                await _proof_wait(
+                    anonymous_executor.execute(anonymous_protected_action),
+                    cancel_requested,
+                ),
+                events,
+                traffic,
+            )
+            check_cancelled()
+            anonymous_observation = await _proof_wait(
+                _record_marker_observation(
+                    recorder, scan_id, anonymous_page, account_marker_selector
+                ),
+                cancel_requested,
+            )
+            events.append(anonymous_observation.evidence)
+
+            if anonymous_observation.account_marker_present:
+                raise LoginFormDiscoveryError(
+                    f"Authentication proof failed: marker '{account_marker_selector}' "
+                    f"visible in anonymous context on {protected_resource}"
+                )
+
+            check_cancelled()
+            control_signatures = (
+                result.step_control_signatures[1].copy()
+                if len(result.step_control_signatures) > 1
+                else {}
+            )
+
+            profile = build_verified_login_profile(
+                target=target,
+                login_steps=login_steps,
+                protected_resource=protected_resource,
+                account_marker_description=runtime_secrets.redact_text(
+                    account_marker_description
+                ),
+                authenticated_observation=authenticated_observation,
+                anonymous_observation=anonymous_observation,
+                discovery_source=DiscoverySource.AUTOMATIC,
+                traffic=traffic,
+                session_references=session_references,
+                control_signatures=control_signatures,
+                step_control_signatures=result.step_control_signatures,
+            )
+            return VerifiedLoginExecution(
+                profile=profile,
+                events=events,
+                traffic=traffic,
+            )
+        finally:
+            if event_sink is not None:
+                event_sink(events)
             if anonymous_context is not None:
                 await anonymous_context.close()
             await authenticated_context.close()

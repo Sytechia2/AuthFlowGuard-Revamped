@@ -51,12 +51,14 @@ class UsageSource(StrEnum):
 
     LIVE = "live"
     MOCK = "mock"
+    NONE = "none"
 
 
 class CostEntry(ContractModel):
     """One priced model request, recorded as exact token counts."""
 
     entry_id: UUID = Field(default_factory=uuid4)
+    request_id: UUID | None = None
     run_id: str = Field(min_length=1)
     workflow: str = Field(min_length=1)
     phase: WorkflowPhase
@@ -67,6 +69,8 @@ class CostEntry(ContractModel):
     image_count: int = Field(default=0, ge=0)
     reserved_cost_usd: Decimal | None = Field(default=None, ge=0)
     scan_id: UUID | None = None
+    is_reservation: bool = False
+    reconciled: bool = False
     recorded_at: datetime = Field(default_factory=_utc_now)
 
     @field_serializer("reserved_cost_usd")
@@ -221,9 +225,121 @@ class CostLedger:
             scan_id=scan_id,
         )
 
+    def record_reservation(
+        self,
+        *,
+        request_id: UUID,
+        run_id: str,
+        workflow: str,
+        phase: WorkflowPhase,
+        model_id: str,
+        source: UsageSource,
+        reserved_cost_usd: Decimal,
+        scan_id: UUID | None = None,
+    ) -> CostEntry:
+        price_for(model_id, self._price_book)
+        entry = CostEntry(
+            request_id=request_id,
+            run_id=run_id,
+            workflow=workflow,
+            phase=phase,
+            model_id=model_id,
+            source=source,
+            input_tokens=0,
+            output_tokens=0,
+            reserved_cost_usd=reserved_cost_usd,
+            scan_id=scan_id,
+            is_reservation=True,
+            recorded_at=self._clock(),
+        )
+        self._entries.append(entry)
+        return entry
+
+    def record_reconciliation(
+        self,
+        *,
+        request_id: UUID,
+        run_id: str,
+        workflow: str,
+        phase: WorkflowPhase,
+        model_id: str,
+        source: UsageSource,
+        input_tokens: int,
+        output_tokens: int,
+        reserved_cost_usd: Decimal | None = None,
+        image_count: int = 0,
+        scan_id: UUID | None = None,
+    ) -> CostEntry:
+        price_for(model_id, self._price_book)
+        if any(
+            entry.request_id == request_id and entry.reconciled
+            for entry in self._entries
+        ):
+            raise ValueError(f"Request {request_id} was already reconciled")
+        entry = CostEntry(
+            request_id=request_id,
+            run_id=run_id,
+            workflow=workflow,
+            phase=phase,
+            model_id=model_id,
+            source=source,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            image_count=image_count,
+            reserved_cost_usd=reserved_cost_usd,
+            scan_id=scan_id,
+            is_reservation=False,
+            reconciled=True,
+            recorded_at=self._clock(),
+        )
+        self._entries.append(entry)
+        return entry
+
+    def total_observed_cost_usd(self) -> Decimal:
+        completed = [e for e in self._entries if not e.is_reservation]
+        return self._cost_of(completed)
+
+    def unresolved_reservations(self) -> list[CostEntry]:
+        reconciled_ids = {
+            e.request_id
+            for e in self._entries
+            if not e.is_reservation and e.request_id is not None
+        }
+        return [
+            e
+            for e in self._entries
+            if e.is_reservation
+            and e.request_id is not None
+            and e.request_id not in reconciled_ids
+        ]
+
+    def total_unresolved_reservations_usd(self) -> Decimal:
+        total = Decimal("0")
+        for res in self.unresolved_reservations():
+            if res.reserved_cost_usd is not None:
+                total += res.reserved_cost_usd
+        return total.quantize(USD_PLACES, rounding=ROUND_HALF_UP)
+
+    def total_budget_committed_usd(self) -> Decimal:
+        return self.total_observed_cost_usd() + self.total_unresolved_reservations_usd()
+
+    def exceeds_budget(
+        self, budget_usd: Decimal, include_reservations: bool = True
+    ) -> bool:
+        """Report whether measured spend has passed a configured allowance."""
+        if include_reservations:
+            return self.total_budget_committed_usd() > budget_usd
+        return self.total_observed_cost_usd() > budget_usd
+
     def extend(self, entries: Iterable[CostEntry]) -> None:
         for entry in entries:
             price_for(entry.model_id, self._price_book)
+            if entry.request_id is not None and any(
+                prior.request_id == entry.request_id
+                and prior.is_reservation == entry.is_reservation
+                for prior in self._entries
+            ):
+                raise ValueError(f"Duplicate cost entry for request {entry.request_id}")
             self._entries.append(entry)
 
     def entry_cost_usd(self, entry: CostEntry) -> Decimal:
@@ -239,7 +355,8 @@ class CostLedger:
 
         grouped: dict[WorkflowPhase, list[CostEntry]] = defaultdict(list)
         for entry in self._entries:
-            grouped[entry.phase].append(entry)
+            if not entry.is_reservation:
+                grouped[entry.phase].append(entry)
         return {
             phase: self._cost_of(entries) for phase, entries in sorted(grouped.items())
         }
@@ -247,8 +364,9 @@ class CostLedger:
     def build_report(self) -> CostReport:
         """Build the per-workflow cost table."""
 
+        completed_entries = [e for e in self._entries if not e.is_reservation]
         grouped: dict[str, list[CostEntry]] = defaultdict(list)
-        for entry in self._entries:
+        for entry in completed_entries:
             grouped[entry.workflow].append(entry)
 
         rows = tuple(
@@ -257,20 +375,15 @@ class CostLedger:
         )
         return CostReport(
             rows=rows,
-            total_cost_usd=self._cost_of(self._entries),
-            total_input_tokens=sum(e.input_tokens for e in self._entries),
-            total_output_tokens=sum(e.output_tokens for e in self._entries),
-            total_requests=len(self._entries),
-            total_runs=len({e.run_id for e in self._entries}),
-            sources=self._sources_of(self._entries),
+            total_cost_usd=self._cost_of(completed_entries),
+            total_input_tokens=sum(e.input_tokens for e in completed_entries),
+            total_output_tokens=sum(e.output_tokens for e in completed_entries),
+            total_requests=len(completed_entries),
+            total_runs=len({e.run_id for e in completed_entries}),
+            sources=self._sources_of(completed_entries),
             price_sources=self._price_sources(),
             generated_at=self._clock(),
         )
-
-    def exceeds_budget(self, budget_usd: Decimal) -> bool:
-        """Report whether measured spend has passed a configured allowance."""
-
-        return self._cost_of(self._entries) > budget_usd
 
     def _build_row(
         self, workflow: str, entries: Sequence[CostEntry]

@@ -37,7 +37,7 @@ class FakeBotoSession:
             "region_name": region_name,
         }
 
-    def client(self, service_name: str, *, region_name: str) -> object:
+    def client(self, service_name: str, *, region_name: str, **kwargs: Any) -> object:
         type(self).client_created_with = {
             "service_name": service_name,
             "region_name": region_name,

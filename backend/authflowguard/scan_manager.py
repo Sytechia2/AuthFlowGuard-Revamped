@@ -1,6 +1,7 @@
 """Local scan lifecycle orchestration for the first complete check slice."""
 
 import asyncio
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -16,12 +17,17 @@ from authflowguard.authentication import (
     GuidedPageObservation,
     LoginFormDiscoveryError,
     VerifiedLoginExecution,
+    execute_ai_verified_login_flow,
     execute_guided_verified_login_flow,
     execute_verified_login_flow,
     observe_guidance_page,
     replay_verified_auth_profile,
     revalidate_auth_profile,
 )
+from authflowguard.automatic_actions import (
+    ActionSelectionClient,
+)
+from authflowguard.bedrock import BedrockActionClient, BedrockConfiguration
 from authflowguard.checks.form_enumeration import FormEnumerationRun
 from authflowguard.checks.login_enumeration import (
     LoginEnumerationRun,
@@ -51,12 +57,23 @@ from authflowguard.checks.session_fixation import (
     analyse_session_fixation,
     run_session_fixation_check,
 )
+from authflowguard.config import (
+    load_server_settings,
+    validate_bedrock_configuration,
+)
+from authflowguard.evaluation.cost_tracking import (
+    CostLedger,
+    CostLedgerStore,
+    UsageSource,
+)
 from authflowguard.evidence import EvidenceStore
 from authflowguard.models import (
     AuthProfile,
     BrowserAction,
     CheckId,
     CheckResult,
+    DiscoveryMode,
+    DiscoveryProvenance,
     EvidenceEvent,
     ScanRequest,
     TargetScope,
@@ -142,6 +159,15 @@ class ScanRecord:
     request: ScanRequest
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     state: ScanState = ScanState.CREATED
+    phase: str = "created"
+    decision_count: int = 0
+    model_request_count: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+    unresolved_reservations_usd: float = 0.0
+    stop_reason: str | None = None
+    provenance: DiscoveryProvenance | None = None
     events: list[EvidenceEvent] = field(default_factory=list)
     evidence: list[TestRunEvidence] = field(default_factory=list)
     results: list[CheckResult] = field(default_factory=list)
@@ -150,13 +176,19 @@ class ScanRecord:
     cancel_requested: Event = field(default_factory=Event)
     future: Future[None] | None = None
     pending_execution: ScanExecutionInput | None = None
+    cost_ledger: CostLedger | None = None
 
 
 class ScanManager:
     """Keep one active local scan and persist its nonsecret artifacts."""
 
-    def __init__(self, data_root: str | Path) -> None:
+    def __init__(
+        self,
+        data_root: str | Path,
+        action_client_factory: Callable[[], ActionSelectionClient] | None = None,
+    ) -> None:
         self._store = EvidenceStore(data_root)
+        self._action_client_factory = action_client_factory
         self._records: dict[UUID, ScanRecord] = {}
         self._lock = Lock()
         self._executor = ThreadPoolExecutor(
@@ -164,8 +196,24 @@ class ScanManager:
         )
         self._load_persisted_scans()
 
+    @property
+    def has_action_client_factory(self) -> bool:
+        return self._action_client_factory is not None
+
     def create_scan(self, request: ScanRequest) -> ScanRecord:
-        record = ScanRecord(scan_id=uuid4(), request=request)
+        provenance = DiscoveryProvenance(
+            requested_mode=request.discovery_mode,
+            actual_engine=None,
+            usage_source="none",
+            reused_profile=False,
+            guidance_used=False,
+            model_id=None,
+        )
+        record = ScanRecord(
+            scan_id=uuid4(),
+            request=request,
+            provenance=provenance,
+        )
         with self._lock:
             self._records[record.scan_id] = record
         self._store.create_scan(
@@ -174,6 +222,8 @@ class ScanManager:
                 **request.model_dump(mode="json"),
                 "created_at": record.created_at.isoformat(),
                 "state": record.state.value,
+                "phase": record.phase,
+                "provenance": provenance.model_dump(mode="json"),
             },
         )
         return record
@@ -193,7 +243,25 @@ class ScanManager:
                 other.state is ScanState.RUNNING for other in self._records.values()
             ):
                 raise ValueError("Another scan is already running")
+            if record.request.discovery_mode == DiscoveryMode.BEDROCK:
+                settings = load_server_settings()
+                limits = record.request.limits
+                if (
+                    limits.maximum_ai_decisions > settings.server_max_decisions
+                    or limits.maximum_active_seconds > settings.server_max_seconds
+                    or limits.maximum_inference_cost_usd > settings.server_max_cost_usd
+                ):
+                    raise ValueError(
+                        "Requested Bedrock limits exceed server maximum limits"
+                    )
+                if not self.has_action_client_factory:
+                    is_valid, reason = validate_bedrock_configuration()
+                    if not is_valid:
+                        raise ValueError(
+                            f"Bedrock discovery is not configured: {reason}"
+                        )
             record.state = ScanState.RUNNING
+            record.phase = "running"
             self._persist_state(record)
             record.future = self._executor.submit(
                 self._run_scan,
@@ -212,9 +280,11 @@ class ScanManager:
             }:
                 return record
             record.cancel_requested.set()
+            record.phase = "cancelled"
+            record.stop_reason = "cancelled"
+            record.pending_execution = None
             if record.state in {ScanState.CREATED, ScanState.AWAITING_GUIDANCE}:
                 record.state = ScanState.CANCELLED
-                record.pending_execution = None
                 self._persist_state(record)
             return record
 
@@ -288,6 +358,7 @@ class ScanManager:
                     execution_data[field_name] = value
             execution = ScanExecutionInput.model_validate(execution_data)
             record.state = ScanState.RUNNING
+            record.phase = "running"
             record.error = None
             self._persist_state(record)
             record.future = self._executor.submit(
@@ -377,8 +448,15 @@ class ScanManager:
             asyncio.run(self._run_scan_async(record, execution))
         except Exception as error:
             with self._lock:
-                record.state = ScanState.FAILED
-                record.error = type(error).__name__
+                if record.cancel_requested.is_set():
+                    record.state = ScanState.CANCELLED
+                    record.phase = "cancelled"
+                    record.stop_reason = "cancelled"
+                    record.pending_execution = None
+                else:
+                    record.state = ScanState.FAILED
+                    record.phase = "failed"
+                    record.error = type(error).__name__
             self._persist_state(record)
 
     def _run_guided_scan(
@@ -396,6 +474,11 @@ class ScanManager:
                     if record.cancel_requested.is_set()
                     else ScanState.AWAITING_GUIDANCE
                 )
+                record.phase = (
+                    "cancelled"
+                    if record.cancel_requested.is_set()
+                    else "awaiting_guidance"
+                )
                 if record.state is ScanState.CANCELLED:
                     record.pending_execution = None
                 record.error = str(error)
@@ -403,6 +486,7 @@ class ScanManager:
         except Exception as error:
             with self._lock:
                 record.state = ScanState.FAILED
+                record.phase = "failed"
                 record.error = type(error).__name__
             self._persist_state(record)
 
@@ -413,17 +497,28 @@ class ScanManager:
     ) -> None:
         if record.cancel_requested.is_set():
             record.state = ScanState.CANCELLED
+            record.phase = "cancelled"
+            record.stop_reason = "cancelled"
             self._persist_state(record)
             return
 
         runtime_secrets = RuntimeSecrets(execution.runtime_secrets)
         try:
-            saved_profile = self._find_saved_profile(record, execution)
+            saved_profile: AuthProfile | None = None
+            if record.request.reuse_saved_profile:
+                saved_profile = self._find_saved_profile(record, execution)
+
             try:
                 if saved_profile is not None:
+                    record.phase = "verifying"
+                    if record.provenance:
+                        record.provenance.reused_profile = True
+                        record.provenance.actual_engine = None
+                        record.provenance.usage_source = "none"
                     await revalidate_auth_profile(
                         profile=saved_profile,
                         scan_id=record.scan_id,
+                        runtime_secrets=runtime_secrets,
                     )
                     profile_execution = await replay_verified_auth_profile(
                         profile=saved_profile,
@@ -431,7 +526,91 @@ class ScanManager:
                         runtime_secrets=runtime_secrets,
                         account_marker_selector=execution.account_marker_selector,
                     )
+                elif record.request.discovery_mode == DiscoveryMode.BEDROCK:
+                    record.phase = "discovering"
+                    settings = load_server_settings()
+                    model_id = settings.model_id
+                    if self._action_client_factory is not None:
+                        client = self._action_client_factory()
+                        source = UsageSource.MOCK
+                    else:
+                        config = BedrockConfiguration(
+                            aws_profile=settings.aws_profile,
+                            aws_region=settings.aws_region,
+                            model_id=settings.model_id,
+                            max_output_tokens=settings.max_output_tokens,
+                            maximum_estimated_cost_usd=settings.maximum_estimated_cost_usd,
+                        )
+                        client = BedrockActionClient(config)
+                        source = UsageSource.LIVE
+
+                    if record.provenance:
+                        record.provenance.actual_engine = "bedrock"
+                        record.provenance.usage_source = source.value
+                        record.provenance.model_id = model_id
+
+                    ledger_path = (
+                        self._store.scan_directory(record.scan_id)
+                        / "cost-ledger.ndjson"
+                    )
+                    ledger_store = CostLedgerStore(ledger_path)
+                    record.cost_ledger = ledger_store.load_into()
+
+                    def usage_cb(
+                        input_tokens: int | None, output_tokens: int | None
+                    ) -> None:
+                        with self._lock:
+                            if input_tokens is None:
+                                record.model_request_count += 1
+                            else:
+                                record.decision_count += 1
+                                record.total_input_tokens += input_tokens
+                                record.total_output_tokens += output_tokens or 0
+                            if record.cost_ledger:
+                                record.estimated_cost_usd = float(
+                                    record.cost_ledger.total_observed_cost_usd()
+                                )
+                                record.unresolved_reservations_usd = float(
+                                    record.cost_ledger.total_unresolved_reservations_usd()
+                                )
+                            self._persist_state(record)
+
+                    def event_sink(events: list[EvidenceEvent]) -> None:
+                        with self._lock:
+                            self._save_events(record, events)
+
+                    profile_execution = await execute_ai_verified_login_flow(
+                        scan_id=record.scan_id,
+                        target=record.request.target,
+                        runtime_secrets=runtime_secrets,
+                        username_reference=execution.username_reference,
+                        password_reference=execution.password_reference,
+                        second_factor_reference=execution.second_factor_reference,
+                        protected_resource=str(execution.protected_resource),
+                        account_marker_selector=execution.account_marker_selector,
+                        account_marker_description=execution.account_marker_description,
+                        action_client=client,
+                        limits=record.request.limits,
+                        cancel_requested=record.cancel_requested.is_set,
+                        usage_callback=usage_cb,
+                        event_sink=event_sink,
+                        cost_ledger_store=ledger_store,
+                        cost_ledger=record.cost_ledger,
+                        usage_source=source,
+                        model_id=model_id,
+                    )
+                    if record.cost_ledger:
+                        record.estimated_cost_usd = float(
+                            record.cost_ledger.total_observed_cost_usd()
+                        )
+                        record.unresolved_reservations_usd = float(
+                            record.cost_ledger.total_unresolved_reservations_usd()
+                        )
                 else:
+                    record.phase = "discovering"
+                    if record.provenance:
+                        record.provenance.actual_engine = "rules"
+                        record.provenance.usage_source = "none"
                     profile_execution = await execute_verified_login_flow(
                         scan_id=record.scan_id,
                         target=record.request.target,
@@ -445,20 +624,22 @@ class ScanManager:
                     )
             except (LoginFormDiscoveryError, ValueError) as error:
                 with self._lock:
-                    record.state = (
-                        ScanState.CANCELLED
-                        if record.cancel_requested.is_set()
-                        else ScanState.AWAITING_GUIDANCE
-                    )
+                    if record.cancel_requested.is_set():
+                        record.state = ScanState.CANCELLED
+                        record.phase = "cancelled"
+                        record.stop_reason = "cancelled"
+                        record.pending_execution = None
+                    else:
+                        record.state = ScanState.AWAITING_GUIDANCE
+                        record.phase = "awaiting_guidance"
+                        record.stop_reason = str(error)
+                        record.pending_execution = execution
+                        if record.provenance:
+                            record.provenance.guidance_used = True
                     record.error = (
                         f"Saved authentication flow needs guidance: {error}"
                         if saved_profile is not None
                         else str(error)
-                    )
-                    record.pending_execution = (
-                        execution
-                        if record.state is ScanState.AWAITING_GUIDANCE
-                        else None
                     )
                 self._persist_state(record)
                 return
@@ -474,6 +655,9 @@ class ScanManager:
     ) -> None:
         runtime_secrets = RuntimeSecrets(execution.runtime_secrets)
         try:
+            record.phase = "verifying"
+            if record.provenance:
+                record.provenance.guidance_used = True
             profile_execution = await execute_guided_verified_login_flow(
                 scan_id=record.scan_id,
                 target=record.request.target,
@@ -500,11 +684,15 @@ class ScanManager:
 
         if record.cancel_requested.is_set():
             record.state = ScanState.CANCELLED
+            record.phase = "cancelled"
+            record.stop_reason = "cancelled"
+            record.pending_execution = None
             self._persist_state(record)
             return
 
-        # Registration can create the disposable account. Execute all checks
-        # depending on its nonexistence before the registration submission.
+        record.phase = "checking"
+        self._persist_state(record)
+
         check_order = (
             CheckId.LOGIN_ENUMERATION,
             CheckId.RESET_REQUEST_ENUMERATION,
@@ -611,11 +799,16 @@ class ScanManager:
             )
             record.results.append(result)
             self._store.save_result(result)
+
         record.state = (
             ScanState.CANCELLED
             if record.cancel_requested.is_set()
             else ScanState.COMPLETED
         )
+        record.phase = "cancelled" if record.cancel_requested.is_set() else "completed"
+        if record.state is ScanState.CANCELLED:
+            record.stop_reason = "cancelled"
+            record.pending_execution = None
         self._persist_state(record)
         if record.evidence:
             export_scan_reports(
@@ -627,9 +820,13 @@ class ScanManager:
         record: ScanRecord,
         events: list[EvidenceEvent],
     ) -> None:
-        record.events.extend(events)
+        existing = {event.event_id for event in record.events}
         for event in events:
+            if event.event_id in existing:
+                continue
             self._store.append_event(event)
+            record.events.append(event)
+            existing.add(event.event_id)
 
     def _get_scan_locked(self, scan_id: UUID) -> ScanRecord:
         try:
@@ -638,20 +835,43 @@ class ScanManager:
             raise KeyError(f"Unknown scan '{scan_id}'") from error
 
     def _persist_state(self, record: ScanRecord) -> None:
-        self._store.update_metadata(
-            record.scan_id,
-            {"state": record.state.value, "error": record.error},
-        )
+        metadata: dict[str, Any] = {
+            "state": record.state.value,
+            "error": record.error,
+            "phase": record.phase,
+            "decision_count": record.decision_count,
+            "model_request_count": record.model_request_count,
+            "total_input_tokens": record.total_input_tokens,
+            "total_output_tokens": record.total_output_tokens,
+            "estimated_cost_usd": record.estimated_cost_usd,
+            "unresolved_reservations_usd": record.unresolved_reservations_usd,
+            "stop_reason": record.stop_reason,
+        }
+        if record.provenance:
+            metadata["provenance"] = record.provenance.model_dump(mode="json")
+        self._store.update_metadata(record.scan_id, metadata)
 
     def _load_persisted_scans(self) -> None:
         for scan_id in self._store.list_scan_ids():
             try:
                 metadata = self._store.read_metadata(scan_id)
                 request_data = dict(metadata)
-                request_data.pop("scan_id", None)
-                request_data.pop("created_at", None)
-                request_data.pop("state", None)
-                request_data.pop("error", None)
+                for key in (
+                    "scan_id",
+                    "created_at",
+                    "state",
+                    "error",
+                    "phase",
+                    "decision_count",
+                    "model_request_count",
+                    "total_input_tokens",
+                    "total_output_tokens",
+                    "estimated_cost_usd",
+                    "unresolved_reservations_usd",
+                    "stop_reason",
+                    "provenance",
+                ):
+                    request_data.pop(key, None)
                 request = ScanRequest.model_validate(request_data)
                 created_at_value = metadata.get("created_at")
                 created_at = (
@@ -674,6 +894,51 @@ class ScanManager:
                 if state in {ScanState.RUNNING, ScanState.AWAITING_GUIDANCE}:
                     state = ScanState.FAILED
                     error = "Backend restarted during scan execution"
+
+                phase = str(
+                    metadata.get(
+                        "phase",
+                        "completed" if state is ScanState.COMPLETED else state.value,
+                    )
+                )
+                decision_count = int(metadata.get("decision_count", 0))
+                model_request_count = int(metadata.get("model_request_count", 0))
+                total_input_tokens = int(metadata.get("total_input_tokens", 0))
+                total_output_tokens = int(metadata.get("total_output_tokens", 0))
+                estimated_cost_usd = float(metadata.get("estimated_cost_usd", 0.0))
+                unresolved_reservations_usd = float(
+                    metadata.get("unresolved_reservations_usd", 0.0)
+                )
+                stop_reason = metadata.get("stop_reason")
+
+                raw_prov = metadata.get("provenance")
+                provenance: DiscoveryProvenance | None = None
+                if raw_prov and isinstance(raw_prov, dict):
+                    try:
+                        provenance = DiscoveryProvenance.model_validate(raw_prov)
+                    except ValueError:
+                        pass
+                if provenance is None:
+                    provenance = DiscoveryProvenance(
+                        requested_mode=request.discovery_mode
+                    )
+
+                ledger_path = self._store.scan_directory(scan_id) / "cost-ledger.ndjson"
+                cost_ledger: CostLedger | None = None
+                if ledger_path.exists():
+                    try:
+                        cost_ledger = CostLedgerStore(ledger_path).load_into()
+                        estimated_cost_usd = float(
+                            cost_ledger.total_observed_cost_usd()
+                        )
+                        unresolved_reservations_usd = float(
+                            cost_ledger.total_unresolved_reservations_usd()
+                        )
+                    except (OSError, ValueError):
+                        state = ScanState.FAILED
+                        phase = "failed"
+                        error = "Cost ledger is damaged; usage cannot be reconciled"
+
                 results = []
                 for raw_result in self._store.read_results(scan_id):
                     result_data = dict(raw_result)
@@ -684,11 +949,21 @@ class ScanManager:
                     request=request,
                     created_at=created_at,
                     state=state,
+                    phase=phase,
+                    decision_count=decision_count,
+                    model_request_count=model_request_count,
+                    total_input_tokens=total_input_tokens,
+                    total_output_tokens=total_output_tokens,
+                    estimated_cost_usd=estimated_cost_usd,
+                    unresolved_reservations_usd=unresolved_reservations_usd,
+                    stop_reason=stop_reason,
+                    provenance=provenance,
                     events=self._store.read_events(scan_id),
                     evidence=self._store.read_all_evidence(scan_id),
                     results=_latest_results(results),
                     profile=self._store.read_profile(scan_id),
                     error=str(error) if error is not None else None,
+                    cost_ledger=cost_ledger,
                 )
                 self._records[scan_id] = record
                 if state is ScanState.FAILED and metadata.get("state") in {
@@ -716,4 +991,17 @@ class ScanManager:
             ),
             "guidance_required": record.state is ScanState.AWAITING_GUIDANCE,
             "results": [result.model_dump(mode="json") for result in record.results],
+            "phase": record.phase,
+            "decision_count": record.decision_count,
+            "model_request_count": record.model_request_count,
+            "total_input_tokens": record.total_input_tokens,
+            "total_output_tokens": record.total_output_tokens,
+            "estimated_cost_usd": record.estimated_cost_usd,
+            "unresolved_reservations_usd": record.unresolved_reservations_usd,
+            "stop_reason": record.stop_reason,
+            "provenance": (
+                record.provenance.model_dump(mode="json") if record.provenance else None
+            ),
+            "discovery_mode": record.request.discovery_mode.value,
+            "reuse_saved_profile": record.request.reuse_saved_profile,
         }
