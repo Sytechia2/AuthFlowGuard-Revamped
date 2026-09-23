@@ -76,6 +76,12 @@ def write_html_report(
             )
             + "</ul>"
         )
+    cancellation_notice = (
+        "<p><strong>Execution was cancelled; unfinished checks have no security "
+        "outcome.</strong></p>"
+        if report["metadata"].get("state") == "cancelled"
+        else ""
+    )
     document = f"""<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>AuthFlowGuard report</title>
@@ -90,6 +96,8 @@ margin: 1rem 0; }}
 </style>
 </head><body><h1>AuthFlowGuard security report</h1>
 <p>Scan: {html.escape(str(report["metadata"].get("scan_id", "unknown")))}</p>
+<p>Execution status: {html.escape(str(report["metadata"].get("state", "unknown")))}</p>
+{cancellation_notice}
 <h2>Results</h2>{results_html}
 <h2>Coverage limitations</h2>{limitations}
 <h2>Saved evidence</h2><p>{len(report["evidence"])} evidence package(s) are

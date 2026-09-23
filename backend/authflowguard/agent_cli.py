@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from botocore.exceptions import BotoCoreError, ClientError
-from playwright.async_api import Page, async_playwright
+from playwright.async_api import BrowserContext, Page, async_playwright
 
 from authflowguard.action_executor import ActionExecutionResult
 from authflowguard.automatic_actions import (
@@ -23,6 +23,7 @@ from authflowguard.bedrock import (
     BedrockConfiguration,
     BedrockResponseError,
 )
+from authflowguard.cancellation import close_resources
 from authflowguard.models import EvidenceKind, ExecutionLimits, TargetScope
 from authflowguard.secrets import RuntimeSecrets
 
@@ -116,16 +117,17 @@ async def run_live_session(
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=not arguments.headed)
-        context = await browser.new_context()
-        page = await context.new_page()
-
-        async def completion_check(current_page: Page) -> bool:
-            return await marker_is_visible(
-                current_page,
-                arguments.account_marker_selector,
-            )
-
+        context: BrowserContext | None = None
         try:
+            context = await browser.new_context()
+            page = await context.new_page()
+
+            async def completion_check(current_page: Page) -> bool:
+                return await marker_is_visible(
+                    current_page,
+                    arguments.account_marker_selector,
+                )
+
             controller = AutomaticBrowserController(
                 page=page,
                 target=target,
@@ -142,8 +144,7 @@ async def run_live_session(
             return await controller.run(completion_check)
         finally:
             runtime_secrets.discard_all()
-            await context.close()
-            await browser.close()
+            await close_resources(context, browser)
 
 
 def print_summary(result: AutomaticActionResult) -> None:

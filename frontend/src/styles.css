@@ -550,6 +550,22 @@ h3 {
   background: var(--blue-soft);
 }
 
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+}
+
+.cancel-button {
+  border-color: #e1aeb3;
+  color: var(--red);
+}
+
+.cancel-button:hover {
+  border-color: var(--red);
+  background: var(--red-soft);
+}
+
 .form-error {
   color: var(--red) !important;
 }
