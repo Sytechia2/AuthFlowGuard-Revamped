@@ -106,6 +106,84 @@ class ScanState(StrEnum):
     CANCELLED = "cancelled"
 
 
+TERMINAL_SCAN_STATES = {
+    ScanState.COMPLETED,
+    ScanState.FAILED,
+    ScanState.CANCELLED,
+}
+
+_UNCHANGED = object()
+
+ALLOWED_SCAN_TRANSITIONS = {
+    ScanState.CREATED: {ScanState.RUNNING, ScanState.CANCELLED},
+    ScanState.RUNNING: {
+        ScanState.AWAITING_GUIDANCE,
+        ScanState.COMPLETED,
+        ScanState.FAILED,
+        ScanState.CANCELLED,
+    },
+    ScanState.AWAITING_GUIDANCE: {
+        ScanState.RUNNING,
+        ScanState.FAILED,
+        ScanState.CANCELLED,
+    },
+    ScanState.COMPLETED: set(),
+    ScanState.FAILED: set(),
+    ScanState.CANCELLED: set(),
+}
+
+
+class ScanManagerError(ValueError):
+    """Safe, machine-readable failure exposed by the local API."""
+
+    code = "scan_error"
+    status_code = 409
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(detail)
+
+
+class ScanNotFoundError(ScanManagerError):
+    code = "scan_not_found"
+    status_code = 404
+
+
+class ScanRecoveryError(ScanManagerError):
+    code = "scan_recovery_failed"
+
+
+class InvalidScanStateError(ScanManagerError):
+    code = "invalid_scan_state"
+
+
+class ScanBusyError(ScanManagerError):
+    code = "scan_busy"
+
+
+class EvidenceNotAvailableError(ScanManagerError):
+    code = "evidence_not_available"
+
+
+class ReportNotAvailableError(ScanManagerError):
+    code = "report_not_available"
+    status_code = 404
+
+
+class InvalidReportFormatError(ScanManagerError):
+    code = "invalid_report_format"
+    status_code = 422
+
+
+class ScanWorkerUnavailableError(ScanManagerError):
+    code = "scan_worker_unavailable"
+    status_code = 503
+
+
+class GuidanceObservationError(ScanManagerError):
+    code = "guidance_observation_failed"
+
+
 class ScanExecutionInput(BaseModel):
     """Transient execution input; this model is never saved with a scan."""
 
@@ -168,12 +246,17 @@ class ScanRecord:
     results: list[CheckResult] = field(default_factory=list)
     profile: AuthProfile | None = None
     error: str | None = None
+    error_code: str | None = None
+    state_changed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
     cancellation: CancellationControl = field(default_factory=CancellationControl)
     future: Future[None] | None = None
     pending_execution: ScanExecutionInput | None = None
     active_check: CheckId | None = None
     completed_checks: list[CheckId] = field(default_factory=list)
     pending_observations: int = 0
+    worker_generation: int = 0
 
     @property
     def cancel_requested(self) -> bool:
@@ -186,6 +269,7 @@ class ScanManager:
     def __init__(self, data_root: str | Path) -> None:
         self._store = EvidenceStore(data_root)
         self._records: dict[UUID, ScanRecord] = {}
+        self._recovery_errors: dict[UUID, str] = {}
         self._lock = Lock()
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="afg-scan"
@@ -202,37 +286,43 @@ class ScanManager:
                 **request.model_dump(mode="json"),
                 "created_at": record.created_at.isoformat(),
                 "state": record.state.value,
+                "state_changed_at": record.state_changed_at.isoformat(),
             },
         )
         return record
 
     def get_scan(self, scan_id: UUID) -> ScanRecord:
-        try:
-            return self._records[scan_id]
-        except KeyError as error:
-            raise KeyError(f"Unknown scan '{scan_id}'") from error
+        with self._lock:
+            return self._get_scan_locked(scan_id)
 
     def start_scan(self, scan_id: UUID, execution: ScanExecutionInput) -> ScanRecord:
         try:
             with self._lock:
                 record = self._get_scan_locked(scan_id)
                 if record.state is not ScanState.CREATED:
-                    raise ValueError("Only a created scan can be started")
+                    raise InvalidScanStateError("Only a created scan can be started")
                 if any(self._is_active(other) for other in self._records.values()):
-                    raise ValueError("Another scan is already running")
-                record.state = ScanState.RUNNING
-                self._persist_state(record)
+                    raise ScanBusyError("Another scan is already running")
+                record.worker_generation += 1
+                worker_generation = record.worker_generation
+                self._transition(record, ScanState.RUNNING)
                 try:
                     record.future = self._executor.submit(
                         self._run_scan,
                         record,
                         execution,
+                        worker_generation,
                     )
                 except BaseException:
-                    record.state = ScanState.FAILED
-                    record.error = "The scan worker could not be started"
-                    self._persist_state(record)
-                    raise
+                    self._transition(
+                        record,
+                        ScanState.FAILED,
+                        error="The scan worker could not be started",
+                        error_code="scan_worker_unavailable",
+                    )
+                    raise ScanWorkerUnavailableError(
+                        "The scan worker could not be started"
+                    ) from None
                 return record
         except BaseException:
             execution.discard_runtime_secrets()
@@ -253,9 +343,13 @@ class ScanManager:
                 and not record.cancellation.has_active_work
                 and record.pending_observations == 0
             ):
-                record.state = ScanState.CANCELLED
                 self._discard_pending_execution(record)
-                self._persist_state(record)
+                self._transition(
+                    record,
+                    ScanState.CANCELLED,
+                    error="Scan execution cancelled",
+                    error_code="scan_cancelled",
+                )
                 self._export_reports(record)
             else:
                 self._persist_state(record)
@@ -271,9 +365,9 @@ class ScanManager:
         with self._lock:
             record = self._get_scan_locked(scan_id)
             if record.state is not ScanState.AWAITING_GUIDANCE:
-                raise ValueError("The scan is not waiting for guidance")
+                raise InvalidScanStateError("The scan is not waiting for guidance")
             if record.cancel_requested:
-                raise ValueError("The scan has been cancelled")
+                raise InvalidScanStateError("The scan has been cancelled")
             record.pending_observations += 1
             secret_values = (
                 record.pending_execution.secret_values()
@@ -342,13 +436,15 @@ class ScanManager:
         with self._lock:
             record = self._get_scan_locked(scan_id)
             if record.state is not ScanState.AWAITING_GUIDANCE:
-                raise ValueError("The scan is not waiting for guidance")
+                raise InvalidScanStateError("The scan is not waiting for guidance")
             if record.pending_execution is None:
-                raise ValueError("The scan no longer has runtime guidance input")
+                raise InvalidScanStateError(
+                    "The scan no longer has runtime guidance input"
+                )
             if record.cancel_requested:
-                raise ValueError("The scan has been cancelled")
+                raise InvalidScanStateError("The scan has been cancelled")
             if any(self._is_active(other) for other in self._records.values()):
-                raise ValueError("Another scan is already running")
+                raise ScanBusyError("Another scan is already running")
 
             pending_execution = record.pending_execution
             execution_data = pending_execution.model_dump()
@@ -363,22 +459,28 @@ class ScanManager:
             execution = ScanExecutionInput.model_validate(execution_data)
             pending_execution.discard_runtime_secrets()
             record.pending_execution = None
-            record.state = ScanState.RUNNING
-            record.error = None
-            self._persist_state(record)
+            record.worker_generation += 1
+            worker_generation = record.worker_generation
+            self._transition(record, ScanState.RUNNING, error=None, error_code=None)
             try:
                 record.future = self._executor.submit(
                     self._run_guided_scan,
                     record,
                     execution,
                     guidance,
+                    worker_generation,
                 )
             except BaseException:
                 execution.discard_runtime_secrets()
-                record.state = ScanState.FAILED
-                record.error = "The guided scan worker could not be started"
-                self._persist_state(record)
-                raise
+                self._transition(
+                    record,
+                    ScanState.FAILED,
+                    error="The guided scan worker could not be started",
+                    error_code="scan_worker_unavailable",
+                )
+                raise ScanWorkerUnavailableError(
+                    "The guided scan worker could not be started"
+                ) from None
             return record
 
     def list_scans(self) -> list[ScanRecord]:
@@ -423,12 +525,20 @@ class ScanManager:
 
     def reanalyse(self, scan_id: UUID) -> list[CheckResult]:
         record = self.get_scan(scan_id)
-        if record.state in {ScanState.RUNNING, ScanState.AWAITING_GUIDANCE}:
-            raise ValueError("Wait for scan execution to finish before reanalysis")
+        if record.state in {
+            ScanState.CREATED,
+            ScanState.RUNNING,
+            ScanState.AWAITING_GUIDANCE,
+        }:
+            raise InvalidScanStateError(
+                "Wait for scan execution to finish before reanalysis"
+            )
         if record.profile is None or not record.evidence:
-            raise ValueError("The scan has no completed evidence to reanalyse")
+            raise EvidenceNotAvailableError(
+                "The scan has no completed evidence to reanalyse"
+            )
         if any(evidence.check_id not in ANALYSERS for evidence in record.evidence):
-            raise ValueError(
+            raise EvidenceNotAvailableError(
                 "No offline analyser is available for some stored evidence"
             )
         results = [
@@ -444,30 +554,32 @@ class ScanManager:
         return results
 
     def report_path(self, scan_id: UUID, extension: str) -> Path:
+        self.get_scan(scan_id)
         if extension not in {"json", "html"}:
-            raise ValueError("Only JSON and HTML reports are available")
+            raise InvalidReportFormatError("Only JSON and HTML reports are available")
         path = self._store.scan_directory(scan_id) / f"report.{extension}"
         if not path.exists():
-            raise FileNotFoundError(f"No {extension} report exists for this scan")
+            raise ReportNotAvailableError(f"No {extension} report exists for this scan")
         return path
 
     def _run_scan(
         self,
         record: ScanRecord,
         execution: ScanExecutionInput,
+        worker_generation: int,
     ) -> None:
         try:
             asyncio.run(
                 self._run_registered(
                     record,
-                    self._run_scan_async(record, execution),
+                    self._run_scan_async(record, execution, worker_generation),
                     execution.secret_values(),
                 )
             )
         except asyncio.CancelledError:
-            self._finalize_cancelled(record)
+            self._finalize_cancelled(record, worker_generation)
         except Exception as error:
-            self._finalize_failed(record, error)
+            self._finalize_failed(record, error, worker_generation)
         finally:
             if record.pending_execution is not execution:
                 execution.discard_runtime_secrets()
@@ -477,32 +589,49 @@ class ScanManager:
         record: ScanRecord,
         execution: ScanExecutionInput,
         guidance: GuidanceSubmission,
+        worker_generation: int,
     ) -> None:
         try:
             asyncio.run(
                 self._run_registered(
                     record,
-                    self._run_guided_scan_async(record, execution, guidance),
+                    self._run_guided_scan_async(
+                        record, execution, guidance, worker_generation
+                    ),
                     execution.secret_values(),
                 )
             )
         except asyncio.CancelledError:
-            self._finalize_cancelled(record)
+            self._finalize_cancelled(record, worker_generation)
         except ValueError as error:
             with self._lock:
-                record.state = (
+                if not self._worker_is_current(record, worker_generation):
+                    return
+                next_state = (
                     ScanState.CANCELLED
                     if record.cancel_requested
                     else ScanState.AWAITING_GUIDANCE
                 )
-                if record.state is ScanState.AWAITING_GUIDANCE:
+                if next_state is ScanState.AWAITING_GUIDANCE:
                     record.pending_execution = execution
                 else:
                     self._discard_pending_execution(record)
-                record.error = execution.redact_text(str(error))
-            self._persist_state(record)
+                self._transition(
+                    record,
+                    next_state,
+                    error=(
+                        "Scan execution cancelled"
+                        if next_state is ScanState.CANCELLED
+                        else execution.redact_text(str(error))
+                    ),
+                    error_code=(
+                        "scan_cancelled"
+                        if next_state is ScanState.CANCELLED
+                        else "guidance_required"
+                    ),
+                )
         except Exception as error:
-            self._finalize_failed(record, error)
+            self._finalize_failed(record, error, worker_generation)
         finally:
             if record.pending_execution is not execution:
                 execution.discard_runtime_secrets()
@@ -530,7 +659,11 @@ class ScanManager:
         self,
         record: ScanRecord,
         execution: ScanExecutionInput,
+        worker_generation: int | None = None,
     ) -> None:
+        with self._lock:
+            if not self._worker_is_current(record, worker_generation):
+                return
         record.cancellation.checkpoint()
 
         runtime_secrets = RuntimeSecrets(execution.runtime_secrets)
@@ -562,7 +695,9 @@ class ScanManager:
                     )
             except (LoginFormDiscoveryError, ValueError) as error:
                 with self._lock:
-                    record.state = (
+                    if not self._worker_is_current(record, worker_generation):
+                        return
+                    next_state = (
                         ScanState.CANCELLED
                         if record.cancel_requested
                         else ScanState.AWAITING_GUIDANCE
@@ -572,15 +707,31 @@ class ScanManager:
                         if saved_profile is not None
                         else str(error)
                     )
-                    record.error = runtime_secrets.redact_text(unsafe_error)
+                    safe_error = runtime_secrets.redact_text(unsafe_error)
                     record.pending_execution = (
-                        execution
-                        if record.state is ScanState.AWAITING_GUIDANCE
-                        else None
+                        execution if next_state is ScanState.AWAITING_GUIDANCE else None
                     )
-                self._persist_state(record)
+                    self._transition(
+                        record,
+                        next_state,
+                        error=(
+                            "Scan execution cancelled"
+                            if next_state is ScanState.CANCELLED
+                            else safe_error
+                        ),
+                        error_code=(
+                            "scan_cancelled"
+                            if next_state is ScanState.CANCELLED
+                            else "guidance_required"
+                        ),
+                    )
                 return
-            await self._complete_profile_execution(record, execution, profile_execution)
+            await self._complete_profile_execution(
+                record,
+                execution,
+                profile_execution,
+                worker_generation,
+            )
         finally:
             runtime_secrets.discard_all()
 
@@ -589,7 +740,11 @@ class ScanManager:
         record: ScanRecord,
         execution: ScanExecutionInput,
         guidance: GuidanceSubmission,
+        worker_generation: int | None = None,
     ) -> None:
+        with self._lock:
+            if not self._worker_is_current(record, worker_generation):
+                return
         runtime_secrets = RuntimeSecrets(execution.runtime_secrets)
         try:
             profile_execution = await execute_guided_verified_login_flow(
@@ -601,7 +756,12 @@ class ScanManager:
                 account_marker_selector=execution.account_marker_selector,
                 account_marker_description=execution.account_marker_description,
             )
-            await self._complete_profile_execution(record, execution, profile_execution)
+            await self._complete_profile_execution(
+                record,
+                execution,
+                profile_execution,
+                worker_generation,
+            )
             self._discard_pending_execution(record)
         finally:
             runtime_secrets.discard_all()
@@ -611,7 +771,11 @@ class ScanManager:
         record: ScanRecord,
         execution: ScanExecutionInput,
         profile_execution: VerifiedLoginExecution,
+        worker_generation: int | None = None,
     ) -> None:
+        with self._lock:
+            if not self._worker_is_current(record, worker_generation):
+                return
         safe_profile = AuthProfile.model_validate(
             redact_persisted_data(profile_execution.profile.model_dump(mode="json"))
         )
@@ -744,10 +908,23 @@ class ScanManager:
             record.active_check = None
             self._persist_state(record)
         with self._lock:
-            record.state = (
+            if not self._worker_is_current(record, worker_generation):
+                return
+            next_state = (
                 ScanState.CANCELLED if record.cancel_requested else ScanState.COMPLETED
             )
-            self._persist_state(record)
+            self._transition(
+                record,
+                next_state,
+                error=(
+                    "Scan execution cancelled"
+                    if next_state is ScanState.CANCELLED
+                    else None
+                ),
+                error_code=(
+                    "scan_cancelled" if next_state is ScanState.CANCELLED else None
+                ),
+            )
         self._export_reports(record)
 
     def _save_events(
@@ -785,7 +962,39 @@ class ScanManager:
         try:
             return self._records[scan_id]
         except KeyError as error:
-            raise KeyError(f"Unknown scan '{scan_id}'") from error
+            if scan_id in self._recovery_errors:
+                raise ScanRecoveryError(
+                    "The persisted scan could not be recovered safely"
+                ) from error
+            raise ScanNotFoundError(f"Scan '{scan_id}' was not found") from error
+
+    def _transition(
+        self,
+        record: ScanRecord,
+        next_state: ScanState,
+        *,
+        error: str | None | object = _UNCHANGED,
+        error_code: str | None | object = _UNCHANGED,
+    ) -> None:
+        """Apply and persist one validated lifecycle transition."""
+
+        current_state = record.state
+        if next_state not in ALLOWED_SCAN_TRANSITIONS[current_state]:
+            raise RuntimeError(
+                f"Invalid internal scan transition: {current_state} -> {next_state}"
+            )
+        now = datetime.now(UTC)
+        record.state = next_state
+        record.state_changed_at = now
+        if next_state is ScanState.RUNNING and record.started_at is None:
+            record.started_at = now
+        if next_state in TERMINAL_SCAN_STATES:
+            record.finished_at = now
+        if error is not _UNCHANGED:
+            record.error = error if isinstance(error, str) else None
+        if error_code is not _UNCHANGED:
+            record.error_code = error_code if isinstance(error_code, str) else None
+        self._persist_state(record)
 
     @staticmethod
     def _discard_pending_execution(record: ScanRecord) -> None:
@@ -801,18 +1010,37 @@ class ScanManager:
             or record.pending_observations > 0
         )
 
-    def _finalize_cancelled(self, record: ScanRecord) -> None:
+    @staticmethod
+    def _worker_is_current(
+        record: ScanRecord,
+        worker_generation: int | None,
+    ) -> bool:
+        return worker_generation is None or (
+            worker_generation == record.worker_generation
+            and record.state is ScanState.RUNNING
+        )
+
+    def _finalize_cancelled(
+        self,
+        record: ScanRecord,
+        worker_generation: int | None = None,
+    ) -> None:
         """Publish cancellation only after the registered worker has unwound."""
 
         with self._lock:
-            if record.state in {ScanState.COMPLETED, ScanState.FAILED}:
+            if not self._worker_is_current(record, worker_generation):
+                return
+            if record.state in TERMINAL_SCAN_STATES:
                 return
             self._preserve_interrupted_check(record)
-            record.state = ScanState.CANCELLED
-            record.error = "Scan execution cancelled"
             self._discard_pending_execution(record)
             record.active_check = None
-            self._persist_state(record)
+            self._transition(
+                record,
+                ScanState.CANCELLED,
+                error="Scan execution cancelled",
+                error_code="scan_cancelled",
+            )
         self._export_reports(record)
 
     def _preserve_interrupted_check(self, record: ScanRecord) -> None:
@@ -851,18 +1079,34 @@ class ScanManager:
         record.evidence.append(evidence)
         self._store.save_evidence(evidence)
 
-    def _finalize_failed(self, record: ScanRecord, error: BaseException) -> None:
+    def _finalize_failed(
+        self,
+        record: ScanRecord,
+        error: BaseException,
+        worker_generation: int | None = None,
+    ) -> None:
         with self._lock:
+            if not self._worker_is_current(record, worker_generation):
+                return
+            if record.state in TERMINAL_SCAN_STATES:
+                return
             if record.cancel_requested:
                 self._preserve_interrupted_check(record)
-                record.state = ScanState.CANCELLED
-                record.error = "Scan execution cancelled"
-            elif record.state is not ScanState.CANCELLED:
-                record.state = ScanState.FAILED
-                record.error = type(error).__name__
+                next_state = ScanState.CANCELLED
+                public_error = "Scan execution cancelled"
+                error_code = "scan_cancelled"
+            else:
+                next_state = ScanState.FAILED
+                public_error = "Scan execution failed"
+                error_code = "scan_execution_failed"
             self._discard_pending_execution(record)
             record.active_check = None
-            self._persist_state(record)
+            self._transition(
+                record,
+                next_state,
+                error=public_error,
+                error_code=error_code,
+            )
         self._export_reports(record)
 
     def _export_reports(self, record: ScanRecord) -> None:
@@ -876,7 +1120,16 @@ class ScanManager:
             {
                 "state": record.state.value,
                 "error": record.error,
+                "error_code": record.error_code,
                 "cancel_requested": record.cancel_requested,
+                "state_changed_at": record.state_changed_at.isoformat(),
+                "started_at": (
+                    record.started_at.isoformat() if record.started_at else None
+                ),
+                "finished_at": (
+                    record.finished_at.isoformat() if record.finished_at else None
+                ),
+                "worker_generation": record.worker_generation,
                 "execution_progress": {
                     "active_check": (
                         record.active_check.value if record.active_check else None
@@ -903,7 +1156,12 @@ class ScanManager:
                 request_data.pop("created_at", None)
                 request_data.pop("state", None)
                 request_data.pop("error", None)
+                request_data.pop("error_code", None)
                 request_data.pop("cancel_requested", None)
+                request_data.pop("state_changed_at", None)
+                request_data.pop("started_at", None)
+                request_data.pop("finished_at", None)
+                request_data.pop("worker_generation", None)
                 progress = request_data.pop("execution_progress", None)
                 request = ScanRequest.model_validate(request_data)
                 created_at_value = metadata.get("created_at")
@@ -924,9 +1182,17 @@ class ScanManager:
                     )
                 state = ScanState(str(raw_state))
                 error = metadata.get("error")
+                error_code = metadata.get("error_code")
+                interrupted_state = state
                 if state in {ScanState.RUNNING, ScanState.AWAITING_GUIDANCE}:
-                    state = ScanState.FAILED
-                    error = "Backend restarted during scan execution"
+                    if metadata.get("cancel_requested"):
+                        state = ScanState.CANCELLED
+                        error = "Scan execution cancelled during backend restart"
+                        error_code = "scan_cancelled"
+                    else:
+                        state = ScanState.FAILED
+                        error = "Backend restarted during scan execution"
+                        error_code = "backend_restarted"
                 results = []
                 for raw_result in self._store.read_results(scan_id):
                     result_data = dict(raw_result)
@@ -942,6 +1208,15 @@ class ScanManager:
                     results=_latest_results(results),
                     profile=self._store.read_profile(scan_id),
                     error=str(error) if error is not None else None,
+                    error_code=(str(error_code) if error_code is not None else None),
+                    state_changed_at=self._read_datetime(
+                        metadata.get("state_changed_at"), created_at
+                    ),
+                    started_at=self._read_optional_datetime(metadata.get("started_at")),
+                    finished_at=self._read_optional_datetime(
+                        metadata.get("finished_at")
+                    ),
+                    worker_generation=int(metadata.get("worker_generation", 0)),
                     completed_checks=[
                         CheckId(value)
                         for value in (
@@ -953,26 +1228,68 @@ class ScanManager:
                 )
                 if metadata.get("cancel_requested"):
                     record.cancellation.request()
+                if interrupted_state in {
+                    ScanState.RUNNING,
+                    ScanState.AWAITING_GUIDANCE,
+                }:
+                    now = datetime.now(UTC)
+                    record.state_changed_at = now
+                    record.finished_at = now
                 self._records[scan_id] = record
                 if state is ScanState.FAILED and metadata.get("state") in {
                     ScanState.RUNNING.value,
                     ScanState.AWAITING_GUIDANCE.value,
                 }:
                     self._persist_state(record)
+                elif state is ScanState.CANCELLED and interrupted_state in {
+                    ScanState.RUNNING,
+                    ScanState.AWAITING_GUIDANCE,
+                }:
+                    self._persist_state(record)
             except (OSError, TypeError, ValueError):
-                continue
+                self._recovery_errors[scan_id] = (
+                    "The persisted scan metadata or artifacts are invalid"
+                )
+
+    @staticmethod
+    def _read_optional_datetime(value: Any) -> datetime | None:
+        if value is None:
+            return None
+        return datetime.fromisoformat(str(value))
+
+    @classmethod
+    def _read_datetime(cls, value: Any, fallback: datetime) -> datetime:
+        return cls._read_optional_datetime(value) or fallback
 
     def snapshot(self, record: ScanRecord) -> dict[str, Any]:
+        scan_directory = self._store.scan_directory(record.scan_id)
         return {
             "scan_id": str(record.scan_id),
             "created_at": record.created_at.isoformat(),
             "state": record.state.value,
+            "state_changed_at": record.state_changed_at.isoformat(),
+            "started_at": record.started_at.isoformat() if record.started_at else None,
+            "finished_at": (
+                record.finished_at.isoformat() if record.finished_at else None
+            ),
+            "worker_generation": record.worker_generation,
             "cancel_requested": record.cancel_requested,
             "target_url": str(record.request.target.target_url),
             "event_count": len(record.events),
             "evidence_count": len(record.evidence),
             "result_count": len(record.results),
+            "partial_results_available": bool(record.evidence or record.results),
+            "reanalysis_available": (
+                record.state in TERMINAL_SCAN_STATES
+                and record.profile is not None
+                and bool(record.evidence)
+            ),
+            "report_available": (
+                (scan_directory / "report.json").exists()
+                and (scan_directory / "report.html").exists()
+            ),
             "error": record.error,
+            "error_code": record.error_code,
             "profile_source": (
                 record.profile.discovery_history[-1].source.value
                 if record.profile and record.profile.discovery_history
