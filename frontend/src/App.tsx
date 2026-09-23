@@ -33,9 +33,16 @@ type ScanStatus = {
   result_count: number;
   results: ScanResult[];
   error?: string | null;
+  error_code?: string | null;
   profile_source?: "automatic" | "guided" | null;
   guidance_required?: boolean;
   cancel_requested?: boolean;
+  state_changed_at?: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  partial_results_available?: boolean;
+  reanalysis_available?: boolean;
+  report_available?: boolean;
 };
 
 type SafeControl = {

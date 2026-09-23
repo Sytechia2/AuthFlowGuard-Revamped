@@ -3,17 +3,19 @@
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from authflowguard.models import ScanRequest
 from authflowguard.scan_manager import (
+    GuidanceObservationError,
     GuidanceObservationRequest,
     GuidanceSubmission,
     ScanExecutionInput,
     ScanManager,
+    ScanManagerError,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -48,19 +50,29 @@ def create_app(
             }
             for item in error.errors()
         ]
-        return JSONResponse(status_code=422, content={"detail": detail})
+        return JSONResponse(
+            status_code=422,
+            content={"code": "invalid_request", "detail": detail},
+        )
+
+    @application.exception_handler(ScanManagerError)
+    async def scan_manager_error(
+        _request: Request,
+        error: ScanManagerError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=error.status_code,
+            content={"code": error.code, "detail": error.detail},
+        )
 
     @application.get("/api/health", tags=["system"])
     async def read_health() -> dict[str, str]:
         return {"status": "ok"}
 
     @application.post("/api/scans", status_code=201)
-    async def create_scan(request: ScanRequest) -> dict[str, str]:
+    async def create_scan(request: ScanRequest) -> dict[str, object]:
         record = scan_manager.create_scan(request)
-        return {
-            "scan_id": str(record.scan_id),
-            "state": record.state.value,
-        }
+        return scan_manager.snapshot(record)
 
     @application.get("/api/scans")
     async def list_scans() -> list[dict[str, object]]:
@@ -71,26 +83,17 @@ def create_app(
         scan_id: UUID,
         execution: ScanExecutionInput,
     ) -> dict[str, object]:
-        try:
-            record = scan_manager.start_scan(scan_id, execution)
-        except (KeyError, ValueError) as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
+        record = scan_manager.start_scan(scan_id, execution)
         return scan_manager.snapshot(record)
 
     @application.get("/api/scans/{scan_id}")
     async def read_scan(scan_id: UUID) -> dict[str, object]:
-        try:
-            record = scan_manager.get_scan(scan_id)
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
+        record = scan_manager.get_scan(scan_id)
         return scan_manager.snapshot(record)
 
     @application.get("/api/scans/{scan_id}/events")
     async def read_scan_events(scan_id: UUID) -> list[dict[str, object]]:
-        try:
-            record = scan_manager.get_scan(scan_id)
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
+        record = scan_manager.get_scan(scan_id)
         return [event.model_dump(mode="json") for event in record.events]
 
     @application.post("/api/scans/{scan_id}/guidance/observe")
@@ -103,39 +106,29 @@ def create_app(
                 scan_id,
                 request.url if request else None,
             )
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
-        except (ValueError, RuntimeError) as error:
-            detail = str(error) or f"{type(error).__name__}: browser observation failed"
-            raise HTTPException(status_code=409, detail=detail) from error
+        except ScanManagerError:
+            raise
+        except (ValueError, RuntimeError):
+            raise GuidanceObservationError(
+                "The target page could not be observed safely"
+            ) from None
 
     @application.post("/api/scans/{scan_id}/guidance")
     async def submit_guidance(
         scan_id: UUID,
         guidance: GuidanceSubmission,
     ) -> dict[str, object]:
-        try:
-            record = scan_manager.submit_guidance(scan_id, guidance)
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
-        except ValueError as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
+        record = scan_manager.submit_guidance(scan_id, guidance)
         return scan_manager.snapshot(record)
 
     @application.post("/api/scans/{scan_id}/cancel")
     async def cancel_scan(scan_id: UUID) -> dict[str, object]:
-        try:
-            record = scan_manager.cancel_scan(scan_id)
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
+        record = scan_manager.cancel_scan(scan_id)
         return scan_manager.snapshot(record)
 
     @application.post("/api/scans/{scan_id}/reanalyse")
     async def reanalyse_scan(scan_id: UUID) -> dict[str, object]:
-        try:
-            results = scan_manager.reanalyse(scan_id)
-        except (KeyError, ValueError, FileNotFoundError) as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
+        results = scan_manager.reanalyse(scan_id)
         return {
             "scan_id": str(scan_id),
             "results": [result.model_dump(mode="json") for result in results],
@@ -143,12 +136,7 @@ def create_app(
 
     @application.get("/api/scans/{scan_id}/report/{extension}")
     async def download_report(scan_id: UUID, extension: str) -> FileResponse:
-        try:
-            path = scan_manager.report_path(scan_id, extension)
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
-        except (ValueError, FileNotFoundError) as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
+        path = scan_manager.report_path(scan_id, extension)
         media_type = "application/json" if extension == "json" else "text/html"
         return FileResponse(path, media_type=media_type)
 
