@@ -505,3 +505,46 @@ data only:
 All state is held in memory, so restarting the process resets it — there is no
 separate reset command. This application binds to `127.0.0.1` by default and
 must not be deployed as a production service.
+
+## 16. Bedrock Web Integration & Offline Evaluation (Task 2.6 / INT-011)
+
+Task 2.6 connects Bedrock browser discovery directly to web scans initiated from
+the React interface or FastAPI backend.
+
+### Running Bedrock Integration Tests
+
+The integration test suite (`test_bedrock_web_integration.py`) tests the complete
+end-to-end pipeline offline using `DeterministicModelDouble`:
+
+```powershell
+.\.venv\Scripts\python -m pytest backend/tests/test_bedrock.py backend/tests/test_bedrock_web_integration.py
+```
+
+Scenarios covered:
+1. Full API scan using Bedrock discovery against Application A, check runner execution, evidence capture, results, and report download.
+2. Multi-page navigation discovery (navigating link on landing page to login) with `step_control_signatures` and fresh-context replay.
+3. Form disambiguation on Application C (search form vs login form).
+4. Dual-context proof rejection halting the scan when an account marker is visible anonymously.
+5. Replay control signature validation rejecting tampered controls with `StaleAuthProfileError`.
+6. Durable accounting persistence surviving restart and halting immediately on ledger store write failure before model dispatch.
+7. Secret redaction verifying that raw passwords/secrets never appear in model observations or events.
+8. Synchronous validation failure returning clean error responses when Bedrock is unconfigured without hanging.
+9. Scan persistence reload verifying that `cost-ledger.ndjson`, exploration metrics, and provenance records survive restarts.
+
+### Running Scans with AI Discovery in the Interface
+
+1. In the **Setup** view, under **Discovery engine**, **Bedrock AI agent** is selected by default. Select **Deterministic rules** explicitly for the offline baseline.
+2. The capability banner reports local backend configuration; it does not verify live AWS access or quota.
+3. Expand **Bounded execution limits** to configure:
+   - Maximum model decisions (default: 40; server cap: 100)
+   - Maximum exploration seconds (default: 900s; server cap: 1800s)
+   - Maximum inference budget (default: $0.25; server cap: $1.00)
+4. For live Bedrock calls against AWS, ensure you have an active AWS session:
+   ```powershell
+   aws login --profile authflowguard-dev --region us-east-1
+   ```
+5. In automated tests and offline development, tests inject `DeterministicModelDouble` to simulate Bedrock responses without incurring AWS costs or requiring credentials.
+
+Offline integration tests exercise the API, controller, proof, and selected checks. A real frontend-to-AWS scan has not been validated in this review; model access, quota, and live discovery reliability remain unverified.
+
+`discovery_reliability.py --discovery-mode bedrock` uses an offline model double by default. `--confirm-live-calls` explicitly permits AWS calls. `--max-evaluation-cost-usd` is shared across all attempts in that evaluation; observed usage and unresolved reservations both reduce the remaining allowance.

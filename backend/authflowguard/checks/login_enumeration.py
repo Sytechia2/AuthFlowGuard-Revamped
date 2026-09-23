@@ -95,7 +95,12 @@ def _fill_references(
     if username_reference is None:
         if not fill_references:
             raise ValueError("The saved login flow has no username fill action")
-        username_reference = fill_references[0]
+        user_matches = [
+            r
+            for r in fill_references
+            if "user" in r.lower() or "login" in r.lower() or "email" in r.lower()
+        ]
+        username_reference = user_matches[0] if user_matches else fill_references[0]
     if password_reference is None:
         remaining = [
             reference
@@ -104,7 +109,8 @@ def _fill_references(
         ]
         if not remaining:
             raise ValueError("The saved login flow has no password fill action")
-        password_reference = remaining[0]
+        pass_matches = [r for r in remaining if "pass" in r.lower()]
+        password_reference = pass_matches[0] if pass_matches else remaining[0]
     return username_reference, password_reference
 
 

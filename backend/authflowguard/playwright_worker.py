@@ -44,6 +44,8 @@ class SafeControlDescription(TypedDict):
     placeholder: str | None
     autocomplete: str | None
     aria_label: str | None
+    text: str | None
+    role: str | None
     value_present: bool | None
     visible: bool
 
@@ -190,6 +192,13 @@ class PlaywrightWorker:
                 "submit",
             }:
                 value_present = bool(await control.input_value())
+            text: str | None = None
+            if tag in {"button", "a"} or control_type in {"button", "submit"}:
+                try:
+                    raw_text = await control.inner_text(timeout=500)
+                    text = " ".join(raw_text.split())[:60] if raw_text else None
+                except Exception:
+                    text = None
             controls.append(
                 {
                     "observed_control_id": f"control-{index + 1}",
@@ -200,6 +209,8 @@ class PlaywrightWorker:
                     "placeholder": await control.get_attribute("placeholder"),
                     "autocomplete": await control.get_attribute("autocomplete"),
                     "aria_label": await control.get_attribute("aria-label"),
+                    "text": text,
+                    "role": await control.get_attribute("role"),
                     "value_present": value_present,
                     "visible": await control.is_visible(),
                 }

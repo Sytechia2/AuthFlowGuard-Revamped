@@ -172,34 +172,64 @@ account lockout.
 
 ## 4. Where does the AI fit?
 
-**Scans started from the web interface do not currently use Bedrock.** Their
-login discovery uses the rules described in Step 2.
+**Scans started from the web interface can use Bedrock AI discovery or deterministic rules (Task 2.6 / INT-011).**
 
-The project also has an AI browser agent that can be started from the terminal.
-That agent sends a filtered description of the page to AWS Bedrock. The model
-chooses an action, such as filling a field or clicking a button. Local code
-validates the action and uses Playwright to carry it out.
+When AI discovery is enabled in Setup, ScanManager delegates authentication
+discovery to the `AutomaticBrowserController`. That controller interacts with
+Playwright to observe page controls and requests actions from AWS Bedrock
+(or an offline `DeterministicModelDouble` during tests).
 
 ```mermaid
 flowchart TD
-    Start["Start the AI agent from the terminal"] --> Read["Read the current page"]
-    Read --> Model["Ask Bedrock to choose the next action"]
-    Model --> Execute["Validate the action and perform it in Chromium"]
-    Execute --> Done{"Account marker visible?"}
-    Done -->|"No, and limits allow another attempt"| Read
-    Done -->|"Yes"| Finish["Print the result in the terminal"]
+    Setup["Setup: choose Bedrock discovery and bounds"] --> API["Create and start scan via FastAPI"]
+    API --> Manager["ScanManager: orchestrate execution"]
+    Manager --> Observe["Observe allowed page controls with positional IDs"]
+    Observe --> Reserve["Persist cost reservation to cost-ledger.ndjson"]
+    Reserve --> Model["Bedrock / Model Double chooses structured action"]
+    Model --> Reconcile["Record exactly-once reconciliation in ledger"]
+    Reconcile --> Execute["Validate action and perform in Chromium"]
+    Execute --> Goal{"Protected marker visible?"}
+    Goal -->|No, within bounds| Observe
+    Goal -->|Yes| Proof["Dual-context proof: authenticated vs isolated anonymous"]
+    Proof --> Profile["Save verified AuthProfile with step control signatures"]
+    Profile --> Checks["Run selected security checks CHK-001–CHK-006"]
+    Checks --> Report["Save evidence, results, and offline reports"]
 ```
 
-The agent has retry, time, action-count, and cost limits. It can stop before
-reaching the account page if those limits are reached or it needs guidance.
+### Key architectural boundaries and guarantees:
 
-This terminal command currently stops when its account marker is visible. It
-does not perform the full signed-in and signed-out comparison, run the six
-checks, or save a complete scan through ScanManager.
+1. **Strict Security Boundary:**
+   The React frontend communicates exclusively through FastAPI. React never calls
+   AWS APIs directly and never receives or handles AWS credentials. AWS Bedrock
+   configuration is validated synchronously by the backend prior to starting scans.
 
-Connecting the AI agent to scans started from the interface remains future
-work. The security analysers themselves use programmed rules to assess evidence;
-they do not ask the AI to decide whether a vulnerability exists.
+2. **Durable Cost Accounting:**
+   Integrated with `CostLedger` and `CostLedgerStore`:
+   - A price-book reservation is durably appended to `cost-ledger.ndjson` before
+     each model dispatch.
+   - If writing the reservation fails (e.g. disk write failure), execution halts
+     immediately before calling AWS.
+   - Model calls use a unique `request_id` for exactly-once reconciliation.
+   - Reconciliations are recorded upon successful response or upon model error
+     (`BedrockResponseError`), ensuring all consumed tokens are permanently accounted for.
+   - Unreconciled reservations survive restart and are restored from the ledger.
+
+3. **Multi-Page Replay and Control Signatures:**
+   AI exploration can navigate through intermediary pages (e.g. landing page to login).
+   Every step captures a non-secret `step_control_signatures` dictionary. Replay and
+   revalidation engines validate the targeted control on the live page before executing
+   each action, rejecting tampered or stale elements with `StaleAuthProfileError`.
+
+4. **Independent Dual-Context Authentication Proof:**
+   Reaching an account marker is not accepted on its own. The controller verifies
+   marker visibility in a dedicated authenticated context and tests the same resource
+   in an isolated anonymous context. If the marker is visible anonymously, the proof
+   is rejected.
+
+5. **Deterministic Security Analysis:**
+   The AI agent is used only for authentication discovery and navigation. The security
+   analysers themselves (CHK-001 through CHK-006) remain 100% deterministic rule-based
+   engines that process structured offline evidence packages.
 
 ## 5. Where is the scan data stored?
 
@@ -208,8 +238,9 @@ Each scan has its own folder. There is currently no database server.
 
 | Saved file or folder | Contents |
 | --- | --- |
-| metadata.json | Scan settings, current state, and any recorded scan error |
-| auth-profile.json | Login steps and the observations used to verify login |
+| metadata.json | Scan settings, current state, exploration metrics, and any scan error |
+| auth-profile.json | Login steps, step signatures, and dual-context proof references |
+| cost-ledger.ndjson | Append-only durable reservations and reconciliations |
 | events.ndjson | Recorded browser activity and observations |
 | checks/ | Evidence collected for each check |
 | results/ | Saved conclusions, including results from later reanalysis |
@@ -228,7 +259,7 @@ These details matter when reading the diagram or assigning the remaining work:
 
 | Area | Current position |
 | --- | --- |
-| AI integration | The Bedrock agent works from the terminal; connecting it to web scans remains unfinished |
+| AI integration | Offline web login integration is implemented and under review (Task 2.6 / INT-011); live UI-to-Bedrock validation remains outstanding. Broader AI discovery of registration/reset flows remains future work |
 | Background execution | Scan jobs run in one background thread within the backend program. Moving them into a separate worker process is planned |
 | Cancellation | The backend has cancellation handling, but stopping every active browser operation still needs work |
 | Credential handling | Credentials are supplied through temporary in-memory objects. Complete cleanup on every exit path and checks for leaks in exports remain open work |
@@ -248,6 +279,9 @@ login procedure.
 | --- | --- |
 | [app.py](../backend/authflowguard/app.py) | The endpoints used to create, start, view, cancel, and reanalyse scans |
 | [scan_manager.py](../backend/authflowguard/scan_manager.py) | The order of work: login, selected checks, saved evidence, results, and reports |
+| [automatic_actions.py](../backend/authflowguard/automatic_actions.py) | AI exploration loop, step signatures, retry policy, and durable cost accounting |
+| [model_double.py](../backend/authflowguard/evaluation/model_double.py) | Offline deterministic model double for automated testing without AWS calls |
+| [cost_tracking.py](../backend/authflowguard/evaluation/cost_tracking.py) | Durable cost ledger and store for reservations and reconciliations |
 | [authentication.py](../backend/authflowguard/authentication.py) | Finding login fields, executing login steps, asking for guidance, and comparing account access |
 | [auth_profiles.py](../backend/authflowguard/auth_profiles.py) | The conditions that must hold before a login profile is accepted |
 | [action_executor.py](../backend/authflowguard/action_executor.py) | How a browser action is validated and performed |
@@ -258,11 +292,14 @@ login procedure.
 | [secrets.py](../backend/authflowguard/secrets.py) | Looking up supplied credentials by reference and clearing their stored copy |
 | [evidence.py](../backend/authflowguard/evidence.py) | Saving and loading evidence, profiles, and results |
 | [reports.py](../backend/authflowguard/reports.py) | Creating the JSON and HTML reports |
-| [agent_cli.py](../backend/authflowguard/agent_cli.py) | Starting the separate AI browser agent |
-| [automatic_actions.py](../backend/authflowguard/automatic_actions.py) | Repeating the AI agent's page-reading, action-selection, and execution steps |
+| [agent_cli.py](../backend/authflowguard/agent_cli.py) | Starting the separate AI browser agent from the terminal |
 | [bedrock.py](../backend/authflowguard/bedrock.py) | Preparing model requests, validating responses, and checking estimated cost |
 
 The `authflowguard.evaluation_targets` package contains the three bundled test
 applications: controlled_app.py, react_json_app.py, and site_app.py. They run as
 separate websites and give AuthFlowGuard something to
 test; they are not parts of the scan manager.
+
+## Bedrock web integration validation (23 September 2026)
+
+Frontend scans route through FastAPI, ScanManager, the browser controller, dual-context authentication proof, and the existing check pipeline. This is offline integration status; a live UI-to-Bedrock scan remains unverified.

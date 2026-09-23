@@ -300,6 +300,8 @@ def test_guidance_api_observes_safe_controls_and_accepts_structured_flow(
         "placeholder": None,
         "autocomplete": "username",
         "aria_label": None,
+        "text": None,
+        "role": None,
         "value_present": False,
         "visible": True,
     }

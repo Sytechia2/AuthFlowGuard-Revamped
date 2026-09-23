@@ -37,7 +37,15 @@ def adapt_login_steps(
     adapted: list[BrowserAction] = []
     for step in steps:
         if step.action_type is BrowserActionType.FILL:
-            reference = username_reference if fill_index == 0 else password_reference
+            val_ref = (step.value_reference or "").lower()
+            if "user" in val_ref or "login" in val_ref or "email" in val_ref:
+                reference = username_reference
+            elif "pass" in val_ref:
+                reference = password_reference
+            else:
+                reference = (
+                    username_reference if fill_index == 0 else password_reference
+                )
             adapted.append(step.model_copy(update={"value_reference": reference}))
             fill_index += 1
         else:

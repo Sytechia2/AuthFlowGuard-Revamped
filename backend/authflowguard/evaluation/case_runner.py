@@ -14,7 +14,7 @@ import asyncio
 import json
 import socket
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -31,6 +31,7 @@ from fastapi.testclient import TestClient
 from pydantic import BaseModel, ConfigDict
 
 from authflowguard.app import create_app
+from authflowguard.automatic_actions import ActionSelectionClient
 from authflowguard.evaluation_targets.controlled_app import (
     EvaluationMode,
     create_controlled_app,
@@ -193,14 +194,27 @@ def execution_input_for(setup: CaseSetup, origin: str) -> ScanExecutionInput:
     )
 
 
-def scan_request_for(case: FormalCase, setup: CaseSetup, origin: str) -> ScanRequest:
+def scan_request_for(
+    case: FormalCase,
+    setup: CaseSetup,
+    origin: str,
+    discovery_mode: str = "rules",
+    reuse_saved_profile: bool | None = None,
+    limits: dict[str, Any] | None = None,
+) -> ScanRequest:
+    if reuse_saved_profile is None:
+        reuse_saved_profile = discovery_mode == "rules"
     payload: dict[str, Any] = {
         "target": {
             "target_url": rebase_url(setup.target_url, origin),
             "permitted_origins": [origin],
         },
         "selected_checks": [case.check_id.value],
+        "discovery_mode": discovery_mode,
+        "reuse_saved_profile": reuse_saved_profile,
     }
+    if limits:
+        payload["limits"] = limits
     if case.security_policy:
         payload["policy"] = case.security_policy
     return ScanRequest.model_validate(payload)
@@ -330,6 +344,11 @@ def run_live_case(
     case: FormalCase,
     origin: str,
     data_root: Path,
+    discovery_mode: str = "rules",
+    reuse_saved_profile: bool | None = None,
+    confirm_live_calls: bool = False,
+    max_cost_usd: float = 1.0,
+    action_client_factory: Callable[[], ActionSelectionClient] | None = None,
 ) -> CaseResult:
     """Run one case through the real scan API against a running fixture."""
 
@@ -348,13 +367,39 @@ def run_live_case(
         result.detail = "The case has no setup block, so it cannot be run live."
         return result
 
-    application = create_app(data_root=data_root)
+    if (
+        discovery_mode == "bedrock"
+        and not confirm_live_calls
+        and action_client_factory is None
+    ):
+        from authflowguard.evaluation.model_double import DeterministicModelDouble
+
+        def _make_double() -> ActionSelectionClient:
+            return DeterministicModelDouble()
+
+        action_client_factory = _make_double
+
+    application = create_app(
+        data_root=data_root, action_client_factory=action_client_factory
+    )
     manager = application.state.scan_manager
     client = TestClient(application)
 
+    limits = (
+        {"maximum_inference_cost_usd": max_cost_usd}
+        if discovery_mode == "bedrock"
+        else None
+    )
     created = client.post(
         "/api/scans",
-        json=scan_request_for(case, case.setup, origin).model_dump(mode="json"),
+        json=scan_request_for(
+            case,
+            case.setup,
+            origin,
+            discovery_mode=discovery_mode,
+            reuse_saved_profile=reuse_saved_profile,
+            limits=limits,
+        ).model_dump(mode="json"),
     )
     if created.status_code != 201:
         result.detail = f"Scan creation failed: {created.status_code} {created.text}"
@@ -446,6 +491,11 @@ def fixture_for(application: str, fixture_mode: str) -> FastAPI:
 def run_live_group(
     cases: list[FormalCase],
     data_root: Path,
+    discovery_mode: str = "rules",
+    reuse_saved_profile: bool | None = None,
+    confirm_live_calls: bool = False,
+    max_cost_usd: float = 1.0,
+    action_client_factory: Callable[[], ActionSelectionClient] | None = None,
 ) -> list[CaseResult]:
     """Run each live case against its own freshly started fixture.
 
@@ -461,7 +511,18 @@ def run_live_group(
         case_root = data_root / case.case_id
         case_root.mkdir(parents=True, exist_ok=True)
         with serve(fixture_for(case.application, case.fixture_mode)) as origin:
-            results.append(run_live_case(case, origin, case_root))
+            results.append(
+                run_live_case(
+                    case,
+                    origin,
+                    case_root,
+                    discovery_mode=discovery_mode,
+                    reuse_saved_profile=reuse_saved_profile,
+                    confirm_live_calls=confirm_live_calls,
+                    max_cost_usd=max_cost_usd,
+                    action_client_factory=action_client_factory,
+                )
+            )
     return results
 
 
@@ -790,15 +851,26 @@ def run_fault_case(case: FormalCase, data_root: Path) -> CaseResult:
     return result
 
 
-def write_results(results: list[CaseResult], run_directory: Path, run_id: str) -> Path:
+def write_results(
+    results: list[CaseResult],
+    run_directory: Path,
+    run_id: str,
+    discovery_mode: str = "rules",
+) -> Path:
     """Write one run's results beside, never into, the authored case file."""
 
     run_directory.mkdir(parents=True, exist_ok=True)
-    destination = run_directory / "results.json"
+    filename = (
+        "results.json"
+        if discovery_mode == "rules"
+        else f"results-bedrock-{run_id}.json"
+    )
+    destination = run_directory / filename
     destination.write_text(
         json.dumps(
             {
                 "run_id": run_id,
+                "discovery_mode": discovery_mode,
                 "generated_at": datetime.now(UTC).isoformat(),
                 "case_file": "evaluation/cases/formal_cases.json",
                 "results": [result.as_dict() for result in results],
@@ -835,7 +907,37 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Reuse a previous run's scan data instead of re-running live cases.",
     )
+    parser.add_argument(
+        "--discovery-mode",
+        choices=["rules", "bedrock"],
+        default="rules",
+        help="Discovery mode for live scans ('rules' or 'bedrock').",
+    )
+    parser.add_argument(
+        "--confirm-live-calls",
+        action="store_true",
+        default=False,
+        help="Allow live Bedrock API calls. Defaults to false (offline double).",
+    )
+    parser.add_argument(
+        "--max-evaluation-cost-usd",
+        type=float,
+        default=1.0,
+        help="Maximum budget limit for Bedrock inference.",
+    )
+    parser.add_argument(
+        "--no-reuse-saved-profile",
+        action="store_true",
+        default=False,
+        help="Disable reusing saved auth profile to force fresh exploration.",
+    )
     arguments = parser.parse_args(argv)
+
+    reuse_saved_profile = (
+        False
+        if arguments.no_reuse_saved_profile
+        else (arguments.discovery_mode == "rules")
+    )
 
     wanted = {name.strip() for name in str(arguments.application).split(",")}
     selected = [
@@ -867,7 +969,14 @@ def main(argv: list[str] | None = None) -> int:
         for fixture_mode in ("secure", "vulnerable"):
             group = [case for case in live if case.fixture_mode == fixture_mode]
             print(f"Live, {fixture_mode} ({len(group)} cases)...", flush=True)
-            for result in run_live_group(group, scan_data_root):
+            for result in run_live_group(
+                group,
+                scan_data_root,
+                discovery_mode=arguments.discovery_mode,
+                reuse_saved_profile=reuse_saved_profile,
+                confirm_live_calls=arguments.confirm_live_calls,
+                max_cost_usd=arguments.max_evaluation_cost_usd,
+            ):
                 report(result)
 
     offline = [
@@ -882,7 +991,12 @@ def main(argv: list[str] | None = None) -> int:
     for case in faults:
         report(run_fault_case(case, run_directory / "fault-scan-data"))
 
-    destination = write_results(results, run_directory, arguments.run_id)
+    destination = write_results(
+        results,
+        run_directory,
+        arguments.run_id,
+        discovery_mode=arguments.discovery_mode,
+    )
     print(f"\nSummary: {summarise(results)}")
     print(f"Results written to {destination}")
     return 0
