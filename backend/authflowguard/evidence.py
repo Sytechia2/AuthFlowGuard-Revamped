@@ -34,6 +34,21 @@ _SENSITIVE_KEY_NAMES = {
 }
 
 _event_sink: ContextVar[Any] = ContextVar("authflowguard_event_sink", default=None)
+_transient_secret_values: ContextVar[tuple[str, ...]] = ContextVar(
+    "authflowguard_transient_secret_values", default=()
+)
+
+
+@contextmanager
+def transient_secret_redaction(secret_values: Iterable[str]) -> Iterator[None]:
+    """Redact one execution's secrets without retaining them after it exits."""
+
+    values = tuple(value for value in secret_values if value)
+    token = _transient_secret_values.set(values)
+    try:
+        yield
+    finally:
+        _transient_secret_values.reset(token)
 
 
 @contextmanager
@@ -61,7 +76,11 @@ def _redact_value(
     key: str | None = None,
 ) -> Any:
     key_name = key.lower().replace("_", "-") if key else ""
-    if key_name in _SENSITIVE_KEY_NAMES:
+    sensitive_key = key_name in _SENSITIVE_KEY_NAMES or any(
+        marker in key_name
+        for marker in ("authorization", "cookie", "password", "secret", "token")
+    )
+    if sensitive_key:
         return "[redacted]"
     if isinstance(value, Mapping):
         return {
@@ -79,7 +98,14 @@ def _redact_value(
     for secret in secret_values:
         if secret:
             redacted = redacted.replace(secret, "[redacted]")
-    if key_name == "url":
+    url_like_key = (
+        key_name == "url"
+        or key_name.endswith("-url")
+        or key_name == "resource"
+        or key_name.endswith("-origin")
+        or key_name.endswith("-origins")
+    )
+    if url_like_key:
         return url_without_query_or_fragment(redacted)
     return redacted
 
@@ -90,7 +116,8 @@ def redact_persisted_data(
 ) -> Any:
     """Redact live secrets and unsafe URL data before writing local evidence."""
 
-    return _redact_value(value, tuple(secret_values))
+    active_values = _transient_secret_values.get()
+    return _redact_value(value, (*tuple(secret_values), *active_values))
 
 
 class EvidenceStore:
@@ -119,7 +146,7 @@ class EvidenceStore:
                 "scan_id": str(scan_id),
                 **metadata_data,
             }
-            self._write_json(metadata_path, metadata_data)
+            self._write_json(metadata_path, redact_persisted_data(metadata_data))
         return scan_dir
 
     def scan_directory(self, scan_id: UUID) -> Path:

@@ -5,7 +5,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from authflowguard import models
-from authflowguard.evidence import EvidenceStore
+from authflowguard.evidence import EvidenceStore, transient_secret_redaction
 from authflowguard.models import (
     CheckId,
     CheckOutcome,
@@ -72,6 +72,46 @@ def test_evidence_store_redacts_events_and_survives_reopen(tmp_path: Path) -> No
     assert "query-secret" not in raw_events
     assert "?token=" not in raw_events
     assert events[0].redacted_details["password"] == "[redacted]"
+
+
+def test_transient_scan_redaction_covers_metadata_and_nested_events(
+    tmp_path: Path,
+) -> None:
+    scan_id = uuid4()
+    canary = "credential-canary-2-2"
+    store = EvidenceStore(tmp_path)
+
+    with transient_secret_redaction([canary]):
+        store.create_scan(
+            scan_id,
+            {
+                "target": {
+                    "target_url": f"https://app.example/login?token={canary}",
+                    "permitted_origins": [
+                        f"https://app.example?origin-secret={canary}"
+                    ],
+                },
+                "description": f"Echoed {canary}",
+            },
+        )
+        store.append_event(
+            EvidenceEvent(
+                event_id=uuid4(),
+                scan_id=scan_id,
+                kind=EvidenceKind.PAGE_STATE,
+                summary=f"Echoed {canary}",
+                redacted_details={"nested": {"label": canary}},
+            )
+        )
+
+    persisted = "".join(
+        path.read_text(encoding="utf-8")
+        for path in (tmp_path / str(scan_id)).rglob("*")
+        if path.is_file()
+    )
+    assert canary not in persisted
+    assert "?token=" not in persisted
+    assert "?origin-secret=" not in persisted
 
 
 def test_evidence_and_results_are_saved_with_versioned_result_files(

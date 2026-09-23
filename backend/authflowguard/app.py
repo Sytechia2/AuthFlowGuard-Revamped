@@ -3,8 +3,9 @@
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from authflowguard.models import ScanRequest
@@ -30,6 +31,24 @@ def create_app(
     )
     scan_manager = ScanManager(data_root or DEFAULT_DATA_ROOT)
     application.state.scan_manager = scan_manager
+
+    @application.exception_handler(RequestValidationError)
+    async def safe_validation_error(
+        _request: Request,
+        error: RequestValidationError,
+    ) -> JSONResponse:
+        """Describe invalid fields without echoing submitted credential values."""
+
+        detail = [
+            {
+                "type": str(item.get("type", "validation_error")),
+                # Deeper locations can contain user-controlled mapping keys.
+                "loc": [str(next(iter(item.get("loc", ())), "request"))],
+                "msg": "Request validation failed",
+            }
+            for item in error.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": detail})
 
     @application.get("/api/health", tags=["system"])
     async def read_health() -> dict[str, str]:
