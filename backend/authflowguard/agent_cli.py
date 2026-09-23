@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+from pathlib import Path
 from urllib.parse import urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from botocore.exceptions import BotoCoreError, ClientError
 from playwright.async_api import BrowserContext, Page, async_playwright
@@ -26,6 +27,7 @@ from authflowguard.bedrock import (
 from authflowguard.cancellation import close_resources
 from authflowguard.models import EvidenceKind, ExecutionLimits, TargetScope
 from authflowguard.secrets import RuntimeSecrets
+from authflowguard.usage_ledger import DurableUsageLedger
 
 DEFAULT_USERNAME_REFERENCE = "login-username"
 DEFAULT_PASSWORD_REFERENCE = "login-password"
@@ -48,6 +50,17 @@ def read_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--maximum-action-retries", type=int, default=2)
     parser.add_argument("--maximum-active-seconds", type=int, default=900)
     parser.add_argument("--maximum-cost-usd", type=float, default=0.25)
+    parser.add_argument(
+        "--run-id",
+        type=UUID,
+        help="Stable run identity used to resume the same durable cost budget.",
+    )
+    parser.add_argument(
+        "--usage-root",
+        type=Path,
+        default=Path(".authflowguard-cli"),
+        help="Directory for durable per-run usage ledgers.",
+    )
     parser.add_argument(
         "--headed",
         action="store_true",
@@ -114,6 +127,12 @@ async def run_live_session(
             DEFAULT_PASSWORD_REFERENCE: password,
         }
     )
+    run_id = arguments.run_id or uuid4()
+    usage_ledger = DurableUsageLedger(
+        arguments.usage_root / str(run_id) / "usage.ndjson",
+        run_id,
+        arguments.maximum_cost_usd,
+    )
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=not arguments.headed)
@@ -132,8 +151,11 @@ async def run_live_session(
                 page=page,
                 target=target,
                 runtime_secrets=runtime_secrets,
-                scan_id=uuid4(),
-                action_client=BedrockActionClient(configuration),
+                scan_id=run_id,
+                action_client=BedrockActionClient(
+                    configuration,
+                    usage_accountant=usage_ledger,
+                ),
                 limits=limits,
                 credential_references=[
                     DEFAULT_USERNAME_REFERENCE,

@@ -8,7 +8,7 @@ import time
 from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from authflowguard.app import create_app
@@ -36,7 +36,7 @@ from test_authentication import guided_login_actions, run_controlled_server
 
 
 def _unresponsive_worker(
-    command_data: dict[str, Any], output: Any, _cancel_event: Any
+    command_data: dict[str, Any], output: Any, _control: Any, _cancel_event: Any
 ) -> None:
     command = WorkerCommand.model_validate(command_data)
     output.put(
@@ -234,6 +234,74 @@ def test_manager_shutdown_reaps_its_active_worker(tmp_path: Path) -> None:
     assert not handle.process.is_alive()
     assert record.worker_active is False
     assert record.state is ScanState.CANCELLED
+
+
+def test_parent_durably_acknowledges_worker_usage_transitions(tmp_path: Path) -> None:
+    manager = ScanManager(tmp_path, worker_backend="thread")
+    record = manager.create_scan(_request())
+    record.worker_generation = 1
+    record.worker_active = True
+    manager._transition(record, ScanState.RUNNING)
+    correlation_id = uuid4()
+    attempt_id = uuid4()
+
+    def message(message_type: WorkerMessageType, **updates: Any) -> WorkerMessage:
+        return WorkerMessage(
+            correlation_id=correlation_id,
+            scan_id=record.scan_id,
+            worker_generation=1,
+            sequence=1,
+            message_type=message_type,
+            attempt_id=attempt_id,
+            **updates,
+        )
+
+    reservation = manager._apply_process_result(
+        record,
+        1,
+        message(
+            WorkerMessageType.USAGE_RESERVE,
+            model_id="amazon.nova-micro-v1:0",
+            region="us-east-1",
+            reserved_cost_usd=0.01,
+            input_price_usd_per_1000_tokens=0.000035,
+            output_price_usd_per_1000_tokens=0.00014,
+        ),
+        None,
+        False,
+    )
+    assert reservation is not None and reservation.accepted
+    dispatched = manager._apply_process_result(
+        record,
+        1,
+        message(WorkerMessageType.USAGE_DISPATCHED),
+        None,
+        False,
+    )
+    assert dispatched is not None and dispatched.accepted
+    settlement = manager._apply_process_result(
+        record,
+        1,
+        message(
+            WorkerMessageType.USAGE_SETTLE,
+            input_tokens=100,
+            output_tokens=20,
+            actual_cost_usd=0.001,
+        ),
+        None,
+        False,
+    )
+    assert settlement is not None and settlement.accepted
+
+    restored = ScanManager(tmp_path, worker_backend="thread")
+    try:
+        usage = restored.snapshot(restored.get_scan(record.scan_id))["usage"]
+        assert usage["input_tokens"] == 100
+        assert usage["settled_cost_usd"] == "0.00100000"
+        assert usage["outstanding_reserved_cost_usd"] == "0.00000000"
+    finally:
+        manager.shutdown()
+        restored.shutdown()
 
 
 def test_complete_scan_runs_and_persists_outside_api_process(tmp_path: Path) -> None:

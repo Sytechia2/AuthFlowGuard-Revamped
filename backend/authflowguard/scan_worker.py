@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from authflowguard.authentication import observe_guidance_page
 from authflowguard.evidence import redact_persisted_data, transient_secret_redaction
@@ -16,12 +17,97 @@ from authflowguard.scan_manager import (
     ScanRecord,
     ScanState,
 )
+from authflowguard.usage_ledger import UsageBudgetExceeded, UsageLedgerError
 from authflowguard.worker_protocol import (
+    WorkerAcknowledgement,
     WorkerCommand,
     WorkerMessage,
     WorkerMessageType,
     WorkerOperation,
 )
+
+
+class _ParentUsageAccountant:
+    """Synchronously obtain a durable parent acknowledgement for each transition."""
+
+    def __init__(self, manager: _ArtifactWorkerManager, control: Any) -> None:
+        self._manager = manager
+        self._control = control
+
+    def reserve(
+        self,
+        *,
+        attempt_id: UUID,
+        model_id: str,
+        region: str,
+        reserved_cost_usd: float,
+        input_price_usd_per_1000_tokens: float,
+        output_price_usd_per_1000_tokens: float,
+    ) -> None:
+        self._exchange(
+            WorkerMessageType.USAGE_RESERVE,
+            attempt_id,
+            model_id=model_id,
+            region=region,
+            reserved_cost_usd=reserved_cost_usd,
+            input_price_usd_per_1000_tokens=input_price_usd_per_1000_tokens,
+            output_price_usd_per_1000_tokens=output_price_usd_per_1000_tokens,
+        )
+
+    def mark_dispatched(self, attempt_id: UUID) -> None:
+        self._exchange(WorkerMessageType.USAGE_DISPATCHED, attempt_id)
+
+    def settle(
+        self,
+        attempt_id: UUID,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        actual_cost_usd: float,
+    ) -> None:
+        self._exchange(
+            WorkerMessageType.USAGE_SETTLE,
+            attempt_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            actual_cost_usd=actual_cost_usd,
+        )
+
+    def release(self, attempt_id: UUID, safe_reason: str) -> None:
+        self._exchange(
+            WorkerMessageType.USAGE_RELEASE,
+            attempt_id,
+            safe_reason=safe_reason,
+        )
+
+    def _exchange(
+        self, message_type: WorkerMessageType, attempt_id: UUID, **updates: Any
+    ) -> None:
+        command = self._manager._worker_command
+        self._manager._worker_output.put(
+            _message(
+                command,
+                self._manager.next_sequence(),
+                message_type,
+                attempt_id=attempt_id,
+                **updates,
+            ),
+            block=True,
+            timeout=5,
+        )
+        acknowledgement = WorkerAcknowledgement.model_validate(
+            self._control.get(block=True, timeout=10)
+        )
+        if (
+            acknowledgement.correlation_id != command.correlation_id
+            or acknowledgement.attempt_id != attempt_id
+            or acknowledgement.message_type is not message_type
+        ):
+            raise UsageLedgerError("Invalid usage acknowledgement")
+        if not acknowledgement.accepted:
+            if acknowledgement.error_code == "usage_budget_exceeded":
+                raise UsageBudgetExceeded("The scan usage budget was exhausted")
+            raise UsageLedgerError("The usage transition was not persisted")
 
 
 class _ArtifactWorkerManager(ScanManager):
@@ -38,6 +124,7 @@ class _ArtifactWorkerManager(ScanManager):
         self._worker_command = command
         self._worker_output = output
         self._worker_sequence = 1
+        self.usage_accountant: _ParentUsageAccountant | None = None
         super().__init__(data_root, worker_backend="inline")
 
     def _load_persisted_scans(self) -> None:
@@ -111,6 +198,7 @@ async def _execute_scan_command(
     command: WorkerCommand,
     cancel_event: Any,
     output: Any,
+    control: Any,
 ) -> WorkerMessage:
     if command.execution is None:
         raise ValueError("A scan worker command requires execution input")
@@ -128,6 +216,9 @@ async def _execute_scan_command(
         worker_generation=command.worker_generation,
     )
     manager._records[record.scan_id] = record
+    # The broker is retained by the worker manager for future scan-owned
+    # Bedrock clients; current web scans do not create model calls.
+    manager.usage_accountant = _ParentUsageAccountant(manager, control)
     try:
         try:
             if command.operation is WorkerOperation.SCAN:
@@ -263,6 +354,7 @@ async def _execute_observation_command(
 def execute_worker_command(
     command_data: dict[str, Any],
     output: Any,
+    control: Any,
     cancel_event: Any,
 ) -> None:
     """Validate one command, execute it, and publish one terminal message."""
@@ -277,7 +369,9 @@ def execute_worker_command(
         if command.operation is WorkerOperation.OBSERVE_GUIDANCE:
             message = asyncio.run(_execute_observation_command(command, cancel_event))
         else:
-            message = asyncio.run(_execute_scan_command(command, cancel_event, output))
+            message = asyncio.run(
+                _execute_scan_command(command, cancel_event, output, control)
+            )
     except BaseException:
         message = WorkerMessage(
             correlation_id=command.correlation_id,

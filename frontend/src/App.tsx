@@ -23,6 +23,17 @@ type ScanResult = {
   explanation: string;
 };
 
+type UsageSummary = {
+  input_tokens?: number;
+  output_tokens?: number;
+  settled_cost_usd?: string;
+  outstanding_reserved_cost_usd?: string;
+  limit_usd?: string;
+  uncertain_requests?: number;
+  estimator_violations?: number;
+  accounting_error?: boolean;
+};
+
 type ScanStatus = {
   scan_id: string;
   state: string;
@@ -47,6 +58,7 @@ type ScanStatus = {
   worker_generation?: number;
   worker_cleanup?: "graceful" | "forced" | "crashed" | null;
   worker_cleanup_seconds?: number | null;
+  usage?: UsageSummary;
 };
 
 type SafeControl = {
@@ -1256,6 +1268,13 @@ function TestingView({
         <span>{scan?.evidence_count ?? 0} evidence packages</span>
         <span>{scan?.result_count ?? 0} results</span>
         {scan?.profile_source && <span>discovery: {scan.profile_source}</span>}
+        {scan?.usage && !scan.usage.accounting_error && (
+          <span>
+            AI cost: ${scan.usage.settled_cost_usd ?? "0.00000000"}
+            {scan.usage.outstanding_reserved_cost_usd !== "0.00000000" &&
+              ` + $${scan.usage.outstanding_reserved_cost_usd} reserved`}
+          </span>
+        )}
       </div>
       {error && (
         <p className="form-error" role="alert">
@@ -1469,6 +1488,17 @@ function ResultsView({ scanId, onScanIdChange }: ResultsViewProps) {
           <p>
             Authentication profile: {scan.profile_source ?? "not verified yet"}
           </p>
+          {scan.usage && !scan.usage.accounting_error && (
+            <p>
+              AI usage: {scan.usage.input_tokens ?? 0} input /{" "}
+              {scan.usage.output_tokens ?? 0} output tokens; estimated cost ${
+                scan.usage.settled_cost_usd ?? "0.00000000"
+              } of ${scan.usage.limit_usd ?? "unknown"}
+              {(scan.usage.uncertain_requests ?? 0) > 0 &&
+                `; ${scan.usage.uncertain_requests} uncertain request(s) remain reserved`}
+              .
+            </p>
+          )}
           <div className="result-actions">
             <a
               href={`/api/scans/${encodeURIComponent(scan.scan_id)}/report/json`}

@@ -16,15 +16,23 @@ from multiprocessing.queues import Queue
 from typing import Any
 from uuid import UUID
 
-from authflowguard.worker_protocol import WorkerCommand, WorkerMessage
+from authflowguard.worker_protocol import (
+    WorkerAcknowledgement,
+    WorkerCommand,
+    WorkerMessage,
+    WorkerMessageType,
+)
 
-WorkerCallback = Callable[[WorkerMessage | None, int | None, bool], None]
-WorkerEntrypoint = Callable[[dict[str, Any], Any, Any], None]
+WorkerCallback = Callable[
+    [WorkerMessage | None, int | None, bool], WorkerAcknowledgement | None
+]
+WorkerEntrypoint = Callable[[dict[str, Any], Any, Any, Any], None]
 
 
 def _worker_entry(
     command_data: dict[str, Any],
     output: Queue[dict[str, Any]],
+    control: Queue[dict[str, Any]],
     cancel_event: Any,
 ) -> None:
     """Import the heavy worker runtime only inside the spawned process."""
@@ -36,7 +44,7 @@ def _worker_entry(
             pass
     from authflowguard.scan_worker import execute_worker_command
 
-    execute_worker_command(command_data, output, cancel_event)
+    execute_worker_command(command_data, output, control, cancel_event)
 
 
 @dataclass
@@ -44,6 +52,7 @@ class WorkerHandle:
     command: WorkerCommand
     process: BaseProcess
     output: Queue[dict[str, Any]]
+    control: Queue[dict[str, Any]]
     cancel_event: Any
     future: Future[None]
     watcher: threading.Thread
@@ -73,11 +82,12 @@ class WorkerSupervisor:
         callback: WorkerCallback,
     ) -> Future[None]:
         output: Queue[dict[str, Any]] = self._context.Queue(maxsize=32)
+        control: Queue[dict[str, Any]] = self._context.Queue(maxsize=32)
         cancel_event = self._context.Event()
         future: Future[None] = Future()
         process = self._context.Process(
             target=self._entrypoint,
-            args=(command.model_dump(mode="json"), output, cancel_event),
+            args=(command.model_dump(mode="json"), output, control, cancel_event),
             name=f"afg-{command.scan_id}-{command.worker_generation}",
             daemon=False,
         )
@@ -86,6 +96,7 @@ class WorkerSupervisor:
             command=command,
             process=process,
             output=output,
+            control=control,
             cancel_event=cancel_event,
             future=future,
             watcher=threading.current_thread(),
@@ -181,8 +192,22 @@ class WorkerSupervisor:
             last_sequence = message.sequence
             if message.message_type.value == "ready":
                 handle.ready.set()
-            elif message.message_type.value == "progress":
+            elif message.message_type is WorkerMessageType.PROGRESS:
                 callback(message, None, False)
+                continue
+            elif message.message_type in {
+                WorkerMessageType.USAGE_RESERVE,
+                WorkerMessageType.USAGE_DISPATCHED,
+                WorkerMessageType.USAGE_SETTLE,
+                WorkerMessageType.USAGE_RELEASE,
+            }:
+                acknowledgement = callback(message, None, False)
+                if acknowledgement is not None:
+                    handle.control.put(
+                        acknowledgement.model_dump(mode="json"),
+                        block=True,
+                        timeout=5,
+                    )
                 continue
             if message.cleanup_confirmed:
                 handle.cleanup_confirmed = True
@@ -199,6 +224,8 @@ class WorkerSupervisor:
         finally:
             handle.output.close()
             handle.output.join_thread()
+            handle.control.close()
+            handle.control.join_thread()
             if not handle.future.done():
                 handle.future.set_result(None)
 

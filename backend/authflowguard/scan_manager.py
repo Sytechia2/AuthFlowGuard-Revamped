@@ -74,7 +74,13 @@ from authflowguard.models import (
 from authflowguard.reports import export_scan_reports
 from authflowguard.scope import url_without_query_or_fragment
 from authflowguard.secrets import RuntimeSecrets, redact_text
+from authflowguard.usage_ledger import (
+    DurableUsageLedger,
+    UsageBudgetExceeded,
+    UsageLedgerError,
+)
 from authflowguard.worker_protocol import (
+    WorkerAcknowledgement,
     WorkerCommand,
     WorkerMessage,
     WorkerMessageType,
@@ -291,6 +297,7 @@ class ScanManager:
         self._data_root = Path(data_root).resolve()
         self._worker_backend = worker_backend
         self._records: dict[UUID, ScanRecord] = {}
+        self._usage_ledgers: dict[UUID, DurableUsageLedger] = {}
         self._recovery_errors: dict[UUID, str] = {}
         self._lock = RLock()
         self._executor = ThreadPoolExecutor(
@@ -680,11 +687,18 @@ class ScanManager:
         message: WorkerMessage | None,
         exit_code: int | None,
         forced: bool,
-    ) -> None:
+    ) -> WorkerAcknowledgement | None:
         export_report = False
         with self._lock:
             if not self._worker_is_current(record, worker_generation):
-                return
+                return None
+            if message is not None and message.message_type in {
+                WorkerMessageType.USAGE_RESERVE,
+                WorkerMessageType.USAGE_DISPATCHED,
+                WorkerMessageType.USAGE_SETTLE,
+                WorkerMessageType.USAGE_RELEASE,
+            }:
+                return self._apply_usage_transition(record, message)
             if (
                 message is not None
                 and message.message_type is WorkerMessageType.PROGRESS
@@ -696,7 +710,7 @@ class ScanManager:
                     CheckId(value) for value in message.completed_checks
                 ]
                 self._persist_state(record)
-                return
+                return None
             record.worker_active = False
             record.worker_pid = None
             record.worker_correlation_id = None
@@ -798,6 +812,99 @@ class ScanManager:
                 export_report = True
         if export_report:
             self._export_reports(record)
+        return None
+
+    def _apply_usage_transition(
+        self, record: ScanRecord, message: WorkerMessage
+    ) -> WorkerAcknowledgement:
+        accepted = True
+        error_code: str | None = None
+        try:
+            if message.attempt_id is None:
+                raise UsageLedgerError("Missing usage attempt identifier")
+            ledger = self._usage_ledger(record)
+            if message.message_type is WorkerMessageType.USAGE_RESERVE:
+                if None in {
+                    message.model_id,
+                    message.region,
+                    message.reserved_cost_usd,
+                    message.input_price_usd_per_1000_tokens,
+                    message.output_price_usd_per_1000_tokens,
+                }:
+                    raise UsageLedgerError("Incomplete usage reservation")
+                assert message.reserved_cost_usd is not None
+                assert message.input_price_usd_per_1000_tokens is not None
+                assert message.output_price_usd_per_1000_tokens is not None
+                ledger.reserve(
+                    attempt_id=message.attempt_id,
+                    model_id=str(message.model_id),
+                    region=str(message.region),
+                    reserved_cost_usd=float(message.reserved_cost_usd),
+                    input_price_usd_per_1000_tokens=float(
+                        message.input_price_usd_per_1000_tokens
+                    ),
+                    output_price_usd_per_1000_tokens=float(
+                        message.output_price_usd_per_1000_tokens
+                    ),
+                )
+            elif message.message_type is WorkerMessageType.USAGE_DISPATCHED:
+                ledger.mark_dispatched(message.attempt_id)
+            elif message.message_type is WorkerMessageType.USAGE_SETTLE:
+                if None in {
+                    message.input_tokens,
+                    message.output_tokens,
+                    message.actual_cost_usd,
+                }:
+                    raise UsageLedgerError("Incomplete usage settlement")
+                assert message.input_tokens is not None
+                assert message.output_tokens is not None
+                assert message.actual_cost_usd is not None
+                ledger.settle(
+                    message.attempt_id,
+                    input_tokens=int(message.input_tokens),
+                    output_tokens=int(message.output_tokens),
+                    actual_cost_usd=float(message.actual_cost_usd),
+                )
+            else:
+                ledger.release(
+                    message.attempt_id, message.safe_reason or "not_dispatched"
+                )
+            self._persist_state(record)
+        except UsageBudgetExceeded:
+            accepted = False
+            error_code = "usage_budget_exceeded"
+        except (OSError, UsageLedgerError, ValueError, TypeError):
+            accepted = False
+            error_code = "usage_ledger_unavailable"
+        return WorkerAcknowledgement(
+            correlation_id=message.correlation_id,
+            scan_id=message.scan_id,
+            worker_generation=message.worker_generation,
+            attempt_id=message.attempt_id or UUID(int=0),
+            message_type=message.message_type,
+            accepted=accepted,
+            error_code=error_code,
+        )
+
+    def _usage_ledger(self, record: ScanRecord) -> DurableUsageLedger:
+        ledger = self._usage_ledgers.get(record.scan_id)
+        if ledger is None:
+            ledger = DurableUsageLedger(
+                self._store.scan_directory(record.scan_id) / "usage.ndjson",
+                record.scan_id,
+                record.request.limits.maximum_inference_cost_usd,
+            )
+            self._usage_ledgers[record.scan_id] = ledger
+        return ledger
+
+    def _usage_summary(self, record: ScanRecord) -> dict[str, object]:
+        try:
+            return self._usage_ledger(record).summary().as_dict()
+        except (OSError, UsageLedgerError):
+            return {
+                "accounting_error": True,
+                "limit_usd": str(record.request.limits.maximum_inference_cost_usd),
+            }
 
     def _reload_worker_artifacts(self, record: ScanRecord) -> None:
         record.events = self._store.read_events(record.scan_id)
@@ -1473,6 +1580,7 @@ class ScanManager:
                         and check_id not in record.completed_checks
                     ],
                 },
+                "usage": self._usage_summary(record),
             },
         )
 
@@ -1493,6 +1601,7 @@ class ScanManager:
                 request_data.pop("worker_generation", None)
                 request_data.pop("worker_active", None)
                 request_data.pop("worker_cleanup", None)
+                request_data.pop("usage", None)
                 request_data.pop("worker_cleanup_seconds", None)
                 request_data.pop("worker_pid", None)
                 request_data.pop("worker_correlation_id", None)
@@ -1649,6 +1758,7 @@ class ScanManager:
                 else None
             ),
             "guidance_required": record.state is ScanState.AWAITING_GUIDANCE,
+            "usage": self._usage_summary(record),
             "execution_progress": {
                 "active_check": (
                     record.active_check.value if record.active_check else None
