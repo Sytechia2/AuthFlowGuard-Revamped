@@ -131,10 +131,7 @@ nav {
 }
 
 .nav-item {
-  display: grid;
-  grid-template-columns: 2rem minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 0.6rem;
+  display: block;
   width: 100%;
   padding: 0.78rem 0.8rem;
   border: 1px solid transparent;
@@ -143,6 +140,16 @@ nav {
   color: var(--muted);
   text-align: left;
   cursor: pointer;
+}
+
+.nav-item > span {
+  min-width: 0;
+}
+
+.nav-item small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .nav-index {
@@ -344,6 +351,7 @@ h3 {
 }
 
 .target-panel,
+.discovery-engine-panel,
 .checks-panel,
 .status-table-panel,
 .credentials-panel,
@@ -654,6 +662,10 @@ h3 {
 }
 
 .danger-button:hover {
+  border-color: var(--red);
+  background: var(--red-soft);
+}
+
 .button-row {
   display: flex;
   flex-wrap: wrap;

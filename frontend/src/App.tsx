@@ -1,20 +1,12 @@
-import { useEffect, useState } from "react";
-import {
-  ConnectionStatus,
-  DiscoveryView,
-  ResultsView,
-  ScanStatus,
-  SetupView,
-  Sidebar,
-  TestingView,
-  ViewId,
-} from "./components/Workspace";
+import { FormEvent, useEffect, useState } from "react";
 
-const viewHeadings: Record<ViewId, { label: string; description: string }> = {
-  setup: { label: "Setup", description: "Define the target and test scope" },
-  discovery: { label: "Discovery", description: "Verify authentication flows" },
-  testing: { label: "Testing", description: "Run controlled security checks" },
-  results: { label: "Results", description: "Review evidence and coverage" },
+type ViewId = "setup" | "discovery" | "testing" | "results";
+type ConnectionStatus = "checking" | "connected" | "offline";
+
+type WorkflowView = {
+  id: ViewId;
+  label: string;
+  description: string;
 };
 
 type SecurityCheck = {
@@ -151,22 +143,22 @@ const workflowViews: WorkflowView[] = [
   {
     id: "setup",
     label: "Setup",
-    description: "Define the target and test scope",
+    description: "Set target and scope",
   },
   {
     id: "discovery",
     label: "Discovery",
-    description: "Verify authentication flows",
+    description: "Verify login flows",
   },
   {
     id: "testing",
     label: "Testing",
-    description: "Run controlled security checks",
+    description: "Run security checks",
   },
   {
     id: "results",
     label: "Results",
-    description: "Review evidence and coverage",
+    description: "Review evidence",
   },
 ];
 
@@ -208,9 +200,6 @@ function App() {
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("checking");
   const [scanId, setScanId] = useState("");
-  const [selectedChecks, setSelectedChecks] = useState<string[]>([]);
-  const [currentScan, setCurrentScan] = useState<ScanStatus | null>(null);
-  const [scanError, setScanError] = useState<string | null>(null);
 
   useEffect(() => {
     let requestIsActive = true;
@@ -224,7 +213,9 @@ function App() {
           );
         }
       } catch {
-        if (requestIsActive) setConnectionStatus("offline");
+        if (requestIsActive) {
+          setConnectionStatus("offline");
+        }
       }
     }
     void checkBackend();
@@ -233,46 +224,13 @@ function App() {
     };
   }, []);
 
-  useEffect(() => {
-    if (!scanId || activeView !== "testing") return;
-    let requestIsActive = true;
-    async function loadScan() {
-      try {
-        const response = await fetch(
-          `/api/scans/${encodeURIComponent(scanId)}`,
-        );
-        if (!response.ok)
-          throw new Error("The scan status could not be loaded.");
-        if (requestIsActive) {
-          setCurrentScan((await response.json()) as ScanStatus);
-          setScanError(null);
-        }
-      } catch (loadError) {
-        if (requestIsActive) {
-          setScanError(
-            loadError instanceof Error
-              ? loadError.message
-              : "Unable to load scan status.",
-          );
-        }
-      }
-    }
-    void loadScan();
-    const interval = window.setInterval(() => void loadScan(), 1500);
-    return () => {
-      requestIsActive = false;
-      window.clearInterval(interval);
-    };
-  }, [activeView, scanId]);
-
-  const currentView = viewHeadings[activeView];
+  const currentView = workflowViews.find((view) => view.id === activeView)!;
 
   return (
     <div className="app-shell">
       <Sidebar
         activeView={activeView}
         connectionStatus={connectionStatus}
-        scan={currentScan}
         onSelectView={setActiveView}
       />
       <main className="workspace">
@@ -287,10 +245,8 @@ function App() {
 
         {activeView === "setup" && (
           <SetupView
-            onStarted={(startedScanId, checks) => {
+            onStarted={(startedScanId) => {
               setScanId(startedScanId);
-              setSelectedChecks(checks);
-              setCurrentScan(null);
               setActiveView("testing");
             }}
           />
@@ -304,10 +260,6 @@ function App() {
         {activeView === "testing" && (
           <TestingView
             scanId={scanId}
-            scan={currentScan}
-            scanError={scanError}
-            selectedChecks={selectedChecks}
-            onScanChange={setCurrentScan}
             onOpenDiscovery={() => setActiveView("discovery")}
             onOpenResults={() => setActiveView("results")}
           />
@@ -1845,9 +1797,9 @@ function ResultsView({ scanId, onScanIdChange }: ResultsViewProps) {
           {scan.usage && !scan.usage.accounting_error && (
             <p>
               AI usage: {scan.usage.input_tokens ?? 0} input /{" "}
-              {scan.usage.output_tokens ?? 0} output tokens; estimated cost ${
-                scan.usage.settled_cost_usd ?? "0.00000000"
-              } of ${scan.usage.limit_usd ?? "unknown"}
+              {scan.usage.output_tokens ?? 0} output tokens; estimated cost $
+              {scan.usage.settled_cost_usd ?? "0.00000000"} of $
+              {scan.usage.limit_usd ?? "unknown"}
               {(scan.usage.uncertain_requests ?? 0) > 0 &&
                 `; ${scan.usage.uncertain_requests} uncertain request(s) remain reserved`}
               .
