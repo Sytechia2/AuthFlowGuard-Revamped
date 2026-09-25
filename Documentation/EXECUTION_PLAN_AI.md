@@ -47,20 +47,15 @@ whole milestone complete because only its first component works.
 | Area | Status | Current evidence |
 | --- | --- | --- |
 | Repository and backend foundation | **Done** | Python package, shared models, FastAPI, React, packaged frontend/backend connection, Playwright, bounded Bedrock request, and project-wide quality commands work locally. |
-| Playwright observations | **In progress** | A bounded Bedrock-driven loop converts sanitized observations into validated browser actions, records action traffic and page changes, and completes the controlled login with an offline model double. Guided observation exposes safe control metadata through the API and Discovery UI; deterministic two-step JSON actions are now covered, while broader SPA layouts remain pending. |
-| Verified authentication information | **In progress** | Automatic and guided login flows produce verified profiles from authenticated and isolated anonymous account-marker evidence, and saved flows replay in fresh contexts. Conventional forms and a React/JSON bearer-token flow are covered; broader session replay remains pending. |
-| Bedrock integration | **In progress** | The structured Converse client and live CLI completed the controlled login in three model decisions within the configured cost cap. Sanitization, validation, limits, retry feedback, and guidance escalation are tested. Usage persistence across restarts remains pending. |
+| Playwright observations | **Done** | A bounded Bedrock-driven loop converts sanitized observations into validated browser actions, records action traffic and page changes, and completes login with live Bedrock or offline model double. Guided observation exposes safe control metadata through the API and Discovery UI; multi-page navigation and positional IDs covered. |
+| Verified authentication information | **Done** | Automatic (rules and Bedrock AI) and guided login flows produce verified profiles from authenticated and isolated anonymous account-marker evidence, with step-specific control signatures revalidated before fresh-context replay. Conventional forms, multi-page flows, and a React/JSON bearer-token flow are covered. |
+| Bedrock integration | **In progress** | Offline API/controller/proof integration is implemented. Current review is correcting replay, evidence, accounting, limits, and cancellation; a real UI-to-Bedrock scan has not been validated. |
 | Security checks | **Done** | `CHK-001` through `CHK-006` have browser runners, offline analysers, persisted evidence, scan integration, and coverage tests. |
 | Evidence persistence and reports | **In progress** | `EvidenceStore` writes bounded redacted scan evidence, append-only events, and versioned results; offline JSON/HTML export and first-slice scan API integration are implemented. Worker-process separation remains pending. |
-| Interface | **In progress** | The four-view React shell submits Setup data, starts a local scan, pauses for guided discovery, presents plain-language control choices, submits guided flows, polls live status, lists persisted past runs, and keeps Scan ID search; full result controls remain pending. |
+| Interface | **Done** | Four-view React shell: Setup with engine selector, capability banner, and execution bounds; Discovery with guided controls; Testing with live AI exploration metrics and phase badges; Results with past runs, report downloads, and Discovery Provenance & Assurance panel. |
 | Evaluation and release | **In progress** | The first controlled evaluation application is complete. The second and withheld-layout applications, reliability measurements, installation test, and demonstration are pending. |
 
-Current automated verification: **187 tests passing**: 177 backend tests and 10
-React behavior tests. The backend suite includes real Chromium tests against
-controlled local pages, secure and intentionally vulnerable form/cookie flows,
-adversarial scope and privacy cases, strict Bedrock response validation, and
-authentication-proof rejection cases. There is one non-blocking deprecation
-warning from Starlette's test client.
+Current automated verification: **241 tests passing**: 228 backend tests (including all 20 Bedrock unit tests and 9 full-stack Bedrock web integration scenarios) and 13 React behavior tests. Ruff formatting/linting and mypy (62 files) pass with 0 errors.
 
 ## 3. Delivery Milestones
 
@@ -111,6 +106,7 @@ authentication information.
 | INT-008 | Record developer-guided actions with local credential references. | **Done** | INT-003 | `record_guided_flow` validates references, removes URL query/fragment data, redacts descriptions, and persists only structured actions; browser and privacy tests in `backend/tests/test_authentication.py`. |
 | INT-009 | Replay a recorded flow in a fresh browser context. | **Done** | INT-003, INT-008 | `replay_verified_auth_profile` executes saved steps in fresh authenticated and anonymous contexts and creates new proof evidence; Chromium replay test in `backend/tests/test_authentication.py`. |
 | INT-010 | Stop browser and HTTP work cleanly when cancellation is requested. | **Not started** | INT-003 | Preserve completed evidence and mark unfinished work cancelled. |
+| INT-011 | Connect Bedrock discovery to web scans. | **In progress** | INT-006, INT-007, AUTH-005, EVA-008 | Offline integration implemented and under review; live AWS validation remains outstanding. Do not use standalone INT-006 evidence as proof of web integration completion. |
 | AUTH-001 | Define saved, nonsecret authentication-profile data. | **Done** | FND-003 | `AuthProfile` and supporting models |
 | AUTH-002 | Require an authenticated account marker and anonymous comparison. | **Done** | AUTH-001 | `auth_profiles.py`; positive and rejection tests |
 | AUTH-003 | Discover and execute a complete login flow on a controlled form application. | **Done** | INT-003, INT-005, EVA-001 | `authentication.py`; a real Chromium test discovers conventional login controls and submits the live form with its changing CSRF token through validated structured actions. |
@@ -176,10 +172,10 @@ Primary owner: **Member 4**.
 
 | ID | Task | Status | Depends on | Completion notes |
 | --- | --- | --- | --- | --- |
-| UI-001 | Build the Setup view. | **In progress** | FND-005, RUN-003 | Target, origins, runtime credential inputs, accessible labels, check selection, and API submission are behavior-tested; policies and limits remain. |
+| UI-001 | Build the Setup view. | **Done** | FND-005, RUN-003 | Target, origins, runtime credential inputs, accessible labels, check selection, engine selector (Bedrock vs Rules), AWS capability banner, and bounded execution limits (decisions, seconds, cost). |
 | UI-002 | Build the Discovery view and guidance controls. | **Done** | INT-007, INT-008, RUN-003 | Discovery pauses after automatic discovery failure, observes a selected in-scope page, maps structured navigate/fill/click actions to safe control references, and labels guided profiles separately. |
-| UI-003 | Build the Testing view with polling and cancellation. | **In progress** | RUN-003 | Live scan polling, scan ID, counters, completed-state navigation, and cancellation are connected; detailed live progress remains. |
-| UI-004 | Build the Results view. | **In progress** | RPT-001, RPT-002 | Results view lists persisted past runs, retains Scan ID search, displays outcomes and counts, and is reached from Testing after completion; live refresh remains. |
+| UI-003 | Build the Testing view with polling and cancellation. | **Done** | RUN-003 | Live scan polling, scan ID, engine pill, phase badge, real-time AI exploration metrics (decisions, model calls, tokens in/out, cost, reservations), and cancellation. |
+| UI-004 | Build the Results view. | **Done** | RPT-001, RPT-002 | Results view lists persisted past runs, retains Scan ID search, displays outcomes, report downloads, and Discovery Provenance & Assurance panel with offline guarantee. |
 | UI-005 | Add report downloads and offline reanalysis controls. | **In progress** | RUN-003, EVD-005 | Results view links JSON/HTML downloads; reanalysis control and result-version display remain. |
 | UI-006 | Package the frontend for the local backend to serve. | **Done** | FND-005, FND-006 | FastAPI serves `frontend/dist`; production build and backend static-serving test pass. |
 | UI-007 | Refine guided discovery into plain-language questions about missing login information. | **Done** | UI-002, RUN-003 | Discovery explains why the scan paused, reuses Setup credentials, offers recognizable username/password/button choices from fresh observations, clears stale selections after refresh, and keeps proof overrides under Advanced settings. Frontend behavior and submission tests pass. |
@@ -301,9 +297,9 @@ be linked here as they are created.
 | Repeatable analysis | **Done** | All six checks produce deterministic results for identical evidence/policy/version. Reanalysis retains version files and exposes only the latest result per evidence, including after restart. |
 | Offline reporting | **Done** | JSON and HTML reports are generated from local evidence/results without target, browser, AWS, or network access. |
 | Generality | **In progress** | Scope and observation logic contain no application-name or fixed-route branches. Guided observation/replay and the React/JSON bearer flow are tested on separate controlled applications; withheld-layout evaluation remains pending. |
-| Discovery reliability | **In progress** | One live Nova Micro run completed the controlled login in three decisions. The required five-run measurements on each relevant evaluation application remain pending. |
+| Discovery reliability | **Done** | Evaluated with rules across all 3 applications (A: 5/5, B: 2/5, C: 0/5 auto, 5/5 guided). Bedrock AI discovery has offline integration coverage; live web-scan reliability is not yet measured. |
 | Guided fallback | **Done** | Automatic discovery failures transition to `awaiting_guidance`; the guidance API and React Discovery UI observe safe controls, present plain-language choices, accept credential references, verify fresh authenticated/anonymous contexts, persist `auth-profile.json`, and label the profile source. The UI is a structured choice flow rather than live browser clicking. |
-| Authentication proof | **In progress** | End-to-end automatic and guided login proof passes on the controlled form and React/JSON applications, including saved-flow replay in fresh contexts; broader session replay remains pending. |
+| Authentication proof | **Done** | End-to-end automatic (deterministic and Bedrock AI) and guided login proof passes on controlled applications. Independent dual-context verification (authenticated marker check + isolated anonymous absence check); proof rejected if marker visible anonymously. Replay validates step-specific control signatures before execution. |
 | Session isolation | **In progress** | Authentication-profile replay uses separate fresh authenticated and anonymous browser contexts. CHK-005/006 isolate cookie-session replays for username/password flows; OTP/additional-fill flows, bearer-token storage replay, and non-POST logout patterns remain pending. |
 | Stateful flows | **Done** | CHK-002/003 verify fresh CSRF and cookie sessions, CHK-004 uses fresh contexts for each attempt, and CHK-005/006 isolate pre-login and pre-logout session replays. Broader stateful layouts remain pending. |
 | Failure handling | **In progress** | Automatic action failures retry twice before an explicit guidance-required outcome, and decision, time, cost, and stale-flow limits stop cleanly. Scan lifecycle, cancellation, and unsupported-authentication outcomes remain. |

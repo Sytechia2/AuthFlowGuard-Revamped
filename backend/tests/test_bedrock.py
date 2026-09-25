@@ -29,7 +29,7 @@ class FakeBedrockRuntimeClient:
 
 class FakeBotoSession:
     created_with: dict[str, str] = {}
-    client_created_with: dict[str, str] = {}
+    client_created_with: dict[str, Any] = {}
 
     def __init__(self, *, profile_name: str, region_name: str) -> None:
         type(self).created_with = {
@@ -37,10 +37,13 @@ class FakeBotoSession:
             "region_name": region_name,
         }
 
-    def client(self, service_name: str, *, region_name: str) -> object:
+    def client(
+        self, service_name: str, *, region_name: str, config: Any, **kwargs: Any
+    ) -> object:
         type(self).client_created_with = {
             "service_name": service_name,
             "region_name": region_name,
+            "total_max_attempts": config.retries["total_max_attempts"],
         }
         return FakeBedrockRuntimeClient(make_valid_response())
 
@@ -146,6 +149,7 @@ def test_aws_session_and_runtime_client_both_receive_the_region(
     assert FakeBotoSession.client_created_with == {
         "service_name": "bedrock-runtime",
         "region_name": "us-east-1",
+        "total_max_attempts": 1,
     }
 
 

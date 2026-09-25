@@ -17,7 +17,7 @@ from authflowguard.checks.session_fixation import (
     analyse_session_fixation,
     run_session_fixation_check,
 )
-from authflowguard.controlled_app import (
+from authflowguard.evaluation_targets.controlled_app import (
     KNOWN_PASSWORD,
     KNOWN_USERNAME,
     EvaluationMode,

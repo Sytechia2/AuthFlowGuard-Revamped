@@ -29,7 +29,7 @@ from authflowguard.checks.reset_request_enumeration import (
     analyse_reset_request_enumeration,
     run_reset_request_enumeration_check,
 )
-from authflowguard.controlled_app import (
+from authflowguard.evaluation_targets.controlled_app import (
     KNOWN_USERNAME,
     EvaluationMode,
     create_controlled_app,

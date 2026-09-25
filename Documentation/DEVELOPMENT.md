@@ -120,7 +120,7 @@ after the applied quota values are nonzero.
 Run the server-rendered form/cookie fixture in secure mode:
 
 ```powershell
-.\.venv\Scripts\python -m authflowguard.controlled_app --mode secure --port 8001
+.\.venv\Scripts\python -m authflowguard.evaluation_targets.controlled_app --mode secure --port 8001
 ```
 
 Use `--mode vulnerable` on a different port to expose the intentionally weak
@@ -255,7 +255,7 @@ verification code through JSON, receives a bearer token through JSON, and stores
 that token in browser localStorage. Start it separately from the form fixture:
 
 ```powershell
-.\.venv\Scripts\python -m authflowguard.react_json_app --mode secure --port 8003
+.\.venv\Scripts\python -m authflowguard.evaluation_targets.react_json_app --mode secure --port 8003
 ```
 
 Use these Setup values:
@@ -279,7 +279,7 @@ is never included in evidence; only a local-storage fingerprint is retained.
 Use this command for the intentionally vulnerable variant:
 
 ```powershell
-.\.venv\Scripts\python -m authflowguard.react_json_app --mode vulnerable --port 8004
+.\.venv\Scripts\python -m authflowguard.evaluation_targets.react_json_app --mode vulnerable --port 8004
 ```
 
 Then change the Setup target, permitted origin, and protected-resource URL to
@@ -480,3 +480,71 @@ pre-login session and leaves the logged-out session valid. The browser and
 offline tests cover secure and vulnerable outcomes, deterministic reanalysis,
 malformed evidence, execution failures, scan persistence, and report code
 mapping.
+
+## 15. Independent Evaluation Application (Application C)
+
+Run the independently-designed workshop-desk fixture in secure mode:
+
+```powershell
+.\.venv\Scripts\python -m authflowguard.evaluation_targets.site_app --mode secure --port 8005
+```
+
+Use `--mode vulnerable` on a different port to expose the intentionally weak
+comparison behaviours. Unlike the controlled application, this fixture was
+built without reusing its labels, routes, or page layout, to give discovery an
+unfamiliar target. It has a login page at `/desk/entry` and a protected page
+at `/desk/bookings`; it deliberately has no registration or password-reset
+forms, so CHK-002 and CHK-003 are not applicable to it. It targets CHK-001
+(login enumeration), CHK-004 (login throttling), CHK-005 (session fixation),
+and CHK-006 (logout invalidation) instead. Its built-in credentials are test
+data only:
+
+- Member ID: `MBR-40817`
+- Passphrase: `lantern-orchard-47`
+
+All state is held in memory, so restarting the process resets it — there is no
+separate reset command. This application binds to `127.0.0.1` by default and
+must not be deployed as a production service.
+
+## 16. Bedrock Web Integration & Offline Evaluation (Task 2.6 / INT-011)
+
+Task 2.6 connects Bedrock browser discovery directly to web scans initiated from
+the React interface or FastAPI backend.
+
+### Running Bedrock Integration Tests
+
+The integration test suite (`test_bedrock_web_integration.py`) tests the complete
+end-to-end pipeline offline using `DeterministicModelDouble`:
+
+```powershell
+.\.venv\Scripts\python -m pytest backend/tests/test_bedrock.py backend/tests/test_bedrock_web_integration.py
+```
+
+Scenarios covered:
+1. Full API scan using Bedrock discovery against Application A, check runner execution, evidence capture, results, and report download.
+2. Multi-page navigation discovery (navigating link on landing page to login) with `step_control_signatures` and fresh-context replay.
+3. Form disambiguation on Application C (search form vs login form).
+4. Dual-context proof rejection halting the scan when an account marker is visible anonymously.
+5. Replay control signature validation rejecting tampered controls with `StaleAuthProfileError`.
+6. Durable accounting persistence surviving restart and halting immediately on ledger store write failure before model dispatch.
+7. Secret redaction verifying that raw passwords/secrets never appear in model observations or events.
+8. Synchronous validation failure returning clean error responses when Bedrock is unconfigured without hanging.
+9. Scan persistence reload verifying that `cost-ledger.ndjson`, exploration metrics, and provenance records survive restarts.
+
+### Running Scans with AI Discovery in the Interface
+
+1. In the **Setup** view, under **Discovery engine**, **Bedrock AI agent** is selected by default. Select **Deterministic rules** explicitly for the offline baseline.
+2. The capability banner reports local backend configuration; it does not verify live AWS access or quota.
+3. Expand **Bounded execution limits** to configure:
+   - Maximum model decisions (default: 40; server cap: 100)
+   - Maximum exploration seconds (default: 900s; server cap: 1800s)
+   - Maximum inference budget (default: $0.25; server cap: $1.00)
+4. For live Bedrock calls against AWS, ensure you have an active AWS session:
+   ```powershell
+   aws login --profile authflowguard-dev --region us-east-1
+   ```
+5. In automated tests and offline development, tests inject `DeterministicModelDouble` to simulate Bedrock responses without incurring AWS costs or requiring credentials.
+
+Offline integration tests exercise the API, controller, proof, and selected checks. A real frontend-to-AWS scan has not been validated in this review; model access, quota, and live discovery reliability remain unverified.
+
+`discovery_reliability.py --discovery-mode bedrock` uses an offline model double by default. `--confirm-live-calls` explicitly permits AWS calls. `--max-evaluation-cost-usd` is shared across all attempts in that evaluation; observed usage and unresolved reservations both reduce the remaining allowance.

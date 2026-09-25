@@ -1,0 +1,111 @@
+{
+  "attempts": [
+    {
+      "application": "A",
+      "attempt": 1,
+      "detail": "No observable page, title, URL, or control-state difference was found across the three paired comparisons.",
+      "discovery": "automatic",
+      "duration_seconds": 4.79
+    },
+    {
+      "application": "A",
+      "attempt": 2,
+      "detail": "No observable page, title, URL, or control-state difference was found across the three paired comparisons.",
+      "discovery": "automatic",
+      "duration_seconds": 4.8
+    },
+    {
+      "application": "A",
+      "attempt": 3,
+      "detail": "No observable page, title, URL, or control-state difference was found across the three paired comparisons.",
+      "discovery": "automatic",
+      "duration_seconds": 4.77
+    },
+    {
+      "application": "A",
+      "attempt": 4,
+      "detail": "No observable page, title, URL, or control-state difference was found across the three paired comparisons.",
+      "discovery": "automatic",
+      "duration_seconds": 4.71
+    },
+    {
+      "application": "A",
+      "attempt": 5,
+      "detail": "No observable page, title, URL, or control-state difference was found across the three paired comparisons.",
+      "discovery": "automatic",
+      "duration_seconds": 4.76
+    },
+    {
+      "application": "B",
+      "attempt": 1,
+      "detail": "Guided fallback could not identify a username, password and submit control among 4 observed controls.",
+      "discovery": "failed",
+      "duration_seconds": 4.08
+    },
+    {
+      "application": "B",
+      "attempt": 2,
+      "detail": "The scan finished in state failed with no result for login_enumeration. Scan error: Error",
+      "discovery": "automatic",
+      "duration_seconds": 0.89
+    },
+    {
+      "application": "B",
+      "attempt": 3,
+      "detail": "Guided fallback could not identify a username, password and submit control among 4 observed controls.",
+      "discovery": "failed",
+      "duration_seconds": 4.0
+    },
+    {
+      "application": "B",
+      "attempt": 4,
+      "detail": "One or more login enumeration attempts failed before comparison.",
+      "discovery": "automatic",
+      "duration_seconds": 94.49
+    },
+    {
+      "application": "B",
+      "attempt": 5,
+      "detail": "Guided fallback could not identify a username, password and submit control among 4 observed controls.",
+      "discovery": "failed",
+      "duration_seconds": 3.96
+    },
+    {
+      "application": "C",
+      "attempt": 1,
+      "detail": "Automatic discovery paused; completed through the guided fallback. No observable page, title, URL, or control-state difference was found across the three paired",
+      "discovery": "guided",
+      "duration_seconds": 6.23
+    },
+    {
+      "application": "C",
+      "attempt": 2,
+      "detail": "Automatic discovery paused; completed through the guided fallback. No observable page, title, URL, or control-state difference was found across the three paired",
+      "discovery": "guided",
+      "duration_seconds": 6.27
+    },
+    {
+      "application": "C",
+      "attempt": 3,
+      "detail": "Automatic discovery paused; completed through the guided fallback. No observable page, title, URL, or control-state difference was found across the three paired",
+      "discovery": "guided",
+      "duration_seconds": 6.22
+    },
+    {
+      "application": "C",
+      "attempt": 4,
+      "detail": "Automatic discovery paused; completed through the guided fallback. No observable page, title, URL, or control-state difference was found across the three paired",
+      "discovery": "guided",
+      "duration_seconds": 6.14
+    },
+    {
+      "application": "C",
+      "attempt": 5,
+      "detail": "Automatic discovery paused; completed through the guided fallback. No observable page, title, URL, or control-state difference was found across the three paired",
+      "discovery": "guided",
+      "duration_seconds": 6.12
+    }
+  ],
+  "attempts_per_application": 5,
+  "run_id": "discovery-001"
+}

@@ -60,7 +60,18 @@ def _fill_references(steps: list[BrowserAction]) -> tuple[str, str]:
     ]
     if len(references) < 2:
         raise ValueError("The saved login flow needs username and password fills")
-    return references[0], references[1]
+    user_refs = [
+        r
+        for r in references
+        if "user" in r.lower() or "login" in r.lower() or "email" in r.lower()
+    ]
+    username_ref = user_refs[0] if user_refs else references[0]
+    remaining = [r for r in references if r != username_ref]
+    pass_refs = [r for r in remaining if "pass" in r.lower()]
+    password_ref = (
+        pass_refs[0] if pass_refs else (remaining[0] if remaining else references[1])
+    )
+    return username_ref, password_ref
 
 
 def _adapt_steps(
@@ -71,7 +82,15 @@ def _adapt_steps(
     adapted: list[BrowserAction] = []
     for step in steps:
         if step.action_type is BrowserActionType.FILL:
-            reference = username_reference if fill_index == 0 else password_reference
+            val_ref = (step.value_reference or "").lower()
+            if "user" in val_ref or "login" in val_ref or "email" in val_ref:
+                reference = username_reference
+            elif "pass" in val_ref:
+                reference = password_reference
+            else:
+                reference = (
+                    username_reference if fill_index == 0 else password_reference
+                )
             adapted.append(step.model_copy(update={"value_reference": reference}))
             fill_index += 1
         else:

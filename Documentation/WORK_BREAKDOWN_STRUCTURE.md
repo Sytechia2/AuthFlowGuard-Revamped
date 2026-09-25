@@ -158,9 +158,34 @@ allow a scan to exceed its cost limit.
 - Restore the totals after a restart.
 - Reserve the maximum expected cost before making a model request.
 
+### Task 2.6 — Connect Bedrock discovery to web scans
+
+**Tracker item:** INT-011
+
+**Why this matters:** Users starting scans from the React web interface need to be
+able to select Bedrock AI discovery, monitor real-time exploration progress and
+token spend, obtain a verified authentication profile, and run security checks
+through the existing report pipeline without directly handling AWS credentials.
+
+**What to do:**
+
+- Add discovery mode selection (Bedrock vs Deterministic Rules) to scan setup.
+- Enforce strict separation: React communicates only with FastAPI; credentials
+  never leave backend.
+- Connect Bedrock browser controller to `ScanManager` and execution pipeline.
+- Implement durable cost accounting with persisted reservations, request IDs,
+  and reconciliation using `CostLedger` and `CostLedgerStore`.
+- Implement step-specific control signatures (`step_control_signatures`) for
+  multi-page navigation discovery and pre-action revalidation.
+- Maintain proof verification ensuring anonymous context distinguishes authenticated state.
+- Support deterministic model doubles for offline evaluation and testing.
+
 **Done when:**
 
-- Restart tests confirm that usage totals and cost limits are preserved.
+- Full end-to-end integration tests verify AI discovery, multi-page replay,
+  two-form disambiguation, proof rejection, durable accounting, and scan reload.
+- Frontend build and tests pass with Bedrock engine controls and live metrics.
+- Backend mypy, ruff, and pytest suites pass cleanly.
 
 ## 6. Member 3 — Additional Test Application and Test Cases
 
@@ -181,7 +206,7 @@ of whether AuthFlowGuard can adapt.
 - Include secure and intentionally vulnerable behavior where practical.
 - Document how to start, reset, and use it.
 - Do not show its implementation to the discovery owner before the first
-  recorded test.
+  recorded test. 
 
 **Done when:**
 
@@ -605,3 +630,5 @@ A task is complete only when:
    evidence.
 6. Another member reviews the work.
 7. The Team Lead accepts the evidence and updates the execution tracker.
+
+Task 2.6 / INT-011 remains in progress: offline integration is under review and live UI-to-Bedrock validation is outstanding.

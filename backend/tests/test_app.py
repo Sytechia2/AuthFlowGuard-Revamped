@@ -76,8 +76,31 @@ def test_backend_returns_not_found_when_frontend_has_not_been_built(
     assert response.status_code == 404
 
 
+def test_validation_errors_do_not_echo_submitted_credentials(tmp_path: Path) -> None:
+    canary = "invalid-credential-canary-2-2"
+    client = TestClient(create_app(data_root=tmp_path, worker_backend="thread"))
+
+    response = client.post(
+        f"/api/scans/{uuid4()}/start",
+        json={
+            "runtime_secrets": {canary: [canary]},
+            "username_reference": "username",
+            "password_reference": "password",
+            "nonexistent_identifier_reference": "missing",
+            "failure_password_reference": "failure",
+            "protected_resource": "https://app.example/account",
+            "account_marker_selector": "#marker",
+            "account_marker_description": "Account marker",
+        },
+    )
+
+    assert response.status_code == 422
+    assert canary not in response.text
+    assert response.json()["detail"][0].keys() == {"type", "loc", "msg"}
+
+
 def test_scan_api_creates_reports_status_and_cancellation(tmp_path: Path) -> None:
-    client = TestClient(create_app(data_root=tmp_path))
+    client = TestClient(create_app(data_root=tmp_path, worker_backend="thread"))
     scan_request = {
         "target": {
             "target_url": "https://app.example/login",
@@ -122,7 +145,9 @@ def test_scan_api_creates_reports_status_and_cancellation(tmp_path: Path) -> Non
     assert cannot_start.status_code == 409
     assert "must-not-be-saved" not in (tmp_path / scan_id / "metadata.json").read_text()
 
-    reopened_client = TestClient(create_app(data_root=tmp_path))
+    reopened_client = TestClient(
+        create_app(data_root=tmp_path, worker_backend="thread")
+    )
     persisted = reopened_client.get(f"/api/scans/{scan_id}")
     assert persisted.status_code == 200
     assert persisted.json()["state"] == "cancelled"
@@ -134,7 +159,7 @@ def test_scan_api_creates_reports_status_and_cancellation(tmp_path: Path) -> Non
 def test_automatic_discovery_failure_pauses_for_guidance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    client = TestClient(create_app(data_root=tmp_path))
+    client = TestClient(create_app(data_root=tmp_path, worker_backend="thread"))
     created = client.post(
         "/api/scans",
         json={
@@ -183,7 +208,7 @@ def test_automatic_discovery_failure_pauses_for_guidance(
 def test_new_scan_revalidates_and_reuses_a_matching_saved_profile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    application = create_app(data_root=tmp_path)
+    application = create_app(data_root=tmp_path, worker_backend="thread")
     manager = application.state.scan_manager
     target = TargetScope(
         target_url="https://app.example/login",
@@ -267,7 +292,8 @@ def test_new_scan_revalidates_and_reuses_a_matching_saved_profile(
 def test_guidance_api_observes_safe_controls_and_accepts_structured_flow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    application = create_app(data_root=tmp_path)
+    canary = "guidance-observation-canary-2-2"
+    application = create_app(data_root=tmp_path, worker_backend="thread")
     manager = application.state.scan_manager
     record = manager.create_scan(
         ScanRequest(
@@ -280,7 +306,7 @@ def test_guidance_api_observes_safe_controls_and_accepts_structured_flow(
     )
     record.state = ScanState.AWAITING_GUIDANCE
     record.pending_execution = ScanExecutionInput(
-        runtime_secrets={"username": "developer", "password": "secret"},
+        runtime_secrets={"username": "developer", "password": canary},
         username_reference="username",
         password_reference="password",
         nonexistent_identifier_reference="missing",
@@ -297,9 +323,11 @@ def test_guidance_api_observes_safe_controls_and_accepts_structured_flow(
         "id": "username",
         "name": "username",
         "type": "text",
-        "placeholder": None,
+        "placeholder": f"Echoed {canary}",
         "autocomplete": "username",
         "aria_label": None,
+        "text": None,
+        "role": None,
         "value_present": False,
         "visible": True,
     }
@@ -310,7 +338,7 @@ def test_guidance_api_observes_safe_controls_and_accepts_structured_flow(
         summary="Observed controls",
         redacted_details={
             "url": "https://app.example/login",
-            "title": "Login",
+            "title": f"Login {canary}",
             "controls": [control],
         },
     )
@@ -326,6 +354,12 @@ def test_guidance_api_observes_safe_controls_and_accepts_structured_flow(
     observed = client.post(f"/api/scans/{record.scan_id}/guidance/observe")
     assert observed.status_code == 200
     assert observed.json()["controls"][0]["observed_control_id"] == "control-1"
+    assert canary not in observed.text
+    assert all(
+        canary not in path.read_text(encoding="utf-8")
+        for path in (tmp_path / str(record.scan_id)).rglob("*")
+        if path.is_file()
+    )
 
     submitted = []
     monkeypatch.setattr(

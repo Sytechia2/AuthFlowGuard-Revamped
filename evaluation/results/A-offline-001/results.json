@@ -1,0 +1,91 @@
+{
+  "case_file": "evaluation/cases/formal_cases.json",
+  "generated_at": "2026-09-22T18:29:21.581187+00:00",
+  "results": [
+    {
+      "actual_outcome": "inconclusive",
+      "application": "A",
+      "case_id": "A-CHK-001-ambiguous",
+      "check_id": "login_enumeration",
+      "detail": "Retained two of three comparison pairs. Three complete known-versus-nonexistent comparisons were not recorded.",
+      "duration_seconds": 0.0,
+      "evidence_id": "0823f34e-3e8d-4472-a81a-2af2fd9952b0",
+      "execution_mode": "offline_analysis",
+      "expected_outcome": "inconclusive",
+      "origin_used": null,
+      "scan_id": "b9ce269a-25a4-47c5-8fe8-6134f32e7e3c",
+      "verdict": "pass"
+    },
+    {
+      "actual_outcome": "inconclusive",
+      "application": "A",
+      "case_id": "A-CHK-002-ambiguous",
+      "check_id": "registration_enumeration",
+      "detail": "Removed the nonexistent_identifier_attempt observation. Registration evidence lacks two complete, valid submitted-form observations.",
+      "duration_seconds": 0.0,
+      "evidence_id": "2947a0a6-f6e2-4319-ab1d-69febb436323",
+      "execution_mode": "offline_analysis",
+      "expected_outcome": "inconclusive",
+      "origin_used": null,
+      "scan_id": "69747fa0-5359-45a7-ba22-51ad16afce46",
+      "verdict": "pass"
+    },
+    {
+      "actual_outcome": "inconclusive",
+      "application": "A",
+      "case_id": "A-CHK-003-ambiguous",
+      "check_id": "reset_request_enumeration",
+      "detail": "Removed the known_identifier_attempt observation. Reset-request evidence lacks two complete, valid submitted-form observations.",
+      "duration_seconds": 0.0,
+      "evidence_id": "2114e8fb-cdc3-4b50-abfd-f20303c863d0",
+      "execution_mode": "offline_analysis",
+      "expected_outcome": "inconclusive",
+      "origin_used": null,
+      "scan_id": "2e2c8cc9-0c52-48e1-a5ac-f5d68e56b656",
+      "verdict": "pass"
+    },
+    {
+      "actual_outcome": "inconclusive",
+      "application": "A",
+      "case_id": "A-CHK-004-ambiguous",
+      "check_id": "login_throttling",
+      "detail": "Removed the valid_login_control record. The bounded failed-attempt sequence or valid-login control is incomplete.",
+      "duration_seconds": 0.0,
+      "evidence_id": "85d89da1-6701-402a-96ff-128a1399e3d7",
+      "execution_mode": "offline_analysis",
+      "expected_outcome": "inconclusive",
+      "origin_used": null,
+      "scan_id": "52ad015e-3337-4ac2-b90b-3942ed0d2efb",
+      "verdict": "pass"
+    },
+    {
+      "actual_outcome": "inconclusive",
+      "application": "A",
+      "case_id": "A-CHK-005-ambiguous",
+      "check_id": "session_fixation",
+      "detail": "Removed the authenticated_control observation. Session fixation evidence is missing one or more controls.",
+      "duration_seconds": 0.0,
+      "evidence_id": "268bf876-45bd-4a1e-b4a1-570e46b894a4",
+      "execution_mode": "offline_analysis",
+      "expected_outcome": "inconclusive",
+      "origin_used": null,
+      "scan_id": "aef2be89-fcee-4c4b-9b41-4216a00b3b93",
+      "verdict": "pass"
+    },
+    {
+      "actual_outcome": "inconclusive",
+      "application": "A",
+      "case_id": "A-CHK-006-ambiguous",
+      "check_id": "logout_invalidation",
+      "detail": "Removed the logout_status observation. Logout controls did not produce usable statuses.",
+      "duration_seconds": 0.0,
+      "evidence_id": "4fafb840-4781-485a-8728-f65d6e2ae181",
+      "execution_mode": "offline_analysis",
+      "expected_outcome": "inconclusive",
+      "origin_used": null,
+      "scan_id": "9320c3f7-1b9e-46a5-a8c7-dfe14140288c",
+      "verdict": "pass"
+    }
+  ],
+  "run_id": "A-offline-001"
+}
