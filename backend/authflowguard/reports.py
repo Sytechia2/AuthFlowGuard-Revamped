@@ -93,8 +93,10 @@ def write_html_report(
         )
         budget_limit = html.escape(str(usage.get("limit_usd", "unknown")))
         uncertain = html.escape(str(usage.get("uncertain_requests", 0)))
+        usage_source = html.escape(str(usage.get("usage_source", "none")))
         usage_html = (
             "<ul>"
+            f"<li>Usage source: {usage_source}</li>"
             f"<li>Input tokens: {input_tokens}</li>"
             f"<li>Output tokens: {output_tokens}</li>"
             f"<li>Settled estimated cost (USD): {settled_cost}</li>"

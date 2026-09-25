@@ -28,12 +28,12 @@ from authflowguard.automatic_actions import (
     AutomaticBrowserController,
     ProgressCallback,
 )
+from authflowguard.cancellation import close_resources
 from authflowguard.evaluation.cost_tracking import (
     CostLedger,
     CostLedgerStore,
     UsageSource,
 )
-from authflowguard.cancellation import close_resources
 from authflowguard.models import (
     ActionWaitCondition,
     AuthFeature,
@@ -615,8 +615,9 @@ async def revalidate_auth_profile(
     if profile.step_control_signatures:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
-            context = await _new_context(browser)
+            context: BrowserContext | None = None
             try:
+                context = await _new_context(browser)
                 page = await context.new_page()
                 executor = BrowserActionExecutor(
                     page,
@@ -676,8 +677,7 @@ async def revalidate_auth_profile(
                         break
                     await executor.execute(action)
             finally:
-                await context.close()
-                await browser.close()
+                await close_resources(context, browser)
         return
 
     navigation = next(
@@ -696,7 +696,7 @@ async def revalidate_auth_profile(
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
-        context: BrowserContext | None = None
+        context = None
         try:
             context = await _new_context(browser)
             page = await context.new_page()

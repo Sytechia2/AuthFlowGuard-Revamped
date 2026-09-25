@@ -6,6 +6,7 @@ from collections.abc import Callable, Coroutine
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import ROUND_CEILING, Decimal
 from enum import StrEnum
 from pathlib import Path
 from threading import RLock
@@ -61,7 +62,9 @@ from authflowguard.checks.session_fixation import (
 )
 from authflowguard.config import (
     load_server_settings,
+    observation_timeout_seconds,
     validate_bedrock_configuration,
+    worker_timeout_seconds,
 )
 from authflowguard.evaluation.cost_tracking import (
     CostLedger,
@@ -79,9 +82,9 @@ from authflowguard.models import (
     BrowserAction,
     CheckId,
     CheckResult,
+    Coverage,
     DiscoveryMode,
     DiscoveryProvenance,
-    Coverage,
     EvidenceEvent,
     EvidenceKind,
     ScanRequest,
@@ -90,17 +93,12 @@ from authflowguard.models import (
 from authflowguard.reports import export_scan_reports
 from authflowguard.scope import url_without_query_or_fragment
 from authflowguard.secrets import RuntimeSecrets, redact_text
-from authflowguard.usage_ledger import (
-    DurableUsageLedger,
-    UsageBudgetExceeded,
-    UsageLedgerError,
-)
 from authflowguard.worker_protocol import (
-    WorkerAcknowledgement,
     WorkerCommand,
     WorkerMessage,
     WorkerMessageType,
     WorkerOperation,
+    WorkerProgress,
 )
 from authflowguard.worker_supervisor import WorkerSupervisor
 
@@ -112,6 +110,13 @@ ANALYSERS = {
     CheckId.SESSION_FIXATION: analyse_session_fixation,
     CheckId.LOGOUT_INVALIDATION: analyse_logout_invalidation,
 }
+
+
+def _usd(value: float) -> str:
+    """Format money with the fixed precision the interface and report expect."""
+
+    amount = Decimal(str(value)).quantize(USD_QUANTUM, rounding=ROUND_CEILING)
+    return format(amount, "f")
 
 
 def _latest_results(results: list[CheckResult]) -> list[CheckResult]:
@@ -135,6 +140,8 @@ class ScanState(StrEnum):
     FAILED = "failed"
     CANCELLED = "cancelled"
 
+
+USD_QUANTUM = Decimal("0.00000001")
 
 TERMINAL_SCAN_STATES = {
     ScanState.COMPLETED,
@@ -297,6 +304,7 @@ class ScanRecord:
     future: Future[None] | None = None
     pending_execution: ScanExecutionInput | None = None
     cost_ledger: CostLedger | None = None
+    cost_ledger_damaged: bool = False
     active_check: CheckId | None = None
     completed_checks: list[CheckId] = field(default_factory=list)
     pending_observations: int = 0
@@ -323,13 +331,22 @@ class ScanManager:
         *,
         worker_backend: Literal["process", "thread", "inline"] = "process",
         cancellation_grace_seconds: float = 3.0,
+        worker_timeout: float | None = None,
+        observation_timeout: float | None = None,
     ) -> None:
         self._store = EvidenceStore(data_root)
         self._data_root = Path(data_root).resolve()
         self._worker_backend = worker_backend
         self._action_client_factory = action_client_factory
+        self._worker_timeout = (
+            worker_timeout if worker_timeout is not None else worker_timeout_seconds()
+        )
+        self._observation_timeout = (
+            observation_timeout
+            if observation_timeout is not None
+            else observation_timeout_seconds()
+        )
         self._records: dict[UUID, ScanRecord] = {}
-        self._usage_ledgers: dict[UUID, DurableUsageLedger] = {}
         self._recovery_errors: dict[UUID, str] = {}
         self._lock = RLock()
         self._executor = ThreadPoolExecutor(
@@ -431,6 +448,7 @@ class ScanManager:
                             operation=WorkerOperation.SCAN,
                             data_root=str(self._data_root),
                             request=record.request,
+                            provenance=record.provenance,
                             execution=execution.model_dump(mode="json"),
                             saved_profile=self._find_saved_profile(record, execution),
                         )
@@ -586,19 +604,33 @@ class ScanManager:
     ) -> WorkerMessage:
         if self._supervisor is None:
             raise RuntimeError("The process worker supervisor is unavailable")
-        result: Future[tuple[WorkerMessage | None, int | None, bool]] = Future()
+        result: Future[tuple[WorkerMessage | None, int | None, bool, bool]] = Future()
 
         def completed(
             message: WorkerMessage | None,
             exit_code: int | None,
             forced: bool,
+            timed_out: bool,
         ) -> None:
+            if (
+                message is not None
+                and message.message_type is WorkerMessageType.PROGRESS
+            ):
+                return
             if not result.done():
-                result.set_result((message, exit_code, forced))
+                result.set_result((message, exit_code, forced, timed_out))
 
-        record.future = self._supervisor.start(command, completed)
-        self._record_worker_identity(record, command)
-        message, exit_code, forced = await asyncio.wrap_future(result)
+        supervisor = self._supervisor
+        record.future = await asyncio.to_thread(
+            lambda: supervisor.start(
+                command,
+                completed,
+                max_runtime_seconds=self._observation_timeout,
+            )
+        )
+        with self._lock:
+            self._record_worker_identity(record, command)
+        message, exit_code, forced, timed_out = await asyncio.wrap_future(result)
         with self._lock:
             record.worker_cleanup = (
                 "forced"
@@ -613,6 +645,8 @@ class ScanManager:
                 record.worker_cleanup_seconds = round(
                     time.monotonic() - record.cancellation_requested_at, 6
                 )
+        if timed_out:
+            raise RuntimeError("The isolated guidance observer timed out")
         if (
             message is None
             or exit_code not in {0, None}
@@ -684,6 +718,7 @@ class ScanManager:
                         operation=WorkerOperation.GUIDED_SCAN,
                         data_root=str(self._data_root),
                         request=record.request,
+                        provenance=record.provenance,
                         execution=execution.model_dump(mode="json"),
                         guidance=guidance.model_dump(mode="json"),
                     )
@@ -729,13 +764,15 @@ class ScanManager:
             raise RuntimeError("The process worker supervisor is unavailable")
         return self._supervisor.start(
             command,
-            lambda message, exit_code, forced: self._apply_process_result(
+            lambda message, exit_code, forced, timed_out: self._apply_process_result(
                 record,
                 command.worker_generation,
                 message,
                 exit_code,
                 forced,
+                timed_out,
             ),
+            max_runtime_seconds=self._worker_timeout,
         )
 
     def _record_worker_identity(
@@ -757,30 +794,21 @@ class ScanManager:
         message: WorkerMessage | None,
         exit_code: int | None,
         forced: bool,
-    ) -> WorkerAcknowledgement | None:
+        timed_out: bool = False,
+    ) -> None:
         export_report = False
         with self._lock:
             if not self._worker_is_current(record, worker_generation):
-                return None
-            if message is not None and message.message_type in {
-                WorkerMessageType.USAGE_RESERVE,
-                WorkerMessageType.USAGE_DISPATCHED,
-                WorkerMessageType.USAGE_SETTLE,
-                WorkerMessageType.USAGE_RELEASE,
-            }:
-                return self._apply_usage_transition(record, message)
+                return
+            if message is not None:
+                self._apply_worker_progress(record, message.progress)
             if (
                 message is not None
                 and message.message_type is WorkerMessageType.PROGRESS
             ):
-                record.active_check = (
-                    CheckId(message.active_check) if message.active_check else None
-                )
-                record.completed_checks = [
-                    CheckId(value) for value in message.completed_checks
-                ]
+                self._reload_worker_events(record)
                 self._persist_state(record)
-                return None
+                return
             record.worker_active = False
             record.worker_pid = None
             record.worker_correlation_id = None
@@ -813,6 +841,16 @@ class ScanManager:
                     error_code=(
                         "scan_cancelled_forced" if forced else "scan_cancelled"
                     ),
+                )
+                export_report = True
+            elif timed_out:
+                self._discard_pending_execution(record)
+                record.active_check = None
+                self._transition(
+                    record,
+                    ScanState.FAILED,
+                    error="The scan worker stopped responding and was terminated",
+                    error_code="scan_worker_timeout",
                 )
                 export_report = True
             elif (
@@ -851,9 +889,6 @@ class ScanManager:
                         error_code="guidance_required",
                     )
             elif message.message_type is WorkerMessageType.COMPLETED:
-                record.completed_checks = [
-                    CheckId(value) for value in message.completed_checks
-                ]
                 self._discard_pending_execution(record)
                 self._transition(
                     record,
@@ -882,99 +917,84 @@ class ScanManager:
                 export_report = True
         if export_report:
             self._export_reports(record)
-        return None
 
-    def _apply_usage_transition(
-        self, record: ScanRecord, message: WorkerMessage
-    ) -> WorkerAcknowledgement:
-        accepted = True
-        error_code: str | None = None
-        try:
-            if message.attempt_id is None:
-                raise UsageLedgerError("Missing usage attempt identifier")
-            ledger = self._usage_ledger(record)
-            if message.message_type is WorkerMessageType.USAGE_RESERVE:
-                if None in {
-                    message.model_id,
-                    message.region,
-                    message.reserved_cost_usd,
-                    message.input_price_usd_per_1000_tokens,
-                    message.output_price_usd_per_1000_tokens,
-                }:
-                    raise UsageLedgerError("Incomplete usage reservation")
-                assert message.reserved_cost_usd is not None
-                assert message.input_price_usd_per_1000_tokens is not None
-                assert message.output_price_usd_per_1000_tokens is not None
-                ledger.reserve(
-                    attempt_id=message.attempt_id,
-                    model_id=str(message.model_id),
-                    region=str(message.region),
-                    reserved_cost_usd=float(message.reserved_cost_usd),
-                    input_price_usd_per_1000_tokens=float(
-                        message.input_price_usd_per_1000_tokens
-                    ),
-                    output_price_usd_per_1000_tokens=float(
-                        message.output_price_usd_per_1000_tokens
-                    ),
-                )
-            elif message.message_type is WorkerMessageType.USAGE_DISPATCHED:
-                ledger.mark_dispatched(message.attempt_id)
-            elif message.message_type is WorkerMessageType.USAGE_SETTLE:
-                if None in {
-                    message.input_tokens,
-                    message.output_tokens,
-                    message.actual_cost_usd,
-                }:
-                    raise UsageLedgerError("Incomplete usage settlement")
-                assert message.input_tokens is not None
-                assert message.output_tokens is not None
-                assert message.actual_cost_usd is not None
-                ledger.settle(
-                    message.attempt_id,
-                    input_tokens=int(message.input_tokens),
-                    output_tokens=int(message.output_tokens),
-                    actual_cost_usd=float(message.actual_cost_usd),
-                )
-            else:
-                ledger.release(
-                    message.attempt_id, message.safe_reason or "not_dispatched"
-                )
-            self._persist_state(record)
-        except UsageBudgetExceeded:
-            accepted = False
-            error_code = "usage_budget_exceeded"
-        except (OSError, UsageLedgerError, ValueError, TypeError):
-            accepted = False
-            error_code = "usage_ledger_unavailable"
-        return WorkerAcknowledgement(
-            correlation_id=message.correlation_id,
-            scan_id=message.scan_id,
-            worker_generation=message.worker_generation,
-            attempt_id=message.attempt_id or UUID(int=0),
-            message_type=message.message_type,
-            accepted=accepted,
-            error_code=error_code,
+    def _apply_worker_progress(
+        self, record: ScanRecord, progress: WorkerProgress | None
+    ) -> None:
+        """Mirror the worker's live state so the interface sees real metrics."""
+
+        if progress is None:
+            return
+        record.active_check = (
+            CheckId(progress.active_check) if progress.active_check else None
         )
-
-    def _usage_ledger(self, record: ScanRecord) -> DurableUsageLedger:
-        ledger = self._usage_ledgers.get(record.scan_id)
-        if ledger is None:
-            ledger = DurableUsageLedger(
-                self._store.scan_directory(record.scan_id) / "usage.ndjson",
-                record.scan_id,
-                record.request.limits.maximum_inference_cost_usd,
-            )
-            self._usage_ledgers[record.scan_id] = ledger
-        return ledger
+        record.completed_checks = [
+            CheckId(value) for value in progress.completed_checks
+        ]
+        record.decision_count = progress.decision_count
+        record.model_request_count = progress.model_request_count
+        record.total_input_tokens = progress.total_input_tokens
+        record.total_output_tokens = progress.total_output_tokens
+        record.estimated_cost_usd = progress.estimated_cost_usd
+        record.unresolved_reservations_usd = progress.unresolved_reservations_usd
+        if progress.stop_reason is not None:
+            record.stop_reason = progress.stop_reason
+        if progress.provenance is not None:
+            record.provenance = progress.provenance
+        if record.state is ScanState.RUNNING and not record.cancel_requested:
+            record.phase = progress.phase
 
     def _usage_summary(self, record: ScanRecord) -> dict[str, object]:
-        try:
-            return self._usage_ledger(record).summary().as_dict()
-        except (OSError, UsageLedgerError):
+        """Summarise model usage from the scan's durable cost ledger totals."""
+
+        if record.cost_ledger_damaged:
             return {
                 "accounting_error": True,
-                "limit_usd": str(record.request.limits.maximum_inference_cost_usd),
+                "limit_usd": _usd(record.request.limits.maximum_inference_cost_usd),
             }
+        ledger = record.cost_ledger
+        return {
+            "input_tokens": record.total_input_tokens,
+            "output_tokens": record.total_output_tokens,
+            "settled_cost_usd": _usd(record.estimated_cost_usd),
+            "outstanding_reserved_cost_usd": _usd(record.unresolved_reservations_usd),
+            "limit_usd": _usd(record.request.limits.maximum_inference_cost_usd),
+            "uncertain_requests": (
+                len(ledger.unresolved_reservations()) if ledger is not None else 0
+            ),
+            "usage_source": (
+                record.provenance.usage_source if record.provenance else "none"
+            ),
+        }
+
+    def _load_cost_ledger(self, record: ScanRecord) -> None:
+        """Rebuild usage totals from the ledger file the scan owner wrote."""
+
+        ledger_path = self._store.scan_directory(record.scan_id) / "cost-ledger.ndjson"
+        if not ledger_path.exists():
+            return
+        try:
+            ledger = CostLedgerStore(ledger_path).load_into()
+        except (OSError, ValueError):
+            record.cost_ledger = None
+            record.cost_ledger_damaged = True
+            return
+        record.cost_ledger = ledger
+        record.cost_ledger_damaged = False
+        record.estimated_cost_usd = float(ledger.total_observed_cost_usd())
+        record.unresolved_reservations_usd = float(
+            ledger.total_unresolved_reservations_usd()
+        )
+        completed = [entry for entry in ledger if not entry.is_reservation]
+        record.total_input_tokens = sum(entry.input_tokens for entry in completed)
+        record.total_output_tokens = sum(entry.output_tokens for entry in completed)
+
+    def _reload_worker_events(self, record: ScanRecord) -> None:
+        try:
+            record.events = self._store.read_events(record.scan_id)
+        except (OSError, ValueError):
+            # The worker may be mid-append; the next progress update retries.
+            pass
 
     def _reload_worker_artifacts(self, record: ScanRecord) -> None:
         record.events = self._store.read_events(record.scan_id)
@@ -986,6 +1006,7 @@ class ScanManager:
             result_data.pop("result_version", None)
             results.append(CheckResult.model_validate(result_data))
         record.results = _latest_results(results)
+        self._load_cost_ledger(record)
 
     def _find_saved_profile(
         self,
@@ -1505,6 +1526,7 @@ class ScanManager:
         with self._lock:
             if not self._worker_is_current(record, worker_generation):
                 return
+            record.active_check = None
             next_state = (
                 ScanState.CANCELLED if record.cancel_requested else ScanState.COMPLETED
             )
@@ -1858,6 +1880,7 @@ class ScanManager:
 
                 ledger_path = self._store.scan_directory(scan_id) / "cost-ledger.ndjson"
                 cost_ledger: CostLedger | None = None
+                cost_ledger_damaged = False
                 if ledger_path.exists():
                     try:
                         cost_ledger = CostLedgerStore(ledger_path).load_into()
@@ -1868,6 +1891,7 @@ class ScanManager:
                             cost_ledger.total_unresolved_reservations_usd()
                         )
                     except (OSError, ValueError):
+                        cost_ledger_damaged = True
                         state = ScanState.FAILED
                         phase = "failed"
                         error = "Cost ledger is damaged; usage cannot be reconciled"
@@ -1896,6 +1920,7 @@ class ScanManager:
                     profile=self._store.read_profile(scan_id),
                     error=str(error) if error is not None else None,
                     cost_ledger=cost_ledger,
+                    cost_ledger_damaged=cost_ledger_damaged,
                     error_code=(str(error_code) if error_code is not None else None),
                     state_changed_at=self._read_datetime(
                         metadata.get("state_changed_at"), created_at

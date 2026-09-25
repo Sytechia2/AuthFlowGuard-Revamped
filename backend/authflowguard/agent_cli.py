@@ -25,9 +25,9 @@ from authflowguard.bedrock import (
     BedrockResponseError,
 )
 from authflowguard.cancellation import close_resources
+from authflowguard.evaluation.cost_tracking import CostLedgerStore, UsageSource
 from authflowguard.models import EvidenceKind, ExecutionLimits, TargetScope
 from authflowguard.secrets import RuntimeSecrets
-from authflowguard.usage_ledger import DurableUsageLedger
 
 DEFAULT_USERNAME_REFERENCE = "login-username"
 DEFAULT_PASSWORD_REFERENCE = "login-password"
@@ -128,11 +128,11 @@ async def run_live_session(
         }
     )
     run_id = arguments.run_id or uuid4()
-    usage_ledger = DurableUsageLedger(
-        arguments.usage_root / str(run_id) / "usage.ndjson",
-        run_id,
-        arguments.maximum_cost_usd,
+    # Reusing a run ID resumes the same durable budget instead of resetting it.
+    ledger_store = CostLedgerStore(
+        arguments.usage_root / str(run_id) / "cost-ledger.ndjson"
     )
+    cost_ledger = ledger_store.load_into()
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=not arguments.headed)
@@ -152,16 +152,17 @@ async def run_live_session(
                 target=target,
                 runtime_secrets=runtime_secrets,
                 scan_id=run_id,
-                action_client=BedrockActionClient(
-                    configuration,
-                    usage_accountant=usage_ledger,
-                ),
+                action_client=BedrockActionClient(configuration),
                 limits=limits,
                 credential_references=[
                     DEFAULT_USERNAME_REFERENCE,
                     DEFAULT_PASSWORD_REFERENCE,
                 ],
                 progress_callback=print_progress,
+                cost_ledger_store=ledger_store,
+                cost_ledger=cost_ledger,
+                usage_source=UsageSource.LIVE,
+                model_id=arguments.model_id,
             )
             return await controller.run(completion_check)
         finally:

@@ -5,16 +5,10 @@ from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
 import boto3
-from botocore.config import Config
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from authflowguard.models import BrowserAction, BrowserActionType
 from authflowguard.scope import url_without_query_or_fragment
-from authflowguard.usage_ledger import (
-    UsageAccountant,
-    UsageBudgetExceeded,
-    new_attempt_id,
-)
 
 NOVA_MICRO_INPUT_USD_PER_1000_TOKENS = 0.000035
 NOVA_MICRO_OUTPUT_USD_PER_1000_TOKENS = 0.00014
@@ -136,11 +130,9 @@ class BedrockActionClient:
         self,
         configuration: BedrockConfiguration,
         runtime_client: BedrockRuntimeClient | None = None,
-        usage_accountant: UsageAccountant | None = None,
     ) -> None:
         self._configuration = configuration
         self._runtime_client = runtime_client or self._create_runtime_client()
-        self._usage_accountant = usage_accountant
 
     def choose_action(
         self,
@@ -154,33 +146,9 @@ class BedrockActionClient:
                 "The estimated Bedrock request cost exceeds the configured limit"
             )
 
-        attempt_id = new_attempt_id()
-        prices = MODEL_PRICES_USD_PER_1000_TOKENS[self._configuration.model_id]
-        if self._usage_accountant is not None:
-            try:
-                self._usage_accountant.reserve(
-                    attempt_id=attempt_id,
-                    model_id=self._configuration.model_id,
-                    region=self._configuration.aws_region,
-                    reserved_cost_usd=reserved_cost,
-                    input_price_usd_per_1000_tokens=prices[0],
-                    output_price_usd_per_1000_tokens=prices[1],
-                )
-            except UsageBudgetExceeded as error:
-                raise BedrockCostLimitError(str(error)) from error
-            self._usage_accountant.mark_dispatched(attempt_id)
-
         response = self._runtime_client.converse(**request)
-        # Usage belongs to the provider call even when its proposed action is invalid.
         input_tokens, output_tokens = self._read_usage(response)
         actual_cost = self._calculate_cost(input_tokens, output_tokens)
-        if self._usage_accountant is not None:
-            self._usage_accountant.settle(
-                attempt_id,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                actual_cost_usd=actual_cost,
-            )
 
         try:
             action = self._read_action(response)

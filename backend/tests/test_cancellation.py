@@ -7,10 +7,15 @@ from threading import Event
 from typing import Any
 
 import pytest
-from authflowguard.authentication import LoginFormDiscoveryError
+from authflowguard.authentication import (
+    LoginFormDiscoveryError,
+    VerifiedLoginExecution,
+)
 from authflowguard.cancellation import CancellationControl, close_resources
+from authflowguard.checks.login_enumeration import LoginEnumerationRun
 from authflowguard.models import CheckId, ScanRequest
 from authflowguard.scan_manager import ScanExecutionInput, ScanManager, ScanState
+from test_form_enumeration import make_evidence, profile_for
 
 
 def _request() -> ScanRequest:
@@ -233,3 +238,41 @@ def test_cleanup_attempts_every_resource_and_preserves_primary_error() -> None:
     with pytest.raises(ValueError, match="primary"):
         asyncio.run(operation())
     assert closed == ["context", "browser"]
+
+
+def test_cancellation_during_a_check_leaves_no_active_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = ScanManager(tmp_path, worker_backend="thread")
+    profile = profile_for("https://app.example")
+    record = manager.create_scan(
+        ScanRequest(target=profile.target, selected_checks=[CheckId.LOGIN_ENUMERATION])
+    )
+    manager._transition(record, ScanState.RUNNING)
+
+    async def cancelled_mid_check(**kwargs: Any) -> LoginEnumerationRun:
+        assert record.active_check is CheckId.LOGIN_ENUMERATION
+        record.cancellation.request()
+        evidence = make_evidence(CheckId.LOGIN_ENUMERATION)
+        evidence.scan_id = kwargs["scan_id"]
+        return LoginEnumerationRun(evidence=evidence, events=[])
+
+    monkeypatch.setattr(
+        "authflowguard.scan_manager.run_login_enumeration_check",
+        cancelled_mid_check,
+    )
+    asyncio.run(
+        manager._complete_profile_execution(
+            record,
+            _execution(),
+            VerifiedLoginExecution(profile=profile, events=[], traffic=[]),
+        )
+    )
+
+    snapshot = manager.snapshot(record)
+    assert record.state is ScanState.CANCELLED
+    assert record.active_check is None
+    assert snapshot["execution_progress"]["active_check"] is None
+    assert snapshot["execution_progress"]["cancelled_checks"] == [
+        CheckId.LOGIN_ENUMERATION.value
+    ]

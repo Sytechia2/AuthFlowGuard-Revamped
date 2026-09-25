@@ -253,7 +253,7 @@ def test_model_observation_redacts_credentials_echoed_by_the_page() -> None:
     )
     controller._recorder = FakeRecorder()  # type: ignore[assignment]
 
-    observation = asyncio.run(controller._observe_page(False, set()))
+    observation, _ = asyncio.run(controller._observe_page(False, set()))
 
     serialized = observation.model_dump_json()
     assert canary not in serialized

@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from authflowguard.models import AuthProfile, ScanRequest
+from authflowguard.models import AuthProfile, DiscoveryProvenance, ScanRequest
 
 WORKER_PROTOCOL_VERSION: Final[Literal[1]] = 1
 
@@ -26,10 +26,6 @@ class WorkerMessageType(StrEnum):
     CANCELLED = "cancelled"
     FAILED = "failed"
     CLEANUP_ACK = "cleanup_ack"
-    USAGE_RESERVE = "usage_reserve"
-    USAGE_DISPATCHED = "usage_dispatched"
-    USAGE_SETTLE = "usage_settle"
-    USAGE_RELEASE = "usage_release"
 
 
 class WorkerCommand(BaseModel):
@@ -44,10 +40,33 @@ class WorkerCommand(BaseModel):
     operation: WorkerOperation
     data_root: str
     request: ScanRequest
+    provenance: DiscoveryProvenance | None = None
     execution: dict[str, Any] | None = None
     guidance: dict[str, Any] | None = None
     observation_url: str | None = None
     saved_profile: AuthProfile | None = None
+
+
+class WorkerProgress(BaseModel):
+    """Live execution state the API parent mirrors while a worker runs.
+
+    Model usage figures are display copies; the durable cost ledger written by
+    the worker remains the source of truth after the worker exits.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    phase: str
+    active_check: str | None = None
+    completed_checks: list[str] = Field(default_factory=list)
+    decision_count: int = Field(default=0, ge=0)
+    model_request_count: int = Field(default=0, ge=0)
+    total_input_tokens: int = Field(default=0, ge=0)
+    total_output_tokens: int = Field(default=0, ge=0)
+    estimated_cost_usd: float = Field(default=0.0, ge=0)
+    unresolved_reservations_usd: float = Field(default=0.0, ge=0)
+    stop_reason: str | None = None
+    provenance: DiscoveryProvenance | None = None
 
 
 class WorkerMessage(BaseModel):
@@ -65,31 +84,5 @@ class WorkerMessage(BaseModel):
     error: str | None = None
     continuation_execution: dict[str, Any] | None = None
     observation: dict[str, Any] | None = None
-    completed_checks: list[str] = Field(default_factory=list)
-    active_check: str | None = None
+    progress: WorkerProgress | None = None
     cleanup_confirmed: bool = False
-    attempt_id: UUID | None = None
-    model_id: str | None = None
-    region: str | None = None
-    reserved_cost_usd: float | None = Field(default=None, ge=0)
-    actual_cost_usd: float | None = Field(default=None, ge=0)
-    input_price_usd_per_1000_tokens: float | None = Field(default=None, ge=0)
-    output_price_usd_per_1000_tokens: float | None = Field(default=None, ge=0)
-    input_tokens: int | None = Field(default=None, ge=0)
-    output_tokens: int | None = Field(default=None, ge=0)
-    safe_reason: str | None = None
-
-
-class WorkerAcknowledgement(BaseModel):
-    """Parent acknowledgement proving an accounting transition is durable."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    protocol_version: Literal[1] = WORKER_PROTOCOL_VERSION
-    correlation_id: UUID
-    scan_id: UUID
-    worker_generation: int = Field(ge=1)
-    attempt_id: UUID
-    message_type: WorkerMessageType
-    accepted: bool
-    error_code: str | None = None

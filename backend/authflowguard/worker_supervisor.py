@@ -17,22 +17,22 @@ from typing import Any
 from uuid import UUID
 
 from authflowguard.worker_protocol import (
-    WorkerAcknowledgement,
     WorkerCommand,
     WorkerMessage,
     WorkerMessageType,
 )
 
-WorkerCallback = Callable[
-    [WorkerMessage | None, int | None, bool], WorkerAcknowledgement | None
-]
-WorkerEntrypoint = Callable[[dict[str, Any], Any, Any, Any], None]
+DEFAULT_STARTUP_TIMEOUT_SECONDS = 60.0
+
+# (message, exit_code, forced, timed_out). PROGRESS messages arrive with
+# exit_code None; the final call carries the last terminal message, if any.
+WorkerCallback = Callable[[WorkerMessage | None, int | None, bool, bool], None]
+WorkerEntrypoint = Callable[[dict[str, Any], Any, Any], None]
 
 
 def _worker_entry(
     command_data: dict[str, Any],
     output: Queue[dict[str, Any]],
-    control: Queue[dict[str, Any]],
     cancel_event: Any,
 ) -> None:
     """Import the heavy worker runtime only inside the spawned process."""
@@ -44,7 +44,7 @@ def _worker_entry(
             pass
     from authflowguard.scan_worker import execute_worker_command
 
-    execute_worker_command(command_data, output, control, cancel_event)
+    execute_worker_command(command_data, output, cancel_event)
 
 
 @dataclass
@@ -52,13 +52,14 @@ class WorkerHandle:
     command: WorkerCommand
     process: BaseProcess
     output: Queue[dict[str, Any]]
-    control: Queue[dict[str, Any]]
     cancel_event: Any
     future: Future[None]
     watcher: threading.Thread
     started_at: float
     ready: threading.Event
+    max_runtime_seconds: float | None = None
     forced: bool = False
+    timed_out: bool = False
     cleanup_confirmed: bool = False
 
 
@@ -69,10 +70,12 @@ class WorkerSupervisor:
         self,
         cancellation_grace_seconds: float = 3.0,
         entrypoint: WorkerEntrypoint = _worker_entry,
+        startup_timeout_seconds: float = DEFAULT_STARTUP_TIMEOUT_SECONDS,
     ) -> None:
         self._context: SpawnContext = multiprocessing.get_context("spawn")
         self._grace_seconds = cancellation_grace_seconds
         self._entrypoint = entrypoint
+        self._startup_timeout_seconds = startup_timeout_seconds
         self._lock = threading.Lock()
         self._handles: dict[tuple[UUID, int], WorkerHandle] = {}
 
@@ -80,14 +83,25 @@ class WorkerSupervisor:
         self,
         command: WorkerCommand,
         callback: WorkerCallback,
+        *,
+        max_runtime_seconds: float | None = None,
     ) -> Future[None]:
+        """Spawn a worker and return without waiting for it to become ready.
+
+        Startup and runtime deadlines are enforced by the watcher thread, which
+        always reports the outcome through ``callback``.
+        """
+
+        key = (command.scan_id, command.worker_generation)
+        with self._lock:
+            if key in self._handles:
+                raise RuntimeError("The worker generation is already active")
         output: Queue[dict[str, Any]] = self._context.Queue(maxsize=32)
-        control: Queue[dict[str, Any]] = self._context.Queue(maxsize=32)
         cancel_event = self._context.Event()
         future: Future[None] = Future()
         process = self._context.Process(
             target=self._entrypoint,
-            args=(command.model_dump(mode="json"), output, control, cancel_event),
+            args=(command.model_dump(mode="json"), output, cancel_event),
             name=f"afg-{command.scan_id}-{command.worker_generation}",
             daemon=False,
         )
@@ -96,12 +110,12 @@ class WorkerSupervisor:
             command=command,
             process=process,
             output=output,
-            control=control,
             cancel_event=cancel_event,
             future=future,
             watcher=threading.current_thread(),
             started_at=time.monotonic(),
             ready=threading.Event(),
+            max_runtime_seconds=max_runtime_seconds,
         )
         watcher = threading.Thread(
             target=self._watch,
@@ -111,31 +125,15 @@ class WorkerSupervisor:
         )
         handle.watcher = watcher
         with self._lock:
-            key = (command.scan_id, command.worker_generation)
-            if key in self._handles:
-                process.terminate()
-                process.join(timeout=1)
-                raise RuntimeError("The worker generation is already active")
             self._handles[key] = handle
         watcher.start()
-        if not handle.ready.wait(timeout=5):
-            handle.forced = True
-            self._terminate_owned_tree(handle)
-            watcher.join(timeout=2)
-            raise RuntimeError("The isolated worker did not acknowledge startup")
         return future
 
     def cancel(self, scan_id: UUID, worker_generation: int) -> bool:
         handle = self._get(scan_id, worker_generation)
         if handle is None:
             return False
-        handle.cancel_event.set()
-        threading.Thread(
-            target=self._escalate,
-            args=(handle,),
-            name=f"afg-stop-{scan_id}",
-            daemon=True,
-        ).start()
+        self._request_stop(handle)
         return True
 
     def is_active(self, scan_id: UUID, worker_generation: int) -> bool:
@@ -168,10 +166,39 @@ class WorkerSupervisor:
         with self._lock:
             return self._handles.get((scan_id, worker_generation))
 
+    def _request_stop(self, handle: WorkerHandle) -> None:
+        """Ask for cooperative cancellation, then force-stop after the grace."""
+
+        handle.cancel_event.set()
+        threading.Thread(
+            target=self._escalate,
+            args=(handle,),
+            name=f"afg-stop-{handle.command.scan_id}",
+            daemon=True,
+        ).start()
+
+    def _enforce_deadlines(self, handle: WorkerHandle) -> None:
+        if handle.timed_out:
+            return
+        elapsed = time.monotonic() - handle.started_at
+        if not handle.ready.is_set():
+            if elapsed > self._startup_timeout_seconds:
+                # A worker that never started cannot cooperate with cancellation.
+                handle.timed_out = True
+                handle.forced = True
+                self._terminate_owned_tree(handle)
+        elif (
+            handle.max_runtime_seconds is not None
+            and elapsed > handle.max_runtime_seconds
+        ):
+            handle.timed_out = True
+            self._request_stop(handle)
+
     def _watch(self, handle: WorkerHandle, callback: WorkerCallback) -> None:
         final_message: WorkerMessage | None = None
         last_sequence = 0
         while True:
+            self._enforce_deadlines(handle)
             try:
                 raw_message = handle.output.get(timeout=0.1)
             except queue.Empty:
@@ -190,24 +217,10 @@ class WorkerSupervisor:
             ):
                 continue
             last_sequence = message.sequence
-            if message.message_type.value == "ready":
+            if message.message_type is WorkerMessageType.READY:
                 handle.ready.set()
             elif message.message_type is WorkerMessageType.PROGRESS:
-                callback(message, None, False)
-                continue
-            elif message.message_type in {
-                WorkerMessageType.USAGE_RESERVE,
-                WorkerMessageType.USAGE_DISPATCHED,
-                WorkerMessageType.USAGE_SETTLE,
-                WorkerMessageType.USAGE_RELEASE,
-            }:
-                acknowledgement = callback(message, None, False)
-                if acknowledgement is not None:
-                    handle.control.put(
-                        acknowledgement.model_dump(mode="json"),
-                        block=True,
-                        timeout=5,
-                    )
+                callback(message, None, False, False)
                 continue
             if message.cleanup_confirmed:
                 handle.cleanup_confirmed = True
@@ -219,13 +232,10 @@ class WorkerSupervisor:
                 (handle.command.scan_id, handle.command.worker_generation), None
             )
         try:
-            if handle.ready.is_set():
-                callback(final_message, exit_code, handle.forced)
+            callback(final_message, exit_code, handle.forced, handle.timed_out)
         finally:
             handle.output.close()
             handle.output.join_thread()
-            handle.control.close()
-            handle.control.join_thread()
             if not handle.future.done():
                 handle.future.set_result(None)
 

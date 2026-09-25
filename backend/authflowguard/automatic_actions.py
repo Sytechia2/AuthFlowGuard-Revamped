@@ -389,7 +389,6 @@ class AutomaticBrowserController:
                     ),
                     timeout=self._remaining_seconds(deadline),
                 )
-                self._check_cancelled()
                 decisions.append(decision)
                 accounted_cost += decision.actual_cost_usd
 
@@ -652,8 +651,7 @@ class AutomaticBrowserController:
         previous_attempt_failed: bool,
         completed_fill_controls: set[str],
         timeout_seconds: float | None = None,
-    ) -> PageObservationForModel | tuple[PageObservationForModel, dict[str, str]]:
-        include_signatures = timeout_seconds is not None
+    ) -> tuple[PageObservationForModel, dict[str, str]]:
         if timeout_seconds is None:
             timeout_seconds = self._limits.maximum_active_seconds
         controls = await self._wait_or_cancel(
@@ -715,9 +713,7 @@ class AutomaticBrowserController:
             completed_fill_controls=sorted(completed_fill_controls),
             previous_attempt_failed=previous_attempt_failed,
         )
-        if include_signatures:
-            return observation, current_step_sigs
-        return observation
+        return observation, current_step_sigs
 
     @staticmethod
     def _control_sig(control: SafeControlDescription | Mapping[str, object]) -> str:

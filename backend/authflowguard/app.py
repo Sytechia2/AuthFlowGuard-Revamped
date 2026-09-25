@@ -87,6 +87,9 @@ def create_app(
             content={"code": error.code, "detail": error.detail},
         )
 
+    # Endpoints that spawn or signal a worker are plain functions so FastAPI runs
+    # them in its threadpool; process startup never blocks the event loop.
+
     @application.get("/api/health", tags=["system"])
     async def read_health() -> dict[str, str]:
         return {"status": "ok"}
@@ -105,7 +108,7 @@ def create_app(
         return [scan_manager.snapshot(record) for record in scan_manager.list_scans()]
 
     @application.post("/api/scans/{scan_id}/start")
-    async def start_scan(
+    def start_scan(
         scan_id: UUID,
         execution: ScanExecutionInput,
     ) -> dict[str, object]:
@@ -140,7 +143,7 @@ def create_app(
             ) from None
 
     @application.post("/api/scans/{scan_id}/guidance")
-    async def submit_guidance(
+    def submit_guidance(
         scan_id: UUID,
         guidance: GuidanceSubmission,
     ) -> dict[str, object]:
@@ -148,7 +151,7 @@ def create_app(
         return scan_manager.snapshot(record)
 
     @application.post("/api/scans/{scan_id}/cancel")
-    async def cancel_scan(scan_id: UUID) -> dict[str, object]:
+    def cancel_scan(scan_id: UUID) -> dict[str, object]:
         record = scan_manager.cancel_scan(scan_id)
         return scan_manager.snapshot(record)
 
