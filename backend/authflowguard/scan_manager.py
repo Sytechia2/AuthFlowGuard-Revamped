@@ -1,14 +1,16 @@
 """Local scan lifecycle orchestration for the first complete check slice."""
 
 import asyncio
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Coroutine
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import ROUND_CEILING, Decimal
 from enum import StrEnum
 from pathlib import Path
-from threading import Event, Lock
-from typing import Any
+from threading import RLock
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
@@ -28,6 +30,7 @@ from authflowguard.automatic_actions import (
     ActionSelectionClient,
 )
 from authflowguard.bedrock import BedrockActionClient, BedrockConfiguration
+from authflowguard.cancellation import CancellationControl
 from authflowguard.checks.form_enumeration import FormEnumerationRun
 from authflowguard.checks.login_enumeration import (
     LoginEnumerationRun,
@@ -59,29 +62,45 @@ from authflowguard.checks.session_fixation import (
 )
 from authflowguard.config import (
     load_server_settings,
+    observation_timeout_seconds,
     validate_bedrock_configuration,
+    worker_timeout_seconds,
 )
 from authflowguard.evaluation.cost_tracking import (
     CostLedger,
     CostLedgerStore,
     UsageSource,
 )
-from authflowguard.evidence import EvidenceStore
+from authflowguard.evidence import (
+    EvidenceStore,
+    incremental_event_sink,
+    redact_persisted_data,
+    transient_secret_redaction,
+)
 from authflowguard.models import (
     AuthProfile,
     BrowserAction,
     CheckId,
     CheckResult,
+    Coverage,
     DiscoveryMode,
     DiscoveryProvenance,
     EvidenceEvent,
+    EvidenceKind,
     ScanRequest,
-    TargetScope,
     TestRunEvidence,
 )
 from authflowguard.reports import export_scan_reports
 from authflowguard.scope import url_without_query_or_fragment
-from authflowguard.secrets import RuntimeSecrets
+from authflowguard.secrets import RuntimeSecrets, redact_text
+from authflowguard.worker_protocol import (
+    WorkerCommand,
+    WorkerMessage,
+    WorkerMessageType,
+    WorkerOperation,
+    WorkerProgress,
+)
+from authflowguard.worker_supervisor import WorkerSupervisor
 
 ANALYSERS = {
     CheckId.LOGIN_ENUMERATION: analyse_login_enumeration,
@@ -91,6 +110,13 @@ ANALYSERS = {
     CheckId.SESSION_FIXATION: analyse_session_fixation,
     CheckId.LOGOUT_INVALIDATION: analyse_logout_invalidation,
 }
+
+
+def _usd(value: float) -> str:
+    """Format money with the fixed precision the interface and report expect."""
+
+    amount = Decimal(str(value)).quantize(USD_QUANTUM, rounding=ROUND_CEILING)
+    return format(amount, "f")
 
 
 def _latest_results(results: list[CheckResult]) -> list[CheckResult]:
@@ -115,6 +141,90 @@ class ScanState(StrEnum):
     CANCELLED = "cancelled"
 
 
+USD_QUANTUM = Decimal("0.00000001")
+
+TERMINAL_SCAN_STATES = {
+    ScanState.COMPLETED,
+    ScanState.FAILED,
+    ScanState.CANCELLED,
+}
+
+_UNCHANGED = object()
+
+ALLOWED_SCAN_TRANSITIONS = {
+    ScanState.CREATED: {ScanState.RUNNING, ScanState.CANCELLED},
+    ScanState.RUNNING: {
+        ScanState.AWAITING_GUIDANCE,
+        ScanState.COMPLETED,
+        ScanState.FAILED,
+        ScanState.CANCELLED,
+    },
+    ScanState.AWAITING_GUIDANCE: {
+        ScanState.RUNNING,
+        ScanState.FAILED,
+        ScanState.CANCELLED,
+    },
+    ScanState.COMPLETED: set(),
+    ScanState.FAILED: set(),
+    ScanState.CANCELLED: set(),
+}
+
+
+class ScanManagerError(ValueError):
+    """Safe, machine-readable failure exposed by the local API."""
+
+    code = "scan_error"
+    status_code = 409
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(detail)
+
+
+class ScanNotFoundError(ScanManagerError):
+    code = "scan_not_found"
+    status_code = 404
+
+
+class ScanRecoveryError(ScanManagerError):
+    code = "scan_recovery_failed"
+
+
+class InvalidScanStateError(ScanManagerError):
+    code = "invalid_scan_state"
+
+
+class ScanBusyError(ScanManagerError):
+    code = "scan_busy"
+
+
+class ScanConfigurationError(ScanManagerError):
+    code = "invalid_scan_configuration"
+
+
+class EvidenceNotAvailableError(ScanManagerError):
+    code = "evidence_not_available"
+
+
+class ReportNotAvailableError(ScanManagerError):
+    code = "report_not_available"
+    status_code = 404
+
+
+class InvalidReportFormatError(ScanManagerError):
+    code = "invalid_report_format"
+    status_code = 422
+
+
+class ScanWorkerUnavailableError(ScanManagerError):
+    code = "scan_worker_unavailable"
+    status_code = 503
+
+
+class GuidanceObservationError(ScanManagerError):
+    code = "guidance_observation_failed"
+
+
 class ScanExecutionInput(BaseModel):
     """Transient execution input; this model is never saved with a scan."""
 
@@ -132,6 +242,19 @@ class ScanExecutionInput(BaseModel):
     registration_url: HttpUrl | None = None
     reset_request_url: HttpUrl | None = None
     registration_password_reference: str | None = None
+
+    def secret_values(self) -> tuple[str, ...]:
+        return tuple(value for value in self.runtime_secrets.values() if value)
+
+    def redact_text(self, value: str) -> str:
+        return redact_text(value, self.runtime_secrets.values())
+
+    def discard_runtime_secrets(self) -> None:
+        """Release this transient owner's credential references idempotently."""
+
+        for reference_id in list(self.runtime_secrets):
+            self.runtime_secrets[reference_id] = ""
+        self.runtime_secrets.clear()
 
 
 class GuidanceSubmission(BaseModel):
@@ -173,10 +296,29 @@ class ScanRecord:
     results: list[CheckResult] = field(default_factory=list)
     profile: AuthProfile | None = None
     error: str | None = None
-    cancel_requested: Event = field(default_factory=Event)
+    error_code: str | None = None
+    state_changed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    cancellation: CancellationControl = field(default_factory=CancellationControl)
     future: Future[None] | None = None
     pending_execution: ScanExecutionInput | None = None
     cost_ledger: CostLedger | None = None
+    cost_ledger_damaged: bool = False
+    active_check: CheckId | None = None
+    completed_checks: list[CheckId] = field(default_factory=list)
+    pending_observations: int = 0
+    worker_generation: int = 0
+    worker_active: bool = False
+    cancellation_requested_at: float | None = None
+    worker_cleanup: str | None = None
+    worker_cleanup_seconds: float | None = None
+    worker_pid: int | None = None
+    worker_correlation_id: UUID | None = None
+
+    @property
+    def cancel_requested(self) -> bool:
+        return self.cancellation.is_requested()
 
 
 class ScanManager:
@@ -186,19 +328,54 @@ class ScanManager:
         self,
         data_root: str | Path,
         action_client_factory: Callable[[], ActionSelectionClient] | None = None,
+        *,
+        worker_backend: Literal["process", "thread", "inline"] = "process",
+        cancellation_grace_seconds: float = 3.0,
+        worker_timeout: float | None = None,
+        observation_timeout: float | None = None,
     ) -> None:
         self._store = EvidenceStore(data_root)
+        self._data_root = Path(data_root).resolve()
+        self._worker_backend = worker_backend
         self._action_client_factory = action_client_factory
+        self._worker_timeout = (
+            worker_timeout if worker_timeout is not None else worker_timeout_seconds()
+        )
+        self._observation_timeout = (
+            observation_timeout
+            if observation_timeout is not None
+            else observation_timeout_seconds()
+        )
         self._records: dict[UUID, ScanRecord] = {}
-        self._lock = Lock()
+        self._recovery_errors: dict[UUID, str] = {}
+        self._lock = RLock()
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="afg-scan"
+        )
+        self._supervisor = (
+            WorkerSupervisor(cancellation_grace_seconds)
+            if worker_backend == "process"
+            else None
         )
         self._load_persisted_scans()
 
     @property
     def has_action_client_factory(self) -> bool:
         return self._action_client_factory is not None
+
+    def shutdown(self) -> None:
+        """Stop owned work without waiting indefinitely during API shutdown."""
+
+        with self._lock:
+            for record in self._records.values():
+                if not self._is_active(record):
+                    continue
+                record.cancellation.request()
+                record.cancellation_requested_at = time.monotonic()
+                self._persist_state(record)
+        if self._supervisor is not None:
+            self._supervisor.shutdown()
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def create_scan(self, request: ScanRequest) -> ScanRecord:
         provenance = DiscoveryProvenance(
@@ -224,51 +401,82 @@ class ScanManager:
                 "state": record.state.value,
                 "phase": record.phase,
                 "provenance": provenance.model_dump(mode="json"),
+                "state_changed_at": record.state_changed_at.isoformat(),
             },
         )
         return record
 
     def get_scan(self, scan_id: UUID) -> ScanRecord:
-        try:
-            return self._records[scan_id]
-        except KeyError as error:
-            raise KeyError(f"Unknown scan '{scan_id}'") from error
+        with self._lock:
+            return self._get_scan_locked(scan_id)
 
     def start_scan(self, scan_id: UUID, execution: ScanExecutionInput) -> ScanRecord:
-        with self._lock:
-            record = self._get_scan_locked(scan_id)
-            if record.state is not ScanState.CREATED:
-                raise ValueError("Only a created scan can be started")
-            if any(
-                other.state is ScanState.RUNNING for other in self._records.values()
-            ):
-                raise ValueError("Another scan is already running")
-            if record.request.discovery_mode == DiscoveryMode.BEDROCK:
-                settings = load_server_settings()
-                limits = record.request.limits
-                if (
-                    limits.maximum_ai_decisions > settings.server_max_decisions
-                    or limits.maximum_active_seconds > settings.server_max_seconds
-                    or limits.maximum_inference_cost_usd > settings.server_max_cost_usd
-                ):
-                    raise ValueError(
-                        "Requested Bedrock limits exceed server maximum limits"
-                    )
-                if not self.has_action_client_factory:
-                    is_valid, reason = validate_bedrock_configuration()
-                    if not is_valid:
-                        raise ValueError(
-                            f"Bedrock discovery is not configured: {reason}"
+        try:
+            with self._lock:
+                record = self._get_scan_locked(scan_id)
+                if record.state is not ScanState.CREATED:
+                    raise InvalidScanStateError("Only a created scan can be started")
+                if any(self._is_active(other) for other in self._records.values()):
+                    raise ScanBusyError("Another scan is already running")
+                if record.request.discovery_mode == DiscoveryMode.BEDROCK:
+                    settings = load_server_settings()
+                    limits = record.request.limits
+                    if (
+                        limits.maximum_ai_decisions > settings.server_max_decisions
+                        or limits.maximum_active_seconds > settings.server_max_seconds
+                        or limits.maximum_inference_cost_usd
+                        > settings.server_max_cost_usd
+                    ):
+                        raise ScanConfigurationError(
+                            "Requested Bedrock limits exceed server maximum limits"
                         )
-            record.state = ScanState.RUNNING
-            record.phase = "running"
-            self._persist_state(record)
-            record.future = self._executor.submit(
-                self._run_scan,
-                record,
-                execution,
-            )
-            return record
+                    if not self.has_action_client_factory:
+                        is_valid, reason = validate_bedrock_configuration()
+                        if not is_valid:
+                            raise ScanConfigurationError(
+                                f"Bedrock discovery is not configured: {reason}"
+                            )
+                record.worker_generation += 1
+                worker_generation = record.worker_generation
+                self._transition(record, ScanState.RUNNING)
+                try:
+                    if self._worker_backend == "process":
+                        record.worker_active = True
+                        command = WorkerCommand(
+                            scan_id=record.scan_id,
+                            worker_generation=worker_generation,
+                            operation=WorkerOperation.SCAN,
+                            data_root=str(self._data_root),
+                            request=record.request,
+                            provenance=record.provenance,
+                            execution=execution.model_dump(mode="json"),
+                            saved_profile=self._find_saved_profile(record, execution),
+                        )
+                        record.future = self._start_process_worker(record, command)
+                        self._record_worker_identity(record, command)
+                        execution.discard_runtime_secrets()
+                    else:
+                        record.future = self._executor.submit(
+                            self._run_scan,
+                            record,
+                            execution,
+                            worker_generation,
+                        )
+                except BaseException:
+                    record.worker_active = False
+                    self._transition(
+                        record,
+                        ScanState.FAILED,
+                        error="The scan worker could not be started",
+                        error_code="scan_worker_unavailable",
+                    )
+                    raise ScanWorkerUnavailableError(
+                        "The scan worker could not be started"
+                    ) from None
+                return record
+        except BaseException:
+            execution.discard_runtime_secrets()
+            raise
 
     def cancel_scan(self, scan_id: UUID) -> ScanRecord:
         with self._lock:
@@ -279,13 +487,27 @@ class ScanManager:
                 ScanState.CANCELLED,
             }:
                 return record
-            record.cancel_requested.set()
             record.phase = "cancelled"
             record.stop_reason = "cancelled"
-            record.pending_execution = None
-            if record.state in {ScanState.CREATED, ScanState.AWAITING_GUIDANCE}:
-                record.state = ScanState.CANCELLED
+            record.cancellation.request()
+            record.cancellation_requested_at = time.monotonic()
+            if record.state is ScanState.CREATED or (
+                record.state is ScanState.AWAITING_GUIDANCE
+                and not record.cancellation.has_active_work
+                and record.pending_observations == 0
+            ):
+                self._discard_pending_execution(record)
+                self._transition(
+                    record,
+                    ScanState.CANCELLED,
+                    error="Scan execution cancelled",
+                    error_code="scan_cancelled",
+                )
+                self._export_reports(record)
+            else:
                 self._persist_state(record)
+                if self._supervisor is not None and record.worker_active:
+                    self._supervisor.cancel(record.scan_id, record.worker_generation)
             return record
 
     async def observe_guidance(
@@ -295,39 +517,161 @@ class ScanManager:
     ) -> dict[str, Any]:
         """Observe the target page for a developer without retaining live values."""
 
-        record = self.get_scan(scan_id)
-        if record.state is not ScanState.AWAITING_GUIDANCE:
-            raise ValueError("The scan is not waiting for guidance")
+        with self._lock:
+            record = self._get_scan_locked(scan_id)
+            if record.state is not ScanState.AWAITING_GUIDANCE:
+                raise InvalidScanStateError("The scan is not waiting for guidance")
+            if record.cancel_requested:
+                raise InvalidScanStateError("The scan has been cancelled")
+            record.pending_observations += 1
+            secret_values = (
+                record.pending_execution.secret_values()
+                if record.pending_execution is not None
+                else ()
+            )
+            process_command: WorkerCommand | None = None
+            if self._worker_backend == "process":
+                record.worker_generation += 1
+                record.worker_active = True
+                process_command = WorkerCommand(
+                    scan_id=record.scan_id,
+                    worker_generation=record.worker_generation,
+                    operation=WorkerOperation.OBSERVE_GUIDANCE,
+                    data_root=str(self._data_root),
+                    request=record.request,
+                    execution=(
+                        record.pending_execution.model_dump(mode="json")
+                        if record.pending_execution is not None
+                        else None
+                    ),
+                    observation_url=(str(observation_url) if observation_url else None),
+                )
+                self._persist_state(record)
         loop = asyncio.get_running_loop()
-        observation = await loop.run_in_executor(
-            self._executor,
-            self._observe_guidance_in_worker,
-            record.scan_id,
-            record.request.target,
-            str(observation_url) if observation_url else None,
-        )
-        self._save_events(record, [observation.event])
+        try:
+            if process_command is not None:
+                process_message = await self._observe_guidance_in_process(
+                    record, process_command
+                )
+                observation_payload = process_message.observation or {}
+                safe_event = EvidenceEvent.model_validate(
+                    observation_payload.get("event")
+                )
+            else:
+                observation = await loop.run_in_executor(
+                    self._executor,
+                    self._observe_guidance_in_worker,
+                    record,
+                    str(observation_url) if observation_url else None,
+                    secret_values,
+                )
+                with transient_secret_redaction(secret_values):
+                    safe_event = EvidenceEvent.model_validate(
+                        redact_persisted_data(observation.event.model_dump(mode="json"))
+                    )
+        except asyncio.CancelledError:
+            raise RuntimeError("Guidance observation cancelled") from None
+        finally:
+            with self._lock:
+                record.pending_observations -= 1
+                if process_command is not None:
+                    record.worker_active = False
+                    record.worker_pid = None
+                    record.worker_correlation_id = None
+                finalize_cancelled = (
+                    record.cancel_requested and record.pending_observations == 0
+                )
+                if not finalize_cancelled:
+                    self._persist_state(record)
+            if finalize_cancelled:
+                self._finalize_cancelled(record)
+        if record.cancel_requested:
+            raise RuntimeError("Guidance observation cancelled")
+        self._save_events(record, [safe_event])
+        safe_controls = safe_event.redacted_details.get("controls", [])
         return {
             "scan_id": str(record.scan_id),
-            "event_id": str(observation.event.event_id),
-            "url": observation.event.redacted_details.get("url"),
-            "title": observation.event.redacted_details.get("title"),
-            "controls": observation.controls,
+            "event_id": str(safe_event.event_id),
+            "url": safe_event.redacted_details.get("url"),
+            "title": safe_event.redacted_details.get("title"),
+            "controls": safe_controls if isinstance(safe_controls, list) else [],
         }
 
-    @staticmethod
-    def _observe_guidance_in_worker(
-        scan_id: UUID,
-        target: TargetScope,
-        observation_url: str | None,
-    ) -> GuidedPageObservation:
-        return asyncio.run(
-            observe_guidance_page(
-                scan_id=scan_id,
-                target=target,
-                observation_url=observation_url,
+    async def _observe_guidance_in_process(
+        self,
+        record: ScanRecord,
+        command: WorkerCommand,
+    ) -> WorkerMessage:
+        if self._supervisor is None:
+            raise RuntimeError("The process worker supervisor is unavailable")
+        result: Future[tuple[WorkerMessage | None, int | None, bool, bool]] = Future()
+
+        def completed(
+            message: WorkerMessage | None,
+            exit_code: int | None,
+            forced: bool,
+            timed_out: bool,
+        ) -> None:
+            if (
+                message is not None
+                and message.message_type is WorkerMessageType.PROGRESS
+            ):
+                return
+            if not result.done():
+                result.set_result((message, exit_code, forced, timed_out))
+
+        supervisor = self._supervisor
+        record.future = await asyncio.to_thread(
+            lambda: supervisor.start(
+                command,
+                completed,
+                max_runtime_seconds=self._observation_timeout,
             )
         )
+        with self._lock:
+            self._record_worker_identity(record, command)
+        message, exit_code, forced, timed_out = await asyncio.wrap_future(result)
+        with self._lock:
+            record.worker_cleanup = (
+                "forced"
+                if forced
+                else (
+                    "crashed"
+                    if message is None or exit_code not in {0, None}
+                    else "graceful"
+                )
+            )
+            if record.cancellation_requested_at is not None:
+                record.worker_cleanup_seconds = round(
+                    time.monotonic() - record.cancellation_requested_at, 6
+                )
+        if timed_out:
+            raise RuntimeError("The isolated guidance observer timed out")
+        if (
+            message is None
+            or exit_code not in {0, None}
+            or not message.cleanup_confirmed
+            or message.message_type is not WorkerMessageType.OBSERVATION
+        ):
+            raise RuntimeError("The isolated guidance observer failed")
+        return message
+
+    def _observe_guidance_in_worker(
+        self,
+        record: ScanRecord,
+        observation_url: str | None,
+        secret_values: tuple[str, ...],
+    ) -> GuidedPageObservation:
+        async def run() -> GuidedPageObservation:
+            with transient_secret_redaction(secret_values):
+                with record.cancellation.register_current_task():
+                    return await observe_guidance_page(
+                        scan_id=record.scan_id,
+                        target=record.request.target,
+                        observation_url=observation_url,
+                    )
+
+        return asyncio.run(run())
 
     def submit_guidance(
         self,
@@ -339,15 +683,18 @@ class ScanManager:
         with self._lock:
             record = self._get_scan_locked(scan_id)
             if record.state is not ScanState.AWAITING_GUIDANCE:
-                raise ValueError("The scan is not waiting for guidance")
+                raise InvalidScanStateError("The scan is not waiting for guidance")
             if record.pending_execution is None:
-                raise ValueError("The scan no longer has runtime guidance input")
-            if any(
-                other.state is ScanState.RUNNING for other in self._records.values()
-            ):
-                raise ValueError("Another scan is already running")
+                raise InvalidScanStateError(
+                    "The scan no longer has runtime guidance input"
+                )
+            if record.cancel_requested:
+                raise InvalidScanStateError("The scan has been cancelled")
+            if any(self._is_active(other) for other in self._records.values()):
+                raise ScanBusyError("Another scan is already running")
 
-            execution_data = record.pending_execution.model_dump()
+            pending_execution = record.pending_execution
+            execution_data = pending_execution.model_dump()
             for field_name in (
                 "protected_resource",
                 "account_marker_selector",
@@ -357,16 +704,47 @@ class ScanManager:
                 if value is not None:
                     execution_data[field_name] = value
             execution = ScanExecutionInput.model_validate(execution_data)
-            record.state = ScanState.RUNNING
-            record.phase = "running"
-            record.error = None
-            self._persist_state(record)
-            record.future = self._executor.submit(
-                self._run_guided_scan,
-                record,
-                execution,
-                guidance,
-            )
+            pending_execution.discard_runtime_secrets()
+            record.pending_execution = None
+            record.worker_generation += 1
+            worker_generation = record.worker_generation
+            self._transition(record, ScanState.RUNNING, error=None, error_code=None)
+            try:
+                if self._worker_backend == "process":
+                    record.worker_active = True
+                    command = WorkerCommand(
+                        scan_id=record.scan_id,
+                        worker_generation=worker_generation,
+                        operation=WorkerOperation.GUIDED_SCAN,
+                        data_root=str(self._data_root),
+                        request=record.request,
+                        provenance=record.provenance,
+                        execution=execution.model_dump(mode="json"),
+                        guidance=guidance.model_dump(mode="json"),
+                    )
+                    record.future = self._start_process_worker(record, command)
+                    self._record_worker_identity(record, command)
+                    execution.discard_runtime_secrets()
+                else:
+                    record.future = self._executor.submit(
+                        self._run_guided_scan,
+                        record,
+                        execution,
+                        guidance,
+                        worker_generation,
+                    )
+            except BaseException:
+                record.worker_active = False
+                execution.discard_runtime_secrets()
+                self._transition(
+                    record,
+                    ScanState.FAILED,
+                    error="The guided scan worker could not be started",
+                    error_code="scan_worker_unavailable",
+                )
+                raise ScanWorkerUnavailableError(
+                    "The guided scan worker could not be started"
+                ) from None
             return record
 
     def list_scans(self) -> list[ScanRecord]:
@@ -376,6 +754,259 @@ class ScanManager:
                 key=lambda record: record.created_at,
                 reverse=True,
             )
+
+    def _start_process_worker(
+        self,
+        record: ScanRecord,
+        command: WorkerCommand,
+    ) -> Future[None]:
+        if self._supervisor is None:
+            raise RuntimeError("The process worker supervisor is unavailable")
+        return self._supervisor.start(
+            command,
+            lambda message, exit_code, forced, timed_out: self._apply_process_result(
+                record,
+                command.worker_generation,
+                message,
+                exit_code,
+                forced,
+                timed_out,
+            ),
+            max_runtime_seconds=self._worker_timeout,
+        )
+
+    def _record_worker_identity(
+        self,
+        record: ScanRecord,
+        command: WorkerCommand,
+    ) -> None:
+        if self._supervisor is None:
+            return
+        identity = self._supervisor.identity(command.scan_id, command.worker_generation)
+        record.worker_pid = identity[0] if identity is not None else None
+        record.worker_correlation_id = command.correlation_id
+        self._persist_state(record)
+
+    def _apply_process_result(
+        self,
+        record: ScanRecord,
+        worker_generation: int,
+        message: WorkerMessage | None,
+        exit_code: int | None,
+        forced: bool,
+        timed_out: bool = False,
+    ) -> None:
+        export_report = False
+        with self._lock:
+            if not self._worker_is_current(record, worker_generation):
+                return
+            if message is not None:
+                self._apply_worker_progress(record, message.progress)
+            if (
+                message is not None
+                and message.message_type is WorkerMessageType.PROGRESS
+            ):
+                self._reload_worker_events(record)
+                self._persist_state(record)
+                return
+            record.worker_active = False
+            record.worker_pid = None
+            record.worker_correlation_id = None
+            if record.cancellation_requested_at is not None:
+                record.worker_cleanup_seconds = round(
+                    time.monotonic() - record.cancellation_requested_at, 6
+                )
+            record.worker_cleanup = (
+                "forced"
+                if forced
+                else (
+                    "crashed"
+                    if message is None or exit_code not in {0, None}
+                    else "graceful"
+                )
+            )
+            self._reload_worker_artifacts(record)
+            if record.cancel_requested:
+                self._preserve_interrupted_check(record)
+                self._discard_pending_execution(record)
+                record.active_check = None
+                self._transition(
+                    record,
+                    ScanState.CANCELLED,
+                    error=(
+                        "Scan execution cancelled after forced worker termination"
+                        if forced
+                        else "Scan execution cancelled"
+                    ),
+                    error_code=(
+                        "scan_cancelled_forced" if forced else "scan_cancelled"
+                    ),
+                )
+                export_report = True
+            elif timed_out:
+                self._discard_pending_execution(record)
+                record.active_check = None
+                self._transition(
+                    record,
+                    ScanState.FAILED,
+                    error="The scan worker stopped responding and was terminated",
+                    error_code="scan_worker_timeout",
+                )
+                export_report = True
+            elif (
+                message is None
+                or message.message_type is WorkerMessageType.READY
+                or not message.cleanup_confirmed
+                or exit_code not in {0, None}
+            ):
+                self._discard_pending_execution(record)
+                self._transition(
+                    record,
+                    ScanState.FAILED,
+                    error="The isolated scan worker exited unexpectedly",
+                    error_code="scan_worker_crashed",
+                )
+                export_report = True
+            elif message.message_type is WorkerMessageType.GUIDANCE_REQUIRED:
+                try:
+                    continuation = ScanExecutionInput.model_validate(
+                        message.continuation_execution
+                    )
+                except (TypeError, ValueError):
+                    self._transition(
+                        record,
+                        ScanState.FAILED,
+                        error="The isolated worker returned invalid continuation data",
+                        error_code="scan_worker_protocol_error",
+                    )
+                    export_report = True
+                else:
+                    record.pending_execution = continuation
+                    self._transition(
+                        record,
+                        ScanState.AWAITING_GUIDANCE,
+                        error=message.error or "Developer guidance is required",
+                        error_code="guidance_required",
+                    )
+            elif message.message_type is WorkerMessageType.COMPLETED:
+                self._discard_pending_execution(record)
+                self._transition(
+                    record,
+                    ScanState.COMPLETED,
+                    error=None,
+                    error_code=None,
+                )
+                export_report = True
+            elif message.message_type is WorkerMessageType.CANCELLED:
+                self._discard_pending_execution(record)
+                self._transition(
+                    record,
+                    ScanState.CANCELLED,
+                    error="Scan execution cancelled",
+                    error_code="scan_cancelled",
+                )
+                export_report = True
+            else:
+                self._discard_pending_execution(record)
+                self._transition(
+                    record,
+                    ScanState.FAILED,
+                    error=message.error or "The isolated scan worker failed",
+                    error_code=message.error_code or "scan_worker_failed",
+                )
+                export_report = True
+        if export_report:
+            self._export_reports(record)
+
+    def _apply_worker_progress(
+        self, record: ScanRecord, progress: WorkerProgress | None
+    ) -> None:
+        """Mirror the worker's live state so the interface sees real metrics."""
+
+        if progress is None:
+            return
+        record.active_check = (
+            CheckId(progress.active_check) if progress.active_check else None
+        )
+        record.completed_checks = [
+            CheckId(value) for value in progress.completed_checks
+        ]
+        record.decision_count = progress.decision_count
+        record.model_request_count = progress.model_request_count
+        record.total_input_tokens = progress.total_input_tokens
+        record.total_output_tokens = progress.total_output_tokens
+        record.estimated_cost_usd = progress.estimated_cost_usd
+        record.unresolved_reservations_usd = progress.unresolved_reservations_usd
+        if progress.stop_reason is not None:
+            record.stop_reason = progress.stop_reason
+        if progress.provenance is not None:
+            record.provenance = progress.provenance
+        if record.state is ScanState.RUNNING and not record.cancel_requested:
+            record.phase = progress.phase
+
+    def _usage_summary(self, record: ScanRecord) -> dict[str, object]:
+        """Summarise model usage from the scan's durable cost ledger totals."""
+
+        if record.cost_ledger_damaged:
+            return {
+                "accounting_error": True,
+                "limit_usd": _usd(record.request.limits.maximum_inference_cost_usd),
+            }
+        ledger = record.cost_ledger
+        return {
+            "input_tokens": record.total_input_tokens,
+            "output_tokens": record.total_output_tokens,
+            "settled_cost_usd": _usd(record.estimated_cost_usd),
+            "outstanding_reserved_cost_usd": _usd(record.unresolved_reservations_usd),
+            "limit_usd": _usd(record.request.limits.maximum_inference_cost_usd),
+            "uncertain_requests": (
+                len(ledger.unresolved_reservations()) if ledger is not None else 0
+            ),
+            "usage_source": (
+                record.provenance.usage_source if record.provenance else "none"
+            ),
+        }
+
+    def _load_cost_ledger(self, record: ScanRecord) -> None:
+        """Rebuild usage totals from the ledger file the scan owner wrote."""
+
+        ledger_path = self._store.scan_directory(record.scan_id) / "cost-ledger.ndjson"
+        if not ledger_path.exists():
+            return
+        try:
+            ledger = CostLedgerStore(ledger_path).load_into()
+        except (OSError, ValueError):
+            record.cost_ledger = None
+            record.cost_ledger_damaged = True
+            return
+        record.cost_ledger = ledger
+        record.cost_ledger_damaged = False
+        record.estimated_cost_usd = float(ledger.total_observed_cost_usd())
+        record.unresolved_reservations_usd = float(
+            ledger.total_unresolved_reservations_usd()
+        )
+        completed = [entry for entry in ledger if not entry.is_reservation]
+        record.total_input_tokens = sum(entry.input_tokens for entry in completed)
+        record.total_output_tokens = sum(entry.output_tokens for entry in completed)
+
+    def _reload_worker_events(self, record: ScanRecord) -> None:
+        try:
+            record.events = self._store.read_events(record.scan_id)
+        except (OSError, ValueError):
+            # The worker may be mid-append; the next progress update retries.
+            pass
+
+    def _reload_worker_artifacts(self, record: ScanRecord) -> None:
+        record.events = self._store.read_events(record.scan_id)
+        record.evidence = self._store.read_all_evidence(record.scan_id)
+        record.profile = self._store.read_profile(record.scan_id)
+        results: list[CheckResult] = []
+        for raw_result in self._store.read_results(record.scan_id):
+            result_data = dict(raw_result)
+            result_data.pop("result_version", None)
+            results.append(CheckResult.model_validate(result_data))
+        record.results = _latest_results(results)
+        self._load_cost_ledger(record)
 
     def _find_saved_profile(
         self,
@@ -411,12 +1042,20 @@ class ScanManager:
 
     def reanalyse(self, scan_id: UUID) -> list[CheckResult]:
         record = self.get_scan(scan_id)
-        if record.state in {ScanState.RUNNING, ScanState.AWAITING_GUIDANCE}:
-            raise ValueError("Wait for scan execution to finish before reanalysis")
+        if record.state in {
+            ScanState.CREATED,
+            ScanState.RUNNING,
+            ScanState.AWAITING_GUIDANCE,
+        }:
+            raise InvalidScanStateError(
+                "Wait for scan execution to finish before reanalysis"
+            )
         if record.profile is None or not record.evidence:
-            raise ValueError("The scan has no completed evidence to reanalyse")
+            raise EvidenceNotAvailableError(
+                "The scan has no completed evidence to reanalyse"
+            )
         if any(evidence.check_id not in ANALYSERS for evidence in record.evidence):
-            raise ValueError(
+            raise EvidenceNotAvailableError(
                 "No offline analyser is available for some stored evidence"
             )
         results = [
@@ -432,75 +1071,117 @@ class ScanManager:
         return results
 
     def report_path(self, scan_id: UUID, extension: str) -> Path:
+        self.get_scan(scan_id)
         if extension not in {"json", "html"}:
-            raise ValueError("Only JSON and HTML reports are available")
+            raise InvalidReportFormatError("Only JSON and HTML reports are available")
         path = self._store.scan_directory(scan_id) / f"report.{extension}"
         if not path.exists():
-            raise FileNotFoundError(f"No {extension} report exists for this scan")
+            raise ReportNotAvailableError(f"No {extension} report exists for this scan")
         return path
 
     def _run_scan(
         self,
         record: ScanRecord,
         execution: ScanExecutionInput,
+        worker_generation: int,
     ) -> None:
         try:
-            asyncio.run(self._run_scan_async(record, execution))
+            asyncio.run(
+                self._run_registered(
+                    record,
+                    self._run_scan_async(record, execution, worker_generation),
+                    execution.secret_values(),
+                )
+            )
+        except asyncio.CancelledError:
+            self._finalize_cancelled(record, worker_generation)
         except Exception as error:
-            with self._lock:
-                if record.cancel_requested.is_set():
-                    record.state = ScanState.CANCELLED
-                    record.phase = "cancelled"
-                    record.stop_reason = "cancelled"
-                    record.pending_execution = None
-                else:
-                    record.state = ScanState.FAILED
-                    record.phase = "failed"
-                    record.error = type(error).__name__
-            self._persist_state(record)
+            self._finalize_failed(record, error, worker_generation)
+        finally:
+            if record.pending_execution is not execution:
+                execution.discard_runtime_secrets()
 
     def _run_guided_scan(
         self,
         record: ScanRecord,
         execution: ScanExecutionInput,
         guidance: GuidanceSubmission,
+        worker_generation: int,
     ) -> None:
         try:
-            asyncio.run(self._run_guided_scan_async(record, execution, guidance))
+            asyncio.run(
+                self._run_registered(
+                    record,
+                    self._run_guided_scan_async(
+                        record, execution, guidance, worker_generation
+                    ),
+                    execution.secret_values(),
+                )
+            )
+        except asyncio.CancelledError:
+            self._finalize_cancelled(record, worker_generation)
         except ValueError as error:
             with self._lock:
-                record.state = (
+                if not self._worker_is_current(record, worker_generation):
+                    return
+                next_state = (
                     ScanState.CANCELLED
-                    if record.cancel_requested.is_set()
+                    if record.cancel_requested
                     else ScanState.AWAITING_GUIDANCE
                 )
-                record.phase = (
-                    "cancelled"
-                    if record.cancel_requested.is_set()
-                    else "awaiting_guidance"
+                if next_state is ScanState.AWAITING_GUIDANCE:
+                    record.pending_execution = execution
+                else:
+                    self._discard_pending_execution(record)
+                self._transition(
+                    record,
+                    next_state,
+                    error=(
+                        "Scan execution cancelled"
+                        if next_state is ScanState.CANCELLED
+                        else execution.redact_text(str(error))
+                    ),
+                    error_code=(
+                        "scan_cancelled"
+                        if next_state is ScanState.CANCELLED
+                        else "guidance_required"
+                    ),
                 )
-                if record.state is ScanState.CANCELLED:
-                    record.pending_execution = None
-                record.error = str(error)
-            self._persist_state(record)
         except Exception as error:
-            with self._lock:
-                record.state = ScanState.FAILED
-                record.phase = "failed"
-                record.error = type(error).__name__
-            self._persist_state(record)
+            self._finalize_failed(record, error, worker_generation)
+        finally:
+            if record.pending_execution is not execution:
+                execution.discard_runtime_secrets()
+
+    async def _run_registered(
+        self,
+        record: ScanRecord,
+        coroutine: Coroutine[Any, Any, None],
+        secret_values: tuple[str, ...],
+    ) -> None:
+        started = False
+        try:
+            with transient_secret_redaction(secret_values):
+                with record.cancellation.register_current_task():
+                    with incremental_event_sink(
+                        lambda events: self._save_incremental_events(record, events)
+                    ):
+                        started = True
+                        await coroutine
+        finally:
+            if not started:
+                coroutine.close()
 
     async def _run_scan_async(
         self,
         record: ScanRecord,
         execution: ScanExecutionInput,
+        worker_generation: int | None = None,
     ) -> None:
-        if record.cancel_requested.is_set():
-            record.state = ScanState.CANCELLED
-            record.phase = "cancelled"
-            record.stop_reason = "cancelled"
-            self._persist_state(record)
-            return
+        with self._lock:
+            if not self._worker_is_current(record, worker_generation):
+                return
+        record.cancellation.checkpoint()
 
         runtime_secrets = RuntimeSecrets(execution.runtime_secrets)
         try:
@@ -591,7 +1272,7 @@ class ScanManager:
                         account_marker_description=execution.account_marker_description,
                         action_client=client,
                         limits=record.request.limits,
-                        cancel_requested=record.cancel_requested.is_set,
+                        cancel_requested=record.cancellation.is_requested,
                         usage_callback=usage_cb,
                         event_sink=event_sink,
                         cost_ledger_store=ledger_store,
@@ -624,26 +1305,45 @@ class ScanManager:
                     )
             except (LoginFormDiscoveryError, ValueError) as error:
                 with self._lock:
-                    if record.cancel_requested.is_set():
-                        record.state = ScanState.CANCELLED
-                        record.phase = "cancelled"
-                        record.stop_reason = "cancelled"
-                        record.pending_execution = None
-                    else:
-                        record.state = ScanState.AWAITING_GUIDANCE
-                        record.phase = "awaiting_guidance"
-                        record.stop_reason = str(error)
-                        record.pending_execution = execution
-                        if record.provenance:
-                            record.provenance.guidance_used = True
-                    record.error = (
+                    if not self._worker_is_current(record, worker_generation):
+                        return
+                    next_state = (
+                        ScanState.CANCELLED
+                        if record.cancel_requested
+                        else ScanState.AWAITING_GUIDANCE
+                    )
+                    if next_state is ScanState.AWAITING_GUIDANCE and record.provenance:
+                        record.provenance.guidance_used = True
+                    unsafe_error = (
                         f"Saved authentication flow needs guidance: {error}"
                         if saved_profile is not None
                         else str(error)
                     )
-                self._persist_state(record)
+                    safe_error = runtime_secrets.redact_text(unsafe_error)
+                    record.pending_execution = (
+                        execution if next_state is ScanState.AWAITING_GUIDANCE else None
+                    )
+                    self._transition(
+                        record,
+                        next_state,
+                        error=(
+                            "Scan execution cancelled"
+                            if next_state is ScanState.CANCELLED
+                            else safe_error
+                        ),
+                        error_code=(
+                            "scan_cancelled"
+                            if next_state is ScanState.CANCELLED
+                            else "guidance_required"
+                        ),
+                    )
                 return
-            await self._complete_profile_execution(record, execution, profile_execution)
+            await self._complete_profile_execution(
+                record,
+                execution,
+                profile_execution,
+                worker_generation,
+            )
         finally:
             runtime_secrets.discard_all()
 
@@ -652,7 +1352,11 @@ class ScanManager:
         record: ScanRecord,
         execution: ScanExecutionInput,
         guidance: GuidanceSubmission,
+        worker_generation: int | None = None,
     ) -> None:
+        with self._lock:
+            if not self._worker_is_current(record, worker_generation):
+                return
         runtime_secrets = RuntimeSecrets(execution.runtime_secrets)
         try:
             record.phase = "verifying"
@@ -667,8 +1371,13 @@ class ScanManager:
                 account_marker_selector=execution.account_marker_selector,
                 account_marker_description=execution.account_marker_description,
             )
-            await self._complete_profile_execution(record, execution, profile_execution)
-            record.pending_execution = None
+            await self._complete_profile_execution(
+                record,
+                execution,
+                profile_execution,
+                worker_generation,
+            )
+            self._discard_pending_execution(record)
         finally:
             runtime_secrets.discard_all()
 
@@ -677,18 +1386,19 @@ class ScanManager:
         record: ScanRecord,
         execution: ScanExecutionInput,
         profile_execution: VerifiedLoginExecution,
+        worker_generation: int | None = None,
     ) -> None:
-        record.profile = profile_execution.profile
-        self._store.save_profile(record.scan_id, profile_execution.profile)
+        with self._lock:
+            if not self._worker_is_current(record, worker_generation):
+                return
+        safe_profile = AuthProfile.model_validate(
+            redact_persisted_data(profile_execution.profile.model_dump(mode="json"))
+        )
+        record.profile = safe_profile
+        self._store.save_profile(record.scan_id, safe_profile)
         self._save_events(record, profile_execution.events)
 
-        if record.cancel_requested.is_set():
-            record.state = ScanState.CANCELLED
-            record.phase = "cancelled"
-            record.stop_reason = "cancelled"
-            record.pending_execution = None
-            self._persist_state(record)
-            return
+        record.cancellation.checkpoint()
 
         record.phase = "checking"
         self._persist_state(record)
@@ -702,10 +1412,12 @@ class ScanManager:
             CheckId.LOGOUT_INVALIDATION,
         )
         for check_id in check_order:
-            if record.cancel_requested.is_set():
+            if record.cancel_requested:
                 break
             if check_id not in record.request.selected_checks:
                 continue
+            record.active_check = check_id
+            self._persist_state(record)
             check_secrets = RuntimeSecrets(execution.runtime_secrets)
             run: (
                 LoginEnumerationRun
@@ -717,16 +1429,17 @@ class ScanManager:
             try:
                 if check_id is CheckId.LOGIN_ENUMERATION:
                     run = await run_login_enumeration_check(
-                        profile=profile_execution.profile,
+                        profile=safe_profile,
                         scan_id=record.scan_id,
                         runtime_secrets=check_secrets,
                         known_identifier_reference=execution.username_reference,
                         nonexistent_identifier_reference=execution.nonexistent_identifier_reference,
                         failure_password_reference=execution.failure_password_reference,
+                        cancel_requested=record.cancellation.is_requested,
                     )
                 elif check_id is CheckId.RESET_REQUEST_ENUMERATION:
                     run = await run_reset_request_enumeration_check(
-                        profile=profile_execution.profile,
+                        profile=safe_profile,
                         scan_id=record.scan_id,
                         runtime_secrets=check_secrets,
                         known_identifier_reference=execution.username_reference,
@@ -734,11 +1447,11 @@ class ScanManager:
                         form_url=str(execution.reset_request_url)
                         if execution.reset_request_url
                         else None,
-                        cancel_requested=record.cancel_requested.is_set,
+                        cancel_requested=record.cancellation.is_requested,
                     )
                 elif check_id is CheckId.LOGIN_THROTTLING:
                     run = await run_login_throttling_check(
-                        profile=profile_execution.profile,
+                        profile=safe_profile,
                         scan_id=record.scan_id,
                         runtime_secrets=check_secrets,
                         username_reference=execution.username_reference,
@@ -747,33 +1460,33 @@ class ScanManager:
                         expected_lockout_threshold=(
                             record.request.policy.expected_lockout_threshold
                         ),
-                        cancel_requested=record.cancel_requested.is_set,
+                        cancel_requested=record.cancellation.is_requested,
                     )
                 elif check_id is CheckId.SESSION_FIXATION:
                     run = await run_session_fixation_check(
-                        profile=profile_execution.profile,
+                        profile=safe_profile,
                         scan_id=record.scan_id,
                         runtime_secrets=check_secrets,
                         username_reference=execution.username_reference,
                         password_reference=execution.password_reference,
                         protected_resource=str(execution.protected_resource),
                         account_marker_selector=execution.account_marker_selector,
-                        cancel_requested=record.cancel_requested.is_set,
+                        cancel_requested=record.cancellation.is_requested,
                     )
                 elif check_id is CheckId.LOGOUT_INVALIDATION:
                     run = await run_logout_invalidation_check(
-                        profile=profile_execution.profile,
+                        profile=safe_profile,
                         scan_id=record.scan_id,
                         runtime_secrets=check_secrets,
                         username_reference=execution.username_reference,
                         password_reference=execution.password_reference,
                         protected_resource=str(execution.protected_resource),
                         account_marker_selector=execution.account_marker_selector,
-                        cancel_requested=record.cancel_requested.is_set,
+                        cancel_requested=record.cancellation.is_requested,
                     )
                 else:
                     run = await run_registration_enumeration_check(
-                        profile=profile_execution.profile,
+                        profile=safe_profile,
                         scan_id=record.scan_id,
                         runtime_secrets=check_secrets,
                         known_identifier_reference=execution.username_reference,
@@ -785,54 +1498,242 @@ class ScanManager:
                         form_url=str(execution.registration_url)
                         if execution.registration_url
                         else None,
-                        cancel_requested=record.cancel_requested.is_set,
+                        cancel_requested=record.cancellation.is_requested,
                     )
             finally:
                 check_secrets.discard_all()
             self._save_events(record, run.events)
-            record.evidence.append(run.evidence)
-            self._store.save_evidence(run.evidence)
+            safe_evidence = TestRunEvidence.model_validate(
+                redact_persisted_data(run.evidence.model_dump(mode="json"))
+            )
+            record.evidence.append(safe_evidence)
+            self._store.save_evidence(safe_evidence)
             result = ANALYSERS[check_id](
-                run.evidence,
-                profile_execution.profile,
+                safe_evidence,
+                safe_profile,
                 record.request.policy,
             )
-            record.results.append(result)
-            self._store.save_result(result)
-
-        record.state = (
-            ScanState.CANCELLED
-            if record.cancel_requested.is_set()
-            else ScanState.COMPLETED
-        )
-        record.phase = "cancelled" if record.cancel_requested.is_set() else "completed"
-        if record.state is ScanState.CANCELLED:
-            record.stop_reason = "cancelled"
-            record.pending_execution = None
-        self._persist_state(record)
-        if record.evidence:
-            export_scan_reports(
-                self._store, record.scan_id, record.evidence, record.results
+            safe_result = CheckResult.model_validate(
+                redact_persisted_data(result.model_dump(mode="json"))
             )
+            record.results.append(safe_result)
+            self._store.save_result(safe_result)
+            if record.cancel_requested:
+                break
+            record.completed_checks.append(check_id)
+            record.active_check = None
+            self._persist_state(record)
+        with self._lock:
+            if not self._worker_is_current(record, worker_generation):
+                return
+            record.active_check = None
+            next_state = (
+                ScanState.CANCELLED if record.cancel_requested else ScanState.COMPLETED
+            )
+            self._transition(
+                record,
+                next_state,
+                error=(
+                    "Scan execution cancelled"
+                    if next_state is ScanState.CANCELLED
+                    else None
+                ),
+                error_code=(
+                    "scan_cancelled" if next_state is ScanState.CANCELLED else None
+                ),
+            )
+        self._export_reports(record)
 
     def _save_events(
         self,
         record: ScanRecord,
         events: list[EvidenceEvent],
     ) -> None:
-        existing = {event.event_id for event in record.events}
-        for event in events:
-            if event.event_id in existing:
-                continue
+        known_ids = {event.event_id for event in record.events}
+        new_events = [
+            EvidenceEvent.model_validate(
+                redact_persisted_data(event.model_dump(mode="json"))
+            )
+            for event in events
+            if event.event_id not in known_ids
+        ]
+        record.events.extend(new_events)
+        for event in new_events:
             self._store.append_event(event)
-            record.events.append(event)
-            existing.add(event.event_id)
+
+    def _save_incremental_events(
+        self, record: ScanRecord, events: list[EvidenceEvent]
+    ) -> None:
+        check_id = record.active_check
+        self._save_events(
+            record,
+            [
+                event.model_copy(update={"check_id": check_id})
+                if check_id is not None and event.check_id is None
+                else event
+                for event in events
+            ],
+        )
 
     def _get_scan_locked(self, scan_id: UUID) -> ScanRecord:
         try:
             return self._records[scan_id]
         except KeyError as error:
-            raise KeyError(f"Unknown scan '{scan_id}'") from error
+            if scan_id in self._recovery_errors:
+                raise ScanRecoveryError(
+                    "The persisted scan could not be recovered safely"
+                ) from error
+            raise ScanNotFoundError(f"Scan '{scan_id}' was not found") from error
+
+    def _transition(
+        self,
+        record: ScanRecord,
+        next_state: ScanState,
+        *,
+        error: str | None | object = _UNCHANGED,
+        error_code: str | None | object = _UNCHANGED,
+    ) -> None:
+        """Apply and persist one validated lifecycle transition."""
+
+        current_state = record.state
+        if next_state not in ALLOWED_SCAN_TRANSITIONS[current_state]:
+            raise RuntimeError(
+                f"Invalid internal scan transition: {current_state} -> {next_state}"
+            )
+        now = datetime.now(UTC)
+        record.state = next_state
+        record.phase = next_state.value
+        if next_state is ScanState.CANCELLED:
+            record.stop_reason = "cancelled"
+        record.state_changed_at = now
+        if next_state is ScanState.RUNNING and record.started_at is None:
+            record.started_at = now
+        if next_state in TERMINAL_SCAN_STATES:
+            record.finished_at = now
+        if error is not _UNCHANGED:
+            record.error = error if isinstance(error, str) else None
+        if error_code is not _UNCHANGED:
+            record.error_code = error_code if isinstance(error_code, str) else None
+        self._persist_state(record)
+
+    @staticmethod
+    def _discard_pending_execution(record: ScanRecord) -> None:
+        if record.pending_execution is not None:
+            record.pending_execution.discard_runtime_secrets()
+            record.pending_execution = None
+
+    @staticmethod
+    def _is_active(record: ScanRecord) -> bool:
+        return (
+            record.state is ScanState.RUNNING
+            or record.worker_active
+            or record.cancellation.has_active_work
+            or record.pending_observations > 0
+        )
+
+    @staticmethod
+    def _worker_is_current(
+        record: ScanRecord,
+        worker_generation: int | None,
+    ) -> bool:
+        return worker_generation is None or (
+            worker_generation == record.worker_generation
+            and record.state is ScanState.RUNNING
+        )
+
+    def _finalize_cancelled(
+        self,
+        record: ScanRecord,
+        worker_generation: int | None = None,
+    ) -> None:
+        """Publish cancellation only after the registered worker has unwound."""
+
+        with self._lock:
+            if not self._worker_is_current(record, worker_generation):
+                return
+            if record.state in TERMINAL_SCAN_STATES:
+                return
+            self._preserve_interrupted_check(record)
+            self._discard_pending_execution(record)
+            record.active_check = None
+            self._transition(
+                record,
+                ScanState.CANCELLED,
+                error="Scan execution cancelled",
+                error_code="scan_cancelled",
+            )
+        self._export_reports(record)
+
+    def _preserve_interrupted_check(self, record: ScanRecord) -> None:
+        check_id = record.active_check
+        if check_id is None or any(
+            evidence.check_id is check_id for evidence in record.evidence
+        ):
+            return
+        event = EvidenceEvent(
+            event_id=uuid4(),
+            scan_id=record.scan_id,
+            check_id=check_id,
+            kind=EvidenceKind.ERROR,
+            summary="The security check was interrupted by scan cancellation.",
+            redacted_details={"reason": "scan_cancelled"},
+        )
+        self._save_events(record, [event])
+        evidence = TestRunEvidence(
+            evidence_id=uuid4(),
+            scan_id=record.scan_id,
+            check_id=check_id,
+            profile_version=(
+                record.profile.schema_version if record.profile else "1.0"
+            ),
+            event_ids=[
+                saved.event_id for saved in record.events if saved.check_id is check_id
+            ],
+            observations={"execution_status": "cancelled"},
+            errors=["ScanCancelledError"],
+            coverage=Coverage(
+                attempted_steps=[f"run-{check_id.value}"],
+                completed_steps=[],
+                limitations=["Execution was interrupted by scan cancellation."],
+            ),
+        )
+        record.evidence.append(evidence)
+        self._store.save_evidence(evidence)
+
+    def _finalize_failed(
+        self,
+        record: ScanRecord,
+        error: BaseException,
+        worker_generation: int | None = None,
+    ) -> None:
+        with self._lock:
+            if not self._worker_is_current(record, worker_generation):
+                return
+            if record.state in TERMINAL_SCAN_STATES:
+                return
+            if record.cancel_requested:
+                self._preserve_interrupted_check(record)
+                next_state = ScanState.CANCELLED
+                public_error = "Scan execution cancelled"
+                error_code = "scan_cancelled"
+            else:
+                next_state = ScanState.FAILED
+                public_error = "Scan execution failed"
+                error_code = "scan_execution_failed"
+            self._discard_pending_execution(record)
+            record.active_check = None
+            self._transition(
+                record,
+                next_state,
+                error=public_error,
+                error_code=error_code,
+            )
+        self._export_reports(record)
+
+    def _export_reports(self, record: ScanRecord) -> None:
+        export_scan_reports(
+            self._store, record.scan_id, record.evidence, record.results
+        )
 
     def _persist_state(self, record: ScanRecord) -> None:
         metadata: dict[str, Any] = {
@@ -846,6 +1747,40 @@ class ScanManager:
             "estimated_cost_usd": record.estimated_cost_usd,
             "unresolved_reservations_usd": record.unresolved_reservations_usd,
             "stop_reason": record.stop_reason,
+            "error_code": record.error_code,
+            "cancel_requested": record.cancel_requested,
+            "state_changed_at": record.state_changed_at.isoformat(),
+            "started_at": (
+                record.started_at.isoformat() if record.started_at else None
+            ),
+            "finished_at": (
+                record.finished_at.isoformat() if record.finished_at else None
+            ),
+            "worker_generation": record.worker_generation,
+            "worker_active": record.worker_active,
+            "worker_cleanup": record.worker_cleanup,
+            "worker_cleanup_seconds": record.worker_cleanup_seconds,
+            "worker_pid": record.worker_pid,
+            "worker_correlation_id": (
+                str(record.worker_correlation_id)
+                if record.worker_correlation_id
+                else None
+            ),
+            "usage": self._usage_summary(record),
+            "execution_progress": {
+                "active_check": (
+                    record.active_check.value if record.active_check else None
+                ),
+                "completed_checks": [
+                    check_id.value for check_id in record.completed_checks
+                ],
+                "cancelled_checks": [
+                    check_id.value
+                    for check_id in record.request.selected_checks
+                    if record.cancel_requested
+                    and check_id not in record.completed_checks
+                ],
+            },
         }
         if record.provenance:
             metadata["provenance"] = record.provenance.model_dump(mode="json")
@@ -870,8 +1805,21 @@ class ScanManager:
                     "unresolved_reservations_usd",
                     "stop_reason",
                     "provenance",
+                    "cancel_requested",
+                    "error_code",
+                    "state_changed_at",
+                    "started_at",
+                    "finished_at",
+                    "worker_generation",
+                    "worker_active",
+                    "worker_cleanup",
+                    "worker_cleanup_seconds",
+                    "worker_pid",
+                    "worker_correlation_id",
+                    "usage",
                 ):
                     request_data.pop(key, None)
+                progress = request_data.pop("execution_progress", None)
                 request = ScanRequest.model_validate(request_data)
                 created_at_value = metadata.get("created_at")
                 created_at = (
@@ -891,10 +1839,17 @@ class ScanManager:
                     )
                 state = ScanState(str(raw_state))
                 error = metadata.get("error")
+                error_code = metadata.get("error_code")
+                interrupted_state = state
                 if state in {ScanState.RUNNING, ScanState.AWAITING_GUIDANCE}:
-                    state = ScanState.FAILED
-                    error = "Backend restarted during scan execution"
-
+                    if metadata.get("cancel_requested"):
+                        state = ScanState.CANCELLED
+                        error = "Scan execution cancelled during backend restart"
+                        error_code = "scan_cancelled"
+                    else:
+                        state = ScanState.FAILED
+                        error = "Backend restarted during scan execution"
+                        error_code = "backend_restarted"
                 phase = str(
                     metadata.get(
                         "phase",
@@ -925,6 +1880,7 @@ class ScanManager:
 
                 ledger_path = self._store.scan_directory(scan_id) / "cost-ledger.ndjson"
                 cost_ledger: CostLedger | None = None
+                cost_ledger_damaged = False
                 if ledger_path.exists():
                     try:
                         cost_ledger = CostLedgerStore(ledger_path).load_into()
@@ -935,10 +1891,10 @@ class ScanManager:
                             cost_ledger.total_unresolved_reservations_usd()
                         )
                     except (OSError, ValueError):
+                        cost_ledger_damaged = True
                         state = ScanState.FAILED
                         phase = "failed"
                         error = "Cost ledger is damaged; usage cannot be reconciled"
-
                 results = []
                 for raw_result in self._store.read_results(scan_id):
                     result_data = dict(raw_result)
@@ -964,32 +1920,129 @@ class ScanManager:
                     profile=self._store.read_profile(scan_id),
                     error=str(error) if error is not None else None,
                     cost_ledger=cost_ledger,
+                    cost_ledger_damaged=cost_ledger_damaged,
+                    error_code=(str(error_code) if error_code is not None else None),
+                    state_changed_at=self._read_datetime(
+                        metadata.get("state_changed_at"), created_at
+                    ),
+                    started_at=self._read_optional_datetime(metadata.get("started_at")),
+                    finished_at=self._read_optional_datetime(
+                        metadata.get("finished_at")
+                    ),
+                    worker_generation=int(metadata.get("worker_generation", 0)),
+                    worker_cleanup=(
+                        str(metadata["worker_cleanup"])
+                        if metadata.get("worker_cleanup") is not None
+                        else None
+                    ),
+                    worker_cleanup_seconds=(
+                        float(metadata["worker_cleanup_seconds"])
+                        if metadata.get("worker_cleanup_seconds") is not None
+                        else None
+                    ),
+                    completed_checks=[
+                        CheckId(value)
+                        for value in (
+                            progress.get("completed_checks", [])
+                            if isinstance(progress, dict)
+                            else []
+                        )
+                    ],
                 )
+                if metadata.get("cancel_requested"):
+                    record.cancellation.request()
+                if interrupted_state in {
+                    ScanState.RUNNING,
+                    ScanState.AWAITING_GUIDANCE,
+                }:
+                    now = datetime.now(UTC)
+                    record.state_changed_at = now
+                    record.finished_at = now
                 self._records[scan_id] = record
                 if state is ScanState.FAILED and metadata.get("state") in {
                     ScanState.RUNNING.value,
                     ScanState.AWAITING_GUIDANCE.value,
                 }:
                     self._persist_state(record)
+                elif state is ScanState.CANCELLED and interrupted_state in {
+                    ScanState.RUNNING,
+                    ScanState.AWAITING_GUIDANCE,
+                }:
+                    self._persist_state(record)
             except (OSError, TypeError, ValueError):
-                continue
+                self._recovery_errors[scan_id] = (
+                    "The persisted scan metadata or artifacts are invalid"
+                )
+
+    @staticmethod
+    def _read_optional_datetime(value: Any) -> datetime | None:
+        if value is None:
+            return None
+        return datetime.fromisoformat(str(value))
+
+    @classmethod
+    def _read_datetime(cls, value: Any, fallback: datetime) -> datetime:
+        return cls._read_optional_datetime(value) or fallback
 
     def snapshot(self, record: ScanRecord) -> dict[str, Any]:
+        scan_directory = self._store.scan_directory(record.scan_id)
         return {
             "scan_id": str(record.scan_id),
             "created_at": record.created_at.isoformat(),
             "state": record.state.value,
+            "state_changed_at": record.state_changed_at.isoformat(),
+            "started_at": record.started_at.isoformat() if record.started_at else None,
+            "finished_at": (
+                record.finished_at.isoformat() if record.finished_at else None
+            ),
+            "worker_generation": record.worker_generation,
+            "worker_active": record.worker_active,
+            "worker_cleanup": record.worker_cleanup,
+            "worker_cleanup_seconds": record.worker_cleanup_seconds,
+            "worker_pid": record.worker_pid,
+            "worker_correlation_id": (
+                str(record.worker_correlation_id)
+                if record.worker_correlation_id
+                else None
+            ),
+            "cancel_requested": record.cancel_requested,
             "target_url": str(record.request.target.target_url),
             "event_count": len(record.events),
             "evidence_count": len(record.evidence),
             "result_count": len(record.results),
+            "partial_results_available": bool(record.evidence or record.results),
+            "reanalysis_available": (
+                record.state in TERMINAL_SCAN_STATES
+                and record.profile is not None
+                and bool(record.evidence)
+            ),
+            "report_available": (
+                (scan_directory / "report.json").exists()
+                and (scan_directory / "report.html").exists()
+            ),
             "error": record.error,
+            "error_code": record.error_code,
             "profile_source": (
                 record.profile.discovery_history[-1].source.value
                 if record.profile and record.profile.discovery_history
                 else None
             ),
             "guidance_required": record.state is ScanState.AWAITING_GUIDANCE,
+            "usage": self._usage_summary(record),
+            "execution_progress": {
+                "active_check": (
+                    record.active_check.value if record.active_check else None
+                ),
+                "completed_checks": [
+                    check_id.value for check_id in record.completed_checks
+                ],
+                "cancelled_checks": [
+                    check_id.value
+                    for check_id in record.request.selected_checks
+                    if record.cancel_requested
+                    and check_id not in record.completed_checks
+                ],
+            },
             "results": [result.model_dump(mode="json") for result in record.results],
             "phase": record.phase,
             "decision_count": record.decision_count,

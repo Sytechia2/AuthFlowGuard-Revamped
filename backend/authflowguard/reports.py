@@ -76,6 +76,35 @@ def write_html_report(
             )
             + "</ul>"
         )
+    cancellation_notice = (
+        "<p><strong>Execution was cancelled; unfinished checks have no security "
+        "outcome.</strong></p>"
+        if report["metadata"].get("state") == "cancelled"
+        else ""
+    )
+    usage = report["metadata"].get("usage", {})
+    usage_html = "<p>Usage accounting unavailable.</p>"
+    if isinstance(usage, Mapping) and not usage.get("accounting_error"):
+        input_tokens = html.escape(str(usage.get("input_tokens", 0)))
+        output_tokens = html.escape(str(usage.get("output_tokens", 0)))
+        settled_cost = html.escape(str(usage.get("settled_cost_usd", "0.00000000")))
+        reserved_cost = html.escape(
+            str(usage.get("outstanding_reserved_cost_usd", "0.00000000"))
+        )
+        budget_limit = html.escape(str(usage.get("limit_usd", "unknown")))
+        uncertain = html.escape(str(usage.get("uncertain_requests", 0)))
+        usage_source = html.escape(str(usage.get("usage_source", "none")))
+        usage_html = (
+            "<ul>"
+            f"<li>Usage source: {usage_source}</li>"
+            f"<li>Input tokens: {input_tokens}</li>"
+            f"<li>Output tokens: {output_tokens}</li>"
+            f"<li>Settled estimated cost (USD): {settled_cost}</li>"
+            f"<li>Outstanding reserved cost (USD): {reserved_cost}</li>"
+            f"<li>Budget limit (USD): {budget_limit}</li>"
+            f"<li>Uncertain requests: {uncertain}</li>"
+            "</ul>"
+        )
     document = f"""<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>AuthFlowGuard report</title>
@@ -90,6 +119,9 @@ margin: 1rem 0; }}
 </style>
 </head><body><h1>AuthFlowGuard security report</h1>
 <p>Scan: {html.escape(str(report["metadata"].get("scan_id", "unknown")))}</p>
+<p>Execution status: {html.escape(str(report["metadata"].get("state", "unknown")))}</p>
+{cancellation_notice}
+<h2>AI usage and estimated cost</h2>{usage_html}
 <h2>Results</h2>{results_html}
 <h2>Coverage limitations</h2>{limitations}
 <h2>Saved evidence</h2><p>{len(report["evidence"])} evidence package(s) are

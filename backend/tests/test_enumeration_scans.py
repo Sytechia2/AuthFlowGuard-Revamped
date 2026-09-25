@@ -145,7 +145,7 @@ def test_selected_checks_only_are_run_persisted_and_reanalysed_offline(
         "authflowguard.checks.login_enumeration.async_playwright", forbidden
     )
     monkeypatch.setattr("authflowguard.secrets.RuntimeSecrets.resolve", forbidden)
-    client = TestClient(create_app(data_root=tmp_path))
+    client = TestClient(create_app(data_root=tmp_path, worker_backend="thread"))
     # More than ten saved result versions exercises numeric version ordering.
     for _ in range(4):
         response = client.post(f"/api/scans/{record.scan_id}/reanalyse")
@@ -187,7 +187,7 @@ def test_real_scan_runs_both_checks_with_automatic_or_guided_profile(
 ) -> None:
     fixture = create_controlled_app(mode)
     with serve(fixture) as origin:
-        app = create_app(data_root=tmp_path)
+        app = create_app(data_root=tmp_path, worker_backend="thread")
         manager = app.state.scan_manager
         client = TestClient(app)
         profile = profile_for(origin)

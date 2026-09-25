@@ -21,6 +21,7 @@ from authflowguard.bedrock import (
     ObservedControlForModel,
     PageObservationForModel,
 )
+from authflowguard.cancellation import cancellation_checkpoint
 from authflowguard.evaluation.cost_tracking import (
     CostEntry,
     CostLedger,
@@ -136,6 +137,7 @@ class AutomaticBrowserController:
     async def run(self, completion_check: CompletionCheck) -> AutomaticActionResult:
         """Run until the goal is reached or a configured boundary stops work."""
 
+        self._check_cancelled()
         events: list[EvidenceEvent] = []
         self._live_events = events
         traffic: list[TrafficReference] = []
@@ -246,7 +248,6 @@ class AutomaticBrowserController:
                     accounted_cost,
                     step_control_signatures,
                 )
-
             if time.monotonic() >= deadline:
                 events.append(self._stop_event("Automatic action time limit reached."))
                 return self._result(
@@ -301,7 +302,7 @@ class AutomaticBrowserController:
                 )
 
             step_control_signatures.append(current_step_sigs)
-
+            self._check_cancelled()
             reserved_cost = self._action_client.estimate_maximum_cost(observation)
             current_committed = (
                 float(self._cost_ledger.total_budget_committed_usd())
@@ -649,8 +650,10 @@ class AutomaticBrowserController:
         self,
         previous_attempt_failed: bool,
         completed_fill_controls: set[str],
-        timeout_seconds: float,
+        timeout_seconds: float | None = None,
     ) -> tuple[PageObservationForModel, dict[str, str]]:
+        if timeout_seconds is None:
+            timeout_seconds = self._limits.maximum_active_seconds
         controls = await self._wait_or_cancel(
             self._recorder.read_controls(self._page),
             timeout=timeout_seconds,
@@ -699,7 +702,7 @@ class AutomaticBrowserController:
         )
         page_title = self._runtime_secrets.redact_text(raw_title)
         observation = PageObservationForModel(
-            page_url=self._page.url,
+            page_url=self._runtime_secrets.redact_text(self._page.url),
             page_title=page_title,
             objective=(
                 "Complete the authentication flow using only the supplied "
@@ -763,11 +766,21 @@ class AutomaticBrowserController:
     def _remaining_seconds(self, deadline: float) -> float:
         return max(deadline - time.monotonic(), 0.0)
 
+    def _check_cancelled(self) -> None:
+        cancellation_checkpoint()
+        if self._is_cancelled():
+            raise asyncio.CancelledError("Automatic browser execution cancelled")
+
     def _required(self, control: Mapping[str, object], key: str) -> str:
         value = control.get(key)
         if not isinstance(value, str):
             raise ValueError(f"Observed control is missing {key}")
         return value
+
+    def _redact_optional(self, value: object) -> str | None:
+        if value is None:
+            return None
+        return self._runtime_secrets.redact_text(str(value))
 
     def _stop_event(self, summary: str) -> EvidenceEvent:
         return EvidenceEvent(

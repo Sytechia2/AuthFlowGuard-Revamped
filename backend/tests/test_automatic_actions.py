@@ -214,6 +214,53 @@ def test_bedrock_decisions_drive_browser_actions_until_completion() -> None:
     assert KNOWN_PASSWORD not in persisted_output
 
 
+def test_model_observation_redacts_credentials_echoed_by_the_page() -> None:
+    canary = "model-credential-canary-2-2"
+
+    class FakePage:
+        url = f"https://app.example/login?echo={canary}"
+
+        async def title(self) -> str:
+            return f"Welcome {canary}"
+
+    class FakeRecorder:
+        async def read_controls(self, _page: object) -> list[dict[str, object]]:
+            return [
+                {
+                    "observed_control_id": "control-1",
+                    "tag": "input",
+                    "name": f"username-{canary}",
+                    "type": "text",
+                    "placeholder": f"Enter {canary}",
+                    "autocomplete": "username",
+                    "aria_label": canary,
+                    "value_present": True,
+                    "visible": True,
+                }
+            ]
+
+    controller = AutomaticBrowserController(
+        page=FakePage(),  # type: ignore[arg-type]
+        target=TargetScope(
+            target_url="https://app.example/login",
+            permitted_origins=["https://app.example"],
+        ),
+        runtime_secrets=RuntimeSecrets({"username": canary}),
+        scan_id=uuid4(),
+        action_client=FakeActionClient([]),
+        limits=ExecutionLimits(),
+        credential_references=["username"],
+    )
+    controller._recorder = FakeRecorder()  # type: ignore[assignment]
+
+    observation, _ = asyncio.run(controller._observe_page(False, set()))
+
+    serialized = observation.model_dump_json()
+    assert canary not in serialized
+    assert "[redacted]" in serialized
+    assert observation.credential_references == ["username"]
+
+
 def test_failed_action_is_retried_with_a_fresh_decision() -> None:
     invalid_action = BrowserAction(
         action_type=BrowserActionType.CLICK,

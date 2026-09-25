@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+from pathlib import Path
 from urllib.parse import urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from botocore.exceptions import BotoCoreError, ClientError
-from playwright.async_api import Page, async_playwright
+from playwright.async_api import BrowserContext, Page, async_playwright
 
 from authflowguard.action_executor import ActionExecutionResult
 from authflowguard.automatic_actions import (
@@ -23,6 +24,8 @@ from authflowguard.bedrock import (
     BedrockConfiguration,
     BedrockResponseError,
 )
+from authflowguard.cancellation import close_resources
+from authflowguard.evaluation.cost_tracking import CostLedgerStore, UsageSource
 from authflowguard.models import EvidenceKind, ExecutionLimits, TargetScope
 from authflowguard.secrets import RuntimeSecrets
 
@@ -47,6 +50,17 @@ def read_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--maximum-action-retries", type=int, default=2)
     parser.add_argument("--maximum-active-seconds", type=int, default=900)
     parser.add_argument("--maximum-cost-usd", type=float, default=0.25)
+    parser.add_argument(
+        "--run-id",
+        type=UUID,
+        help="Stable run identity used to resume the same durable cost budget.",
+    )
+    parser.add_argument(
+        "--usage-root",
+        type=Path,
+        default=Path(".authflowguard-cli"),
+        help="Directory for durable per-run usage ledgers.",
+    )
     parser.add_argument(
         "--headed",
         action="store_true",
@@ -113,24 +127,31 @@ async def run_live_session(
             DEFAULT_PASSWORD_REFERENCE: password,
         }
     )
+    run_id = arguments.run_id or uuid4()
+    # Reusing a run ID resumes the same durable budget instead of resetting it.
+    ledger_store = CostLedgerStore(
+        arguments.usage_root / str(run_id) / "cost-ledger.ndjson"
+    )
+    cost_ledger = ledger_store.load_into()
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=not arguments.headed)
-        context = await browser.new_context()
-        page = await context.new_page()
-
-        async def completion_check(current_page: Page) -> bool:
-            return await marker_is_visible(
-                current_page,
-                arguments.account_marker_selector,
-            )
-
+        context: BrowserContext | None = None
         try:
+            context = await browser.new_context()
+            page = await context.new_page()
+
+            async def completion_check(current_page: Page) -> bool:
+                return await marker_is_visible(
+                    current_page,
+                    arguments.account_marker_selector,
+                )
+
             controller = AutomaticBrowserController(
                 page=page,
                 target=target,
                 runtime_secrets=runtime_secrets,
-                scan_id=uuid4(),
+                scan_id=run_id,
                 action_client=BedrockActionClient(configuration),
                 limits=limits,
                 credential_references=[
@@ -138,12 +159,15 @@ async def run_live_session(
                     DEFAULT_PASSWORD_REFERENCE,
                 ],
                 progress_callback=print_progress,
+                cost_ledger_store=ledger_store,
+                cost_ledger=cost_ledger,
+                usage_source=UsageSource.LIVE,
+                model_id=arguments.model_id,
             )
             return await controller.run(completion_check)
         finally:
             runtime_secrets.discard_all()
-            await context.close()
-            await browser.close()
+            await close_resources(context, browser)
 
 
 def print_summary(result: AutomaticActionResult) -> None:

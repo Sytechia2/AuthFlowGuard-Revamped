@@ -10,6 +10,7 @@ presented as a measured AWS cost.
 """
 
 import json
+import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
@@ -450,9 +451,17 @@ class CostLedgerStore:
         return self._ledger_path
 
     def append(self, entry: CostEntry) -> None:
+        """Write one entry and force it to disk before a request can proceed.
+
+        A reservation that is lost in a crash would let a restarted scan spend
+        the same budget twice, so each append is flushed and fsynced.
+        """
+
         self._ledger_path.parent.mkdir(parents=True, exist_ok=True)
         with self._ledger_path.open("a", encoding="utf-8") as ledger_file:
             ledger_file.write(entry.model_dump_json() + "\n")
+            ledger_file.flush()
+            os.fsync(ledger_file.fileno())
 
     def append_all(self, entries: Iterable[CostEntry]) -> None:
         for entry in entries:

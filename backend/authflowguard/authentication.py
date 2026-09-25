@@ -28,6 +28,7 @@ from authflowguard.automatic_actions import (
     AutomaticBrowserController,
     ProgressCallback,
 )
+from authflowguard.cancellation import close_resources
 from authflowguard.evaluation.cost_tracking import (
     CostLedger,
     CostLedgerStore,
@@ -424,8 +425,9 @@ async def record_guided_flow(
     recorded_actions = _prepare_guided_actions(actions, target, runtime_secrets)
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
-        context = await _new_context(browser)
+        context: BrowserContext | None = None
         try:
+            context = await _new_context(browser)
             page = await context.new_page()
             events, traffic, _control_signatures = await _execute_steps(
                 page=page,
@@ -440,8 +442,7 @@ async def record_guided_flow(
                 traffic=traffic,
             )
         finally:
-            await context.close()
-            await browser.close()
+            await close_resources(context, browser)
 
 
 async def observe_guidance_page(
@@ -460,8 +461,9 @@ async def observe_guidance_page(
     runtime_secrets = RuntimeSecrets({})
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
-        context = await _new_context(browser)
+        context: BrowserContext | None = None
         try:
+            context = await _new_context(browser)
             page = await context.new_page()
             executor = BrowserActionExecutor(page, target, runtime_secrets, scan_id)
             navigation = BrowserAction(
@@ -474,8 +476,7 @@ async def observe_guidance_page(
             controls = event.redacted_details.get("controls", [])
             return GuidedPageObservation(event=event, controls=controls)
         finally:
-            await context.close()
-            await browser.close()
+            await close_resources(context, browser)
 
 
 async def execute_guided_verified_login_flow(
@@ -502,9 +503,10 @@ async def execute_guided_verified_login_flow(
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
-        authenticated_context = await _new_context(browser)
+        authenticated_context: BrowserContext | None = None
         anonymous_context: BrowserContext | None = None
         try:
+            authenticated_context = await _new_context(browser)
             authenticated_page = await authenticated_context.new_page()
             action_events, action_traffic, control_signatures = await _execute_steps(
                 page=authenticated_page,
@@ -591,10 +593,7 @@ async def execute_guided_verified_login_flow(
                 traffic=traffic,
             )
         finally:
-            if anonymous_context is not None:
-                await anonymous_context.close()
-            await authenticated_context.close()
-            await browser.close()
+            await close_resources(anonymous_context, authenticated_context, browser)
 
 
 async def revalidate_auth_profile(
@@ -616,8 +615,9 @@ async def revalidate_auth_profile(
     if profile.step_control_signatures:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
-            context = await _new_context(browser)
+            context: BrowserContext | None = None
             try:
+                context = await _new_context(browser)
                 page = await context.new_page()
                 executor = BrowserActionExecutor(
                     page,
@@ -677,8 +677,7 @@ async def revalidate_auth_profile(
                         break
                     await executor.execute(action)
             finally:
-                await context.close()
-                await browser.close()
+                await close_resources(context, browser)
         return
 
     navigation = next(
@@ -697,8 +696,9 @@ async def revalidate_auth_profile(
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
-        context = await _new_context(browser)
+        context = None
         try:
+            context = await _new_context(browser)
             page = await context.new_page()
             executor = BrowserActionExecutor(
                 page,
@@ -713,8 +713,7 @@ async def revalidate_auth_profile(
                 for control in current_controls
             }
         finally:
-            await context.close()
-            await browser.close()
+            await close_resources(context, browser)
 
     expected_ids = set(profile.control_signatures)
     current_ids = set(current_signatures)
@@ -770,9 +769,10 @@ async def replay_verified_auth_profile(
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
-        authenticated_context = await _new_context(browser)
+        authenticated_context: BrowserContext | None = None
         anonymous_context: BrowserContext | None = None
         try:
+            authenticated_context = await _new_context(browser)
             authenticated_page = await authenticated_context.new_page()
             action_events, action_traffic, _ = await _execute_steps(
                 page=authenticated_page,
@@ -861,10 +861,7 @@ async def replay_verified_auth_profile(
                 traffic=traffic,
             )
         finally:
-            if anonymous_context is not None:
-                await anonymous_context.close()
-            await authenticated_context.close()
-            await browser.close()
+            await close_resources(anonymous_context, authenticated_context, browser)
 
 
 async def execute_verified_login_flow(
@@ -893,10 +890,11 @@ async def execute_verified_login_flow(
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
-        authenticated_context = await _new_context(browser)
+        authenticated_context: BrowserContext | None = None
         anonymous_context: BrowserContext | None = None
 
         try:
+            authenticated_context = await _new_context(browser)
             authenticated_page = await authenticated_context.new_page()
             authenticated_executor = BrowserActionExecutor(
                 authenticated_page,
@@ -999,10 +997,7 @@ async def execute_verified_login_flow(
                 traffic=traffic,
             )
         finally:
-            if anonymous_context is not None:
-                await anonymous_context.close()
-            await authenticated_context.close()
-            await browser.close()
+            await close_resources(anonymous_context, authenticated_context, browser)
 
 
 async def execute_ai_verified_login_flow(
@@ -1215,7 +1210,4 @@ async def execute_ai_verified_login_flow(
         finally:
             if event_sink is not None:
                 event_sink(events)
-            if anonymous_context is not None:
-                await anonymous_context.close()
-            await authenticated_context.close()
-            await browser.close()
+            await close_resources(anonymous_context, authenticated_context, browser)

@@ -18,6 +18,11 @@ SERVER_MAX_DECISIONS = 100
 SERVER_MAX_SECONDS = 1800
 SERVER_MAX_COST_USD = 1.0
 
+# A whole scan must outlast the longest permitted Bedrock discovery
+# (SERVER_MAX_SECONDS) plus the security checks that follow it.
+DEFAULT_WORKER_TIMEOUT_SECONDS = 3600.0
+DEFAULT_OBSERVATION_TIMEOUT_SECONDS = 120.0
+
 MODEL_DISPLAY_NAMES = {
     "amazon.nova-micro-v1:0": "Amazon Nova Micro",
     "amazon.nova-lite-v1:0": "Amazon Nova Lite",
@@ -62,6 +67,23 @@ def load_server_settings() -> BedrockServerSettings:
         server_max_cost_usd=float(
             os.getenv("AFG_SERVER_MAX_COST_USD", str(SERVER_MAX_COST_USD))
         ),
+    )
+
+
+def worker_timeout_seconds() -> float:
+    """Wall-clock limit after which a scan worker is stopped as hung."""
+    return float(
+        os.getenv("AFG_WORKER_TIMEOUT_SECONDS", str(DEFAULT_WORKER_TIMEOUT_SECONDS))
+    )
+
+
+def observation_timeout_seconds() -> float:
+    """Wall-clock limit for one guidance page observation worker."""
+    return float(
+        os.getenv(
+            "AFG_OBSERVATION_TIMEOUT_SECONDS",
+            str(DEFAULT_OBSERVATION_TIMEOUT_SECONDS),
+        )
     )
 
 
