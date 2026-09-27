@@ -53,7 +53,8 @@
         "known_username": "admin@juice-sh.op",
         "known_password": "admin123",
         "nonexistent_username": "eva-js-chk002-{run}@example.test",
-        "failure_password": "Eva-Wrong-Pass-123!"
+        "failure_password": "Eva-Wrong-Pass-123!",
+        "registration_url": "http://127.0.0.1:3000/#/register"
       },
       "ground_truth": "POST /api/Users with an existing email returns HTTP 400 'email must be unique'; with a fresh email it returns HTTP 201 and creates the account.",
       "rationale": "Registration discloses that an email is already registered.",

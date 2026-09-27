@@ -183,8 +183,15 @@ def execution_input_for(setup: CaseSetup, origin: str) -> ScanExecutionInput:
     second_factor = getattr(setup, "second_factor", None)
     if second_factor:
         secrets["second_factor"] = str(second_factor)
+    # Optional explicit form URLs, for apps whose links do not name the form.
+    form_urls = {
+        field: rebase_url(str(url), origin)
+        for field in ("registration_url", "reset_request_url")
+        if (url := getattr(setup, field, None))
+    }
 
     return ScanExecutionInput(
+        **form_urls,
         runtime_secrets=secrets,
         username_reference="known",
         password_reference="password",
