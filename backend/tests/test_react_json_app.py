@@ -97,6 +97,21 @@ def test_react_json_vulnerable_mode_discloses_unknown_account() -> None:
     assert "No account exists" in response.json()["message"]
 
 
+def test_react_json_secure_mode_answers_every_email_alike() -> None:
+    client = TestClient(create_react_json_app(EvaluationMode.SECURE))
+    known = client.post("/api/auth/start", json={"username": KNOWN_USERNAME})
+    unknown = client.post("/api/auth/start", json={"username": "missing@example.test"})
+    assert unknown.status_code == known.status_code == 200
+    assert unknown.json() == known.json()
+
+    rejected = [
+        client.post("/api/auth/verify", json={"username": username, "code": "wrong"})
+        for username in (KNOWN_USERNAME, "missing@example.test")
+    ]
+    assert [response.status_code for response in rejected] == [401, 401]
+    assert rejected[0].json() == rejected[1].json()
+
+
 def test_automatic_flow_supports_two_step_json_and_bearer_sessions() -> None:
     with run_react_json_server() as origin:
         result = asyncio.run(
