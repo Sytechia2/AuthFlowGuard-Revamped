@@ -143,22 +143,22 @@ const workflowViews: WorkflowView[] = [
   {
     id: "setup",
     label: "Setup",
-    description: "Define the target and test scope",
+    description: "Set target and scope",
   },
   {
     id: "discovery",
     label: "Discovery",
-    description: "Verify authentication flows",
+    description: "Verify login flows",
   },
   {
     id: "testing",
     label: "Testing",
-    description: "Run controlled security checks",
+    description: "Run security checks",
   },
   {
     id: "results",
     label: "Results",
-    description: "Review evidence and coverage",
+    description: "Review evidence",
   },
 ];
 
@@ -203,12 +203,10 @@ function App() {
 
   useEffect(() => {
     let requestIsActive = true;
-
     async function checkBackend() {
       try {
         const response = await fetch("/api/health");
         const body = (await response.json()) as { status?: string };
-
         if (requestIsActive) {
           setConnectionStatus(
             response.ok && body.status === "ok" ? "connected" : "offline",
@@ -220,7 +218,6 @@ function App() {
         }
       }
     }
-
     void checkBackend();
     return () => {
       requestIsActive = false;
@@ -236,7 +233,6 @@ function App() {
         connectionStatus={connectionStatus}
         onSelectView={setActiveView}
       />
-
       <main className="workspace">
         <header className="workspace-header">
           <div>
@@ -1801,9 +1797,9 @@ function ResultsView({ scanId, onScanIdChange }: ResultsViewProps) {
           {scan.usage && !scan.usage.accounting_error && (
             <p>
               AI usage: {scan.usage.input_tokens ?? 0} input /{" "}
-              {scan.usage.output_tokens ?? 0} output tokens; estimated cost ${
-                scan.usage.settled_cost_usd ?? "0.00000000"
-              } of ${scan.usage.limit_usd ?? "unknown"}
+              {scan.usage.output_tokens ?? 0} output tokens; estimated cost $
+              {scan.usage.settled_cost_usd ?? "0.00000000"} of $
+              {scan.usage.limit_usd ?? "unknown"}
               {(scan.usage.uncertain_requests ?? 0) > 0 &&
                 `; ${scan.usage.uncertain_requests} uncertain request(s) remain reserved`}
               .
