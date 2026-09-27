@@ -274,13 +274,13 @@ applications. All members contribute to integration and release checks.
 | EVA-001 | Prepare the server-rendered form/cookie application with secure and vulnerable modes. | **Done** | — | `controlled_app.py`; unit and real-Chromium tests cover redirects, changing single-use CSRF tokens, cookie sessions, isolated anonymous access, account enumeration, registration, reset, throttling, session rotation, and logout invalidation. Explicit prerequisite for AUTH-003. |
 | EVA-002 | Prepare the React/JSON two-step bearer-token application. | **Done** | — | `react_json_app.py` exposes secure/vulnerable modes, JSON start/verify endpoints, localStorage bearer sessions, and an account marker page with a deliberately different SPA layout. |
 | EVA-003 | Independently prepare the withheld-layout evaluation application. | **Not started** | — | Discovery implementers must not tune against it. |
-| EVA-004 | Run each supported discovery flow five times per relevant application. | **Not started** | AUTH-006, EVA-001–EVA-003 | Report automatic and guided completion separately. |
-| EVA-005 | Execute at least 24 required security-check scenarios. | **Not started** | CHK-001–CHK-006 | Four scenario types for each of six checks. |
-| EVA-006 | Test timeouts, Bedrock outages, stale flows, missing features, cancellation, and unsupported authentication. | **Not started** | Integrated application | Every failure needs an explicit outcome. |
-| EVA-007 | Verify analyzers and reports with target, browser, AWS, and network unavailable. | **Not started** | EVD-005, RPT-001, RPT-002 | Enforce offline behavior in automated tests. |
-| EVA-008 | Measure discovery reliability, request volume, model usage, and cost. | **Not started** | Integrated application | Measure consumption before credits. |
+| EVA-004 | Run each supported discovery flow five times per relevant application. | **Done (rule-based); live Bedrock not measured** | AUTH-006, EVA-001–EVA-003 | `evaluation/reports/discovery-reliability.md`: A 5/5 and B 5/5 automatic; C 0/5 automatic, 5/5 guided. Live Bedrock reliability needs AWS credentials. |
+| EVA-005 | Execute at least 24 required security-check scenarios. | **Done** | CHK-001–CHK-006 | 44 cases across A, B, C: 44 pass (`evaluation/reports/formal-cases.md`). Juice Shop: 6 of 6 (`juiceshop.md`). |
+| EVA-006 | Test timeouts, Bedrock outages, stale flows, missing features, cancellation, and unsupported authentication. | **Done** | Integrated application | 7 of 7 conditions evidenced, including worker failure (`KNOWN_LIMITATIONS.md` §7). |
+| EVA-007 | Verify analyzers and reports with target, browser, AWS, and network unavailable. | **Done** | EVD-005, RPT-001, RPT-002 | `offline-verification.md` 6/6; `offline-verification-juiceshop.md` 6/6 with the target stopped. |
+| EVA-008 | Measure discovery reliability, request volume, model usage, and cost. | **Done except live model cost** | Integrated application | `measurements.md`: 28 live scans. AI cost pipeline verified with the labelled double; live token cost needs AWS. |
 | EVA-009 | Complete a clean installation and scan on another team member's computer. | **Not started** | Integrated application | Must not install or start mitmproxy. |
-| REL-001 | Freeze features and document known limitations. | **Not started** | EVA-004–EVA-009 | Do not present incomplete checks as complete. |
+| REL-001 | Freeze features and document known limitations. | **Done** | EVA-004–EVA-009 | `Documentation/KNOWN_LIMITATIONS.md`, updated 28 September. |
 | REL-002 | Complete installation and OWASP coverage documentation. | **Not started** | REL-001 | Include supported and unsupported behavior. |
 | REL-003 | Record the demonstration video. | **Not started** | REL-001, REL-002 | Show setup, discovery/guidance, testing, evidence, and reports. |
 | REL-004 | Perform final review and submit. | **Not started** | REL-003 | Target 28–29 September. |

@@ -1,6 +1,8 @@
 # Known Limitations
 
-**Prepared by Member 5 for REL-001, 23 September 2026.**
+**Prepared by Member 5 for REL-001. Updated 28 September 2026** to reflect the
+merged process worker (RUN-002), Bedrock web discovery (INT-011), and the
+single-page-application work evaluated against OWASP Juice Shop.
 
 This is the single consolidated list of what AuthFlowGuard does not do. It
 exists so that no incomplete behaviour is presented as complete. Every entry
@@ -10,185 +12,136 @@ reported as a security pass.
 
 ## 1. Session-check scope (Task 5.6 decision)
 
-CHK-005 (session fixation) and CHK-006 (logout invalidation) support login
-flows that use a username, a password, and a browser cookie session. The
-following were considered for this release and are **deferred**:
+CHK-005 (session fixation) and CHK-006 (logout invalidation) were first scoped
+to username-and-password logins with cookie sessions. The Juice Shop work
+extended part of that scope; the rest remains deferred.
 
-| Capability | Decision | What happens instead |
+| Capability | Status | What happens |
 | --- | --- | --- |
-| One-time-code login replay | Deferred | The session-check adapter assigns the username to the first fill action and the password to every later fill action, so it cannot replay a flow containing a verification-code step. An unsupported flow shape fails before check evidence is created and fails the scan. |
-| Bearer-token session replay | Deferred | Discovery and login proof support the React/JSON bearer fixture, but these two checks copy and replay cookies only. Tokens in local or session storage are not replayed. |
-| Non-POST logout | Deferred | CHK-006 discovers logout only through an HTML form whose submit produces a POST response. Logout links, client-side navigation, and JavaScript requests using another method are recorded as `execution_error`. |
+| Logout through a menu button or client-side logout | **Supported** (was deferred) | With no logout form, CHK-006 finds a visible control labelled "log out" / "sign out", opening up to three account-menu toggles. A logout that sends no request counts only when the runner recorded it and the page then showed signed-out. A control without such a label is not found and the check reports `execution_error`. |
+| Protected pages that answer signed-out visitors with a server error | **Supported** (new) | A `5xx` counts as a failure only when it differs from the anonymous control; when it matches, it is how that site rejects signed-out requests. |
+| Bearer-token session replay | Deferred | These two checks copy and replay browser cookies only. Tokens held in local or session storage are not replayed. Choose a cookie-protected resource, or the check cannot demonstrate reuse. |
+| One-time-code login replay in session checks | Deferred | The session-check adapter assigns the username to the first fill and the password to later fills, so it cannot replay a login with a verification-code step. It fails before check evidence is created. (Login enumeration, CHK-001, *does* support two-step logins; see §4.) |
 
-None of these can produce a false pass. Unsupported logout discovery yields
-`execution_error`, and an analyser given incomplete evidence yields
-`inconclusive`. Both are distinct from `no_issue_observed` in the reports.
+None of these can produce a false pass: an unsupported shape yields
+`execution_error`, and incomplete evidence yields `inconclusive`.
 
-## 2. AI integration (Updated for INT-011)
+## 2. AI integration
 
-Task 2.6 / INT-011 connects the Bedrock browser controller directly to web scans
-initiated from the React interface via FastAPI. Users can select Bedrock AI discovery,
-configure bounded execution limits, observe real-time decision metrics and token spend,
-obtain verified authentication profiles with multi-page replay support, and run all six
-security checks through the existing reporting pipeline.
+Bedrock discovery is wired into web scans (INT-011). A user can select Bedrock
+discovery in the interface; each scan is bounded by a maximum number of AI
+decisions (default 40, server maximum 100), active time (default 900 s, server
+maximum 1,800 s) and inference cost (default $0.25, server maximum $1.00), and
+every model call is refused if its conservative pre-call estimate exceeds
+$0.001. Usage and cost are recorded per call in a ledger and shown live.
 
-**Live AWS Session Prerequisite:**
-Live model dispatch requires an active AWS profile session with Bedrock Converse
-entitlements:
+**Not measured live.** No member has yet run Bedrock discovery against live
+AWS for the evaluation. The whole AI path was exercised end to end with the
+built-in deterministic model double (`UsageSource.MOCK`, clearly labelled in
+provenance and ledgers): Applications A and C pass all their formal cases in
+Bedrock mode. On Application B the double cannot handle the verification-code
+step, spends its 40-decision cap and stops, and those cases end `blocked`
+(`evaluation/results/bedrock-offline-final`). Real reliability of
+the model's choices, real token counts and real cost therefore remain
+unmeasured. See `evaluation/reports/final-evaluation-report.md` §5 for the
+cost envelope implied by the configured prices and caps.
+
+Live dispatch needs an AWS profile with Bedrock Converse access:
+
 ```bash
 aws sso login --profile authflowguard-dev
-# or: aws login --profile authflowguard-dev
 ```
-Automated tests and the evaluation harness use `DeterministicModelDouble`
-(`UsageSource.MOCK`) unless live calls are explicitly enabled. A user-selected
-Bedrock web scan does not silently switch to the double or rules when AWS is
-unconfigured. Mock usage is labeled in scan provenance and evaluation output.
+
+A Bedrock scan never silently falls back to the double or to rules when AWS is
+unavailable; it requests guidance instead (tested in
+`test_evaluation_failures.py`).
 
 ## 3. Runtime
 
 | Area | Limitation |
 | --- | --- |
-| Background execution | Scans run in a background thread inside the API process, not a separate worker process. A long scan shares a process with the API. |
-| Cancellation | Cancellation handling exists, but stopping every active browser operation is unfinished. |
-| Credential handling | Credentials are held in temporary in-memory objects. Complete cleanup on every exit path, and leak checks in exports, remain open. |
-| Restart recovery | A scan that was running or awaiting guidance is marked failed after a backend restart. |
+| Worker process | Scans run in a separate spawned worker process (RUN-002). A worker that stops responding is stopped at its runtime limit (default one hour) and the scan is marked failed. A worker that reports its result but then fails to exit is stopped after 10 s and its result is kept. |
+| Cancellation | A synchronous Bedrock SDK request cannot be interrupted inside its thread; cancellation takes effect when the request returns or the worker is stopped. |
+| Restart recovery | A scan that was running or awaiting guidance when the backend restarts is marked failed; it is not resumed. |
+| One scan at a time | The server runs one active scan; a second start is refused with `scan_busy`. |
 
 ## 4. Evaluation coverage
 
-- All 44 authored cases were executed: Application A (24), B (4) and C (16).
-  41 passed. The three exceptions are all Application B and are recorded in
-  Section 4.1 as findings, not as harness defects.
-- **Automatic login discovery did not succeed on Application C.** All 16 of its
-  cases completed through the guided fallback instead. The site presents two
-  forms on the sign-in page, which discovery treats as ambiguous. This is the
-  intended purpose of an independently designed target, and it is the clearest
-  generality result the evaluation produced.
-- Application C (`site_app`) has no registration or reset-request features, so
-  those two checks have no cases for it. That is an absence of the feature, not
+- **Formal cases: 44 of 44 pass** across Applications A (24), B (4) and C (16),
+  run `ABC-spa-support` (`evaluation/reports/formal-cases.md`).
+- **OWASP Juice Shop: 6 of 6** correct, with ground truth established
+  independently before the tool was run; 4 of 4 real vulnerabilities detected,
+  no false passes (`evaluation/reports/juiceshop.md`).
+- **Application C always uses the guided fallback.** Its sign-in field is
+  labelled "Member ID" with no username semantics, and the page also carries a
+  search form with its own submit button, so automatic discovery cannot
+  identify the login controls with certainty and hands over rather than
+  guessing. Guided completion succeeded 5 of 5. Discovery was deliberately
+  **not** tuned to Application C after its results were seen: it is the
+  independently designed target, and tuning to it would turn a blind
+  generality measurement into a fitted one.
+- **Juice Shop also used the guided fallback** in every case, for the same kind
+  of reason (no conventional username semantics on its login fields).
+- Application C (`site_app`) has no registration or reset-request feature, so
+  those two checks have no Application C cases. That is an absent feature, not
   a pass.
-- The execution-failure cases inject HTTP 503 responses. Two of them
-  ("stop the target") are realised as every route returning 503 from the
-  trigger onward rather than the process being killed, so the scan observes
-  server errors rather than a refused connection. Both are documented triggers
-  for `execution_error`; the distinction is recorded in each result's `detail`.
-- Live cases run against an ephemeral local port rather than the fixed ports in
-  the case file, so a run cannot fail because a port was busy. The origin
-  actually used is recorded on every result.
+- Execution-failure cases inject HTTP 503 responses. Two of them ("stop the
+  target") are realised as every route returning 503 from the trigger onward
+  rather than a killed process; both are documented triggers for
+  `execution_error`, recorded in each result's `detail`.
+- Live cases run on ephemeral local ports rather than the fixed ports in the
+  case file; the origin used is recorded on every result.
 
-### 4.1 Application B — login enumeration is not supported
+### 4.1 Application B — resolved
 
-Application B uses a two-step JSON login with a verification code and a bearer
-token. Automatic discovery succeeded and login was proven, but CHK-001 could
-not run: the enumeration runner submits failed logins through a native form,
-and Application B has no such form.
+On 22 September, Application B's login-enumeration cases failed (1 of 4). Two
+causes were found and fixed on 27–28 September:
 
-| Case | Expected | Actual | Reading |
-| --- | --- | --- | --- |
-| `B-CHK-001-secure` | `no_issue_observed` | `execution_error` | The product refused to claim a pass it could not evidence. The case expectation was optimistic. |
-| `B-CHK-001-ambiguous` | `inconclusive` | `execution_error` | Derived from the secure run's evidence, so it inherits the same outcome. |
-| `B-CHK-001-vulnerable` | `finding_confirmed` | not reached | Automatic discovery paused, and the guided fallback submits a username, a password and a submit control. It cannot express a two-step flow whose second step is a verification code. |
-| `B-CHK-001-execution-failure` | `execution_error` | `execution_error` | Passed. |
+1. **Tool defect.** An unknown email is rejected at the first step of B's
+   two-step login, so the code field never appears. The runner waited 30 s for
+   that hidden field and discarded the attempt. It now records the early
+   rejection as the response; the known-identifier attempt must still complete
+   every step, so a broken flow stays an error.
+2. **Test-application defect.** B's secure mode answered the first step with
+   `200 "Code sent."` for the known email and `401` for any other, itself an
+   enumeration leak contrary to the case rationale. With the old application,
+   the fixed tool correctly reported `finding_confirmed` on the "secure" mode.
+   The secure mode now answers every email identically. Case expectations were
+   not edited.
 
-**These expectations were not adjusted to make the rows pass.** The correct
-correction is to record CHK-001 as unsupported for Application B. The important
-property holds: an unsupported flow produced `execution_error`, never
-`no_issue_observed`.
+## 5. Single-page applications (from the Juice Shop evaluation)
 
-## 5. Measurements not taken
+| Area | Limitation |
+| --- | --- |
+| Reset forms on JavaScript apps | Compared on the page's reaction to the identifier only; the form is never submitted, since completing it could change a real account's password. An app that leaks only after a full submission reads as secure for CHK-003. |
+| Numeric-only differences | Background JSON responses are compared with numbers normalised, because record ids differ between any two requests. A difference carried only by a number is not detected; differences in keys, text, status or page state are. |
+| Registration side effects | Registration comparison may create the disposable account; use a fresh identifier per run (`{run}` in the case file does this). |
+| Positional control references | Guided replays fill controls by position. If a page's layout changes, a credential could be typed into an unrelated field. Recommended, not implemented: check that a fill's target still matches the recorded control before typing a secret. |
 
-| Tracker | Task | Status | Reason |
-| --- | --- | --- | --- |
-| EVA-004 | Discovery reliability of the **terminal Bedrock agent** | **Blocked** | The agent needs live AWS and is subject to the Nova quota problem in `DEVELOPMENT.md` Section 5. Discovery reliability of the web application's own rule-based discovery **was measured** — see Section 6. |
-| EVA-008 | Model token and cost measurement | **Blocked** | Requires live Bedrock calls. Browser request volume and scan duration **were** measured across 22 live scans (`evaluation/reports/measurements.md`). Cost accounting is implemented and tested (`cost_model`, `cost_tracking`) and will produce a table as soon as real model calls exist. No projected figure is published, because a projection is not a measurement. |
+## 6. Measurements
 
-### EVA-006 failure testing is partial
-
-Task 5.3 names seven failure conditions. **Six are evidenced. One is blocked**
-because the component it tests does not exist yet, so EVA-006 is as complete as
-it can be before RUN-002 lands.
-
-| Condition | State | Evidence or reason |
+| Tracker | Task | Status |
 | --- | --- | --- |
-| Stale saved flows | Covered | `test_enumeration_scans.py` returns a stale profile to `awaiting_guidance` before any check runs |
-| Cancellation | Covered | Cancellation tests in `test_enumeration_scans.py` and `test_app.py` |
-| Missing target features / target errors | Covered | Eleven fault-injection cases across three applications produce `execution_error` from the analyser |
-| Timeouts | Covered | `test_evaluation_failures.py` drives a real scan against a protected resource that stops responding, and asserts the result is never `no_issue_observed`. Model-request timeouts are covered separately by the active-time-limit test |
-| Unsupported authentication | Covered | Application B's two-step JSON login is unsupported by CHK-001 and by the guided fallback; both refuse rather than pass (Section 4.1) |
-| Bedrock outages | Covered | `test_evaluation_failures.py` drives the controller against an unreachable model: it escalates to guidance, never reports success, and does not leak the service error into the operator-facing reason |
-| Worker failure | **Blocked** | Scans run in a background thread; the separate worker process (RUN-002) does not exist yet |
+| EVA-004 | Discovery reliability, rule-based | **Measured**: A 5/5 automatic, B 5/5 automatic, C 0/5 automatic and 5/5 guided (`discovery-reliability.md`) |
+| EVA-004 | Discovery reliability, live Bedrock | **Not measured**: needs AWS credentials and billable calls |
+| EVA-006 | Failure situations | **7 of 7 covered** (§7) |
+| EVA-007 | Offline reanalysis and reports | **Measured**: 6 of 6 on Application A and 6 of 6 on a Juice Shop client-form scan, target stopped |
+| EVA-008 | Browser requests and durations | **Measured** across 28 live scans (`measurements.md`) |
+| EVA-008 | Model tokens and cost | **Not measured live**; pipeline verified with the labelled double, cost envelope derived from configured prices and caps |
 
-The task's completion criterion — that no failed or unsupported test is reported
-as a security pass — holds for every condition that was exercised. Twenty-two of
-the forty-four executed cases exist specifically to demonstrate it: eleven
-degrade saved evidence and require `inconclusive`, and eleven inject server
-errors during a real scan and require `execution_error`. Neither may be reported
-as `no_issue_observed`.
+## 7. Failure testing (EVA-006)
 
-These are dependencies on unfinished integration work, not gaps in the
-evaluation method. Scan duration *was* recorded for all 24 executed cases and is
-in `evaluation/reports/formal-cases.csv`.
+| Condition | Evidence |
+| --- | --- |
+| Stale saved flows | `test_enumeration_scans.py` returns a stale profile to `awaiting_guidance` before any check runs |
+| Cancellation | `test_enumeration_scans.py`, `test_app.py`, `test_process_worker.py` |
+| Missing target features / target errors | Eleven fault-injection cases across three applications produce `execution_error` |
+| Timeouts | `test_evaluation_failures.py` drives a real scan against a protected resource that stops responding and asserts it is never `no_issue_observed` |
+| Unsupported authentication | Unsupported flow shapes refuse rather than pass (§1); Application C and Juice Shop hand over to guided discovery |
+| Bedrock outages | `test_evaluation_failures.py`: an unreachable model escalates to guidance, never reports success, and does not leak the service error |
+| Worker failure | `test_process_worker.py`: abrupt exit, unresponsive worker, startup timeout, runtime limit and a worker that lingers after its result all end in a safe, explicit state |
 
-## 7. Test suite
-
-`backend/tests/test_react_json_app.py::test_automatic_flow_supports_two_step_json_and_bearer_sessions`
-fails when the full suite runs, and passes when run alone. The failure is
-`Page.goto: net::ERR_ABORTED` against the fixture's ephemeral port, and is
-deterministic across repeated full-suite runs.
-
-This is a pre-existing fixture-isolation defect, not a regression. It was
-invisible until `test_controlled_app.py` began collecting. That module imports
-`httpx2`, which is correct for Starlette 1.6, but `pyproject.toml` lists `httpx`
-in its dev extras, so a environment built from `pyproject.toml` could not
-collect it. **The dependency should be corrected to `httpx2`.**
-
-Current state: **213 passed, 1 failed**.
-
-## 6. Discovery reliability, measured
-
-EVA-004 was **not** blocked. Login discovery in a scan started from the web
-interface is rule-based — `scan_manager.py` contains no Bedrock reference — so
-it can be measured without AWS. Each application's login flow was attempted
-five times against a freshly started fixture.
-
-| Application | Automatic | Guided | Failed | Meets the 4/5 automatic target |
-| --- | --- | --- | --- | --- |
-| A — forms and cookies | 5/5 | 0/5 | 0/5 | Yes |
-| B — React, JSON, bearer token | 2/5 | 0/5 | 3/5 | **No** |
-| C — independent withheld layout | 0/5 | 5/5 | 0/5 | No |
-
-Three findings follow from this table.
-
-**Application B's automatic discovery is non-deterministic.** It succeeded on
-two attempts out of five, and attempt durations ranged from 0.89 s to 94.49 s
-against an identical fixture. This is very likely the same defect as the
-intermittent `test_react_json_app` full-suite failure in Section 7: both involve
-the React/JSON target and both are order- or timing-dependent. **This is the
-most serious reliability finding in the evaluation** and should be assigned
-before any reliability claim is published.
-
-**Application C never completes automatically, and always completes guided.**
-Its sign-in page carries two forms, which discovery treats as ambiguous. As the
-independently designed target, it is doing exactly the job it was built for.
-
-**Application A meets the target** at 5 of 5, with durations between 4.71 s and
-4.80 s.
-
-What remains unmeasured is the reliability of the *terminal Bedrock agent*, for
-the reason in Section 5.
-
-Keep two distinctions apart, because they are easy to conflate:
-
-| | What decides the next step | Measured? |
-| --- | --- | --- |
-| **Automatic** discovery in a web scan | Programmed rules. **No AI.** | Yes — the table above |
-| **Guided** fallback in a web scan | A person identifies the fields | Yes — the table above |
-| **Terminal Bedrock agent** | Amazon Bedrock chooses each action | No — needs live AWS |
-
-"Automatic" therefore does **not** mean "AI". Every figure in the table above
-was produced without a single model call. The Bedrock agent is a separate
-command-line tool that is not wired into scans at all, which is why its
-reliability is the only part left unmeasured.
-
-## Bedrock web integration review (23 September 2026)
-
-Offline integration tests do not establish live AWS model access, quota, or discovery reliability. Active synchronous SDK requests have bounded network timeouts, but cancellation cannot terminate the underlying thread; worker-process termination remains RUN-002.
+Twenty-two of the forty-four formal cases exist specifically to show that a
+failed or incomplete test is never a pass: eleven degrade saved evidence and
+require `inconclusive`, and eleven inject server errors and require
+`execution_error`. All twenty-two pass.
