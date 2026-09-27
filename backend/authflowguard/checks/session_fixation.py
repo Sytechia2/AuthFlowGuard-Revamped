@@ -27,6 +27,7 @@ from authflowguard.models import (
     SecurityPolicy,
     TestRunEvidence,
 )
+from authflowguard.page_settling import goto_and_settle
 from authflowguard.secrets import RuntimeSecrets
 
 OWASP_REFERENCE = "WSTG-SESS-03"
@@ -67,9 +68,7 @@ async def run_session_fixation_check(
                 context = await browser.new_context(service_workers="block")
                 try:
                     page = await context.new_page()
-                    await page.goto(
-                        str(profile.target.target_url), wait_until="domcontentloaded"
-                    )
+                    await goto_and_settle(page, str(profile.target.target_url))
                     pre_login_cookies = await context.cookies()
                     observations["pre_login_session"] = cookie_snapshot(
                         pre_login_cookies

@@ -198,6 +198,7 @@ def test_stale_worker_generation_cannot_finalize_newer_execution(
     )
     assert record.state is ScanState.FAILED
     assert record.error_code == "scan_execution_failed"
+    assert record.error == "Scan execution failed (RuntimeError)"
 
 
 @pytest.mark.parametrize(

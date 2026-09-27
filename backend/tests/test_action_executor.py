@@ -1,6 +1,7 @@
 """Browser-level tests for validated structured action execution."""
 
 import asyncio
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,12 +29,26 @@ LIVE_USERNAME = "developer@example.test"
 
 class ActionPageHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        if self.path.startswith("/api/"):
+            self._background_response()
+            return
         encoded_page = self._page_for_path().encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded_page)))
         self.end_headers()
         self.wfile.write(encoded_page)
+
+    def _background_response(self) -> None:
+        # Slow enough that an action returning early would miss the result.
+        time.sleep(0.4)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "2")
+        if self.path.startswith("/api/login"):
+            self.send_header("Set-Cookie", "session=client-rendered; Path=/")
+        self.end_headers()
+        self.wfile.write(b"{}")
 
     def _page_for_path(self) -> str:
         if self.path.startswith("/controls"):
@@ -53,6 +68,26 @@ class ActionPageHandler(BaseHTTPRequestHandler):
                         <option value="developer">Developer</option>
                         <option value="administrator">Administrator</option>
                     </select>
+                </body>
+            </html>"""
+
+        if self.path.startswith("/spa"):
+            # Like a hash-routed single-page app: the form exists only after
+            # the app has fetched its configuration, and signing in is a
+            # background request whose response sets the session cookie.
+            return """<!doctype html>
+            <html>
+                <head><title>Client Rendered</title></head>
+                <body>
+                    <script>
+                        fetch('/api/config').then(() => {
+                            document.body.innerHTML = `
+                                <button id="sign-in" type="button"
+                                        onclick="fetch('/api/login')">
+                                    Sign in
+                                </button>`;
+                        });
+                    </script>
                 </body>
             </html>"""
 
@@ -349,3 +384,40 @@ def test_snapshot_remains_consistent_while_page_replaces_its_controls() -> None:
                 await browser.close()
 
     asyncio.run(snapshot_changing_page())
+
+
+async def sign_in_to_client_rendered_page(origin: str) -> None:
+    route = f"{origin}/spa#/login"
+    target = TargetScope(target_url=route, permitted_origins=[origin])
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
+        executor = BrowserActionExecutor(page, target, RuntimeSecrets({}), uuid4())
+        try:
+            await executor.execute(
+                BrowserAction(
+                    action_type=BrowserActionType.NAVIGATE,
+                    url=route,
+                    description="Open the client-rendered sign-in route",
+                )
+            )
+            assert await page.locator("#sign-in").count() == 1
+
+            await executor.execute(
+                BrowserAction(
+                    action_type=BrowserActionType.CLICK,
+                    observed_control_id="control-1",
+                    description="Sign in",
+                )
+            )
+            cookie_names = [cookie["name"] for cookie in await context.cookies()]
+            assert cookie_names == ["session"]
+        finally:
+            await browser.close()
+
+
+def test_executor_waits_for_client_rendering_and_background_sign_in() -> None:
+    with run_action_server() as origin:
+        asyncio.run(sign_in_to_client_rendered_page(origin))

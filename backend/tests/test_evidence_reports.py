@@ -5,7 +5,11 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from authflowguard import models
-from authflowguard.evidence import EvidenceStore, transient_secret_redaction
+from authflowguard.evidence import (
+    EvidenceStore,
+    redact_persisted_data,
+    transient_secret_redaction,
+)
 from authflowguard.models import (
     CheckId,
     CheckOutcome,
@@ -154,3 +158,17 @@ def test_offline_reports_are_written_from_saved_models(tmp_path: Path) -> None:
     assert report["metadata"]["scan_id"] == str(scan_id)
     assert report["evidence"][0]["check_id"] == CheckId.LOGIN_ENUMERATION.value
     assert "WSTG-IDNT-04" in Path(html_path).read_text()
+
+
+def test_persisted_urls_keep_hash_routes_but_drop_token_fragments() -> None:
+    redacted = redact_persisted_data(
+        {
+            "url": "http://127.0.0.1:3000/?next=query-secret#/login",
+            "protected-url": "https://app.example/callback#access_token=secret",
+        }
+    )
+
+    assert redacted == {
+        "url": "http://127.0.0.1:3000/#/login",
+        "protected-url": "https://app.example/callback",
+    }

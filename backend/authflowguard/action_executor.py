@@ -31,6 +31,7 @@ from authflowguard.models import (
     TargetScope,
     TrafficReference,
 )
+from authflowguard.page_settling import background_requests_settled, goto_and_settle
 from authflowguard.scope import url_is_in_scope, url_without_query_or_fragment
 from authflowguard.secrets import RuntimeSecrets
 
@@ -395,11 +396,12 @@ class BrowserActionExecutor:
         if not url_is_in_scope(destination, self._target):
             raise ValueError("Navigation destination is outside permitted_origins")
 
-        await self._page.goto(destination, wait_until="domcontentloaded")
+        await goto_and_settle(self._page, destination)
 
     async def _click(self, action: BrowserAction) -> None:
         control = await self._find_control(action.observed_control_id)
-        await control.click()
+        async with background_requests_settled(self._page):
+            await control.click()
         try:
             await self._page.wait_for_load_state(
                 "domcontentloaded",
@@ -426,12 +428,13 @@ class BrowserActionExecutor:
         if action.key is None:
             raise ValueError("A press_key action requires key")
 
-        if action.observed_control_id is None:
-            await self._page.keyboard.press(action.key)
-            return
+        async with background_requests_settled(self._page):
+            if action.observed_control_id is None:
+                await self._page.keyboard.press(action.key)
+                return
 
-        control = await self._find_control(action.observed_control_id)
-        await control.press(action.key)
+            control = await self._find_control(action.observed_control_id)
+            await control.press(action.key)
 
     async def _wait(self, action: BrowserAction) -> None:
         if action.wait_for is None:

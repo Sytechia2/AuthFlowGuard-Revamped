@@ -17,7 +17,7 @@ from authflowguard.models import (
     EvidenceEvent,
     TestRunEvidence,
 )
-from authflowguard.scope import url_without_query_or_fragment
+from authflowguard.scope import url_without_query_keeping_route
 
 _SENSITIVE_KEY_NAMES = {
     "authorization",
@@ -106,7 +106,7 @@ def _redact_value(
         or key_name.endswith("-origins")
     )
     if url_like_key:
-        return url_without_query_or_fragment(redacted)
+        return url_without_query_keeping_route(redacted)
     return redacted
 
 

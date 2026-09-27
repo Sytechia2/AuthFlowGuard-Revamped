@@ -48,7 +48,10 @@ from authflowguard.models import (
     TrafficReference,
 )
 from authflowguard.playwright_worker import PlaywrightWorker, SafeControlDescription
-from authflowguard.scope import url_is_in_scope, url_without_query_or_fragment
+from authflowguard.scope import (
+    url_is_in_scope,
+    url_without_query_keeping_route,
+)
 from authflowguard.secrets import RuntimeSecrets
 
 
@@ -125,7 +128,7 @@ def _sanitize_recorded_action(
 
     values = action.model_dump()
     if action.url is not None:
-        values["url"] = url_without_query_or_fragment(str(action.url))
+        values["url"] = url_without_query_keeping_route(str(action.url))
     values["description"] = runtime_secrets.redact_text(action.description)
     return BrowserAction.model_validate(values)
 

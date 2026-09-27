@@ -1718,7 +1718,9 @@ class ScanManager:
                 error_code = "scan_cancelled"
             else:
                 next_state = ScanState.FAILED
-                public_error = "Scan execution failed"
+                # The exception message may contain secrets, but its type is
+                # safe and is what makes a failed scan diagnosable.
+                public_error = f"Scan execution failed ({type(error).__name__})"
                 error_code = "scan_execution_failed"
             self._discard_pending_execution(record)
             record.active_check = None

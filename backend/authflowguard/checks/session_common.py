@@ -18,6 +18,7 @@ from authflowguard.models import (
     EvidenceEvent,
     EvidenceKind,
 )
+from authflowguard.page_settling import goto_and_settle
 from authflowguard.secrets import RuntimeSecrets
 
 
@@ -100,7 +101,7 @@ def cookie_snapshot(cookies: list[Any]) -> dict[str, Any]:
 async def protected_state(
     page: Page, resource: str, marker_selector: str
 ) -> dict[str, Any]:
-    response = await page.goto(resource, wait_until="domcontentloaded")
+    response = await goto_and_settle(page, resource)
     status = response.status if response is not None else None
     marker_present = await page.locator(marker_selector).count() > 0
     return {

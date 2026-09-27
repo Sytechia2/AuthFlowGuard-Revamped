@@ -13,6 +13,7 @@ import uvicorn
 from authflowguard.authentication import (
     StaleAuthProfileError,
     VerifiedLoginExecution,
+    _prepare_guided_actions,
     execute_guided_verified_login_flow,
     execute_verified_login_flow,
     record_guided_flow,
@@ -280,3 +281,30 @@ def test_saved_profile_revalidation_rejects_changed_control_metadata() -> None:
                     scan_id=uuid4(),
                 )
             )
+
+
+def test_guided_navigation_keeps_hash_routes_but_not_token_fragments() -> None:
+    origin = "http://127.0.0.1:3000"
+    target = TargetScope(target_url=f"{origin}/#/login", permitted_origins=[origin])
+    destinations = [
+        f"{origin}/?session=do-not-save#/login",
+        f"{origin}/#access_token=do-not-save",
+    ]
+
+    actions = _prepare_guided_actions(
+        [
+            BrowserAction(
+                action_type=BrowserActionType.NAVIGATE,
+                url=destination,
+                description="Open the sign-in route",
+            )
+            for destination in destinations
+        ],
+        target,
+        RuntimeSecrets({}),
+    )
+
+    assert [str(action.url) for action in actions] == [
+        f"{origin}/#/login",
+        f"{origin}/",
+    ]
