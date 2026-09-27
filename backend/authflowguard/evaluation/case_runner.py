@@ -12,6 +12,7 @@ be busy; the origin actually used is recorded on every result.
 
 import asyncio
 import json
+import os
 import socket
 import time
 from collections.abc import Callable, Iterator
@@ -22,8 +23,10 @@ from enum import StrEnum
 from pathlib import Path
 from threading import Thread
 from typing import Any
+from urllib.error import URLError
 from urllib.parse import urlparse, urlunparse
-from uuid import UUID
+from urllib.request import urlopen
+from uuid import UUID, uuid4
 
 import uvicorn
 from fastapi import FastAPI
@@ -223,6 +226,71 @@ def scan_request_for(
 USERNAME_HINTS = ("username", "email", "user", "login", "member", "identifier")
 
 
+SUBMIT_HINTS = ("log in", "login", "sign in", "signin", "submit", "continue", "open my")
+
+# Buttons that commonly sit on a login page but never submit it: banners,
+# navigation, search, social sign-in, and password-visibility toggles.
+NON_SUBMIT_HINTS = (
+    "close",
+    "dismiss",
+    "cancel",
+    "cookie",
+    "search",
+    "menu",
+    "sidenav",
+    "language",
+    "basket",
+    "cart",
+    "google",
+    "display the password",
+    "show",
+    "back to",
+)
+
+
+def _control_label(control: dict[str, Any]) -> str:
+    parts = (control.get("aria_label"), control.get("text"), control.get("name"))
+    return " ".join(str(part) for part in parts if part).lower()
+
+
+def choose_submit_control(controls: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Pick the button that submits the login form.
+
+    Taking the first button on the page is wrong on any real application:
+    Juice Shop's first button is a cookie-banner link. A type="submit" button
+    with a login-like label is preferred, then any submit button that is not
+    obviously a banner, navigation or search control.
+    """
+
+    buttons = [
+        c
+        for c in controls
+        if c.get("visible", True)
+        and (
+            str(c.get("tag")) == "button" or str(c.get("type")) in {"submit", "button"}
+        )
+    ]
+
+    def is_submit(control: dict[str, Any]) -> bool:
+        return str(control.get("type")) == "submit"
+
+    def looks_like_login(control: dict[str, Any]) -> bool:
+        return any(hint in _control_label(control) for hint in SUBMIT_HINTS)
+
+    def looks_unrelated(control: dict[str, Any]) -> bool:
+        return any(hint in _control_label(control) for hint in NON_SUBMIT_HINTS)
+
+    ranked = (
+        [c for c in buttons if is_submit(c) and looks_like_login(c)],
+        [c for c in buttons if is_submit(c) and not looks_unrelated(c)],
+        [c for c in buttons if looks_like_login(c) and not looks_unrelated(c)],
+    )
+    for tier in ranked:
+        if tier:
+            return tier[0]
+    return None
+
+
 def choose_guided_controls(
     controls: list[dict[str, Any]],
 ) -> tuple[str, str, str] | None:
@@ -233,15 +301,7 @@ def choose_guided_controls(
     """
 
     password = next((c for c in controls if str(c.get("type")) == "password"), None)
-    submit = next(
-        (
-            c
-            for c in controls
-            if str(c.get("tag")) == "button"
-            or str(c.get("type")) in {"submit", "button"}
-        ),
-        None,
-    )
+    submit = choose_submit_control(controls)
     username = next(
         (
             c
@@ -366,6 +426,7 @@ def run_live_case(
     if case.setup is None:
         result.detail = "The case has no setup block, so it cannot be run live."
         return result
+    case = case.model_copy(update={"setup": with_run_token(case.setup)})
 
     if (
         discovery_mode == "bedrock"
@@ -467,6 +528,86 @@ def run_live_case(
     return result
 
 
+# Applications that are not started by this module. They run as their own
+# process (Juice Shop runs in Docker), so every case against them shares one
+# live instance and its state. Each entry names an environment variable that
+# overrides the default origin.
+EXTERNAL_TARGETS: dict[str, tuple[str, str]] = {
+    "J": ("AUTHFLOWGUARD_JUICESHOP_URL", "http://127.0.0.1:3000"),
+}
+
+EXTERNAL_START_HINTS: dict[str, str] = {
+    "J": (
+        "docker run -d --name authflowguard-juiceshop -e NODE_ENV=quiet "
+        "-p 127.0.0.1:3000:3000 bkimminich/juice-shop:v20.2.0"
+    ),
+}
+
+# Substituted for "{run}" in case setup values. External targets keep state
+# between runs, so an identifier that a check registers must be new each run
+# or the second run of the same case stops meeting its expectation.
+RUN_TOKEN = uuid4().hex[:8]
+
+
+class TargetUnavailableError(RuntimeError):
+    """Raised when an external evaluation target is not answering."""
+
+
+def external_origin(application: str) -> str | None:
+    """Return the origin of an external target, or None for a local fixture."""
+
+    entry = EXTERNAL_TARGETS.get(application)
+    if entry is None:
+        return None
+    variable, default = entry
+    return os.environ.get(variable, default).rstrip("/")
+
+
+def ensure_reachable(application: str, origin: str) -> None:
+    """Fail with a start command rather than a confusing browser error."""
+
+    try:
+        with urlopen(f"{origin}/", timeout=10) as response:  # noqa: S310 - local
+            if response.status < 500:
+                return
+            reason = f"HTTP {response.status}"
+    except (URLError, OSError) as error:
+        reason = str(error)
+    hint = EXTERNAL_START_HINTS.get(application, "start the application")
+    raise TargetUnavailableError(
+        f"Application {application} is not reachable at {origin} ({reason}). "
+        f"Start it with: {hint}"
+    )
+
+
+@contextmanager
+def target_origin(case: FormalCase) -> Iterator[str]:
+    """Yield the origin a case runs against.
+
+    Local fixtures are started fresh for the case and stopped afterwards. An
+    external target is only checked for reachability; it is never started or
+    stopped here, and its state carries over between cases.
+    """
+
+    origin = external_origin(case.application)
+    if origin is None:
+        with serve(fixture_for(case.application, case.fixture_mode)) as served:
+            yield served
+        return
+    ensure_reachable(case.application, origin)
+    yield origin
+
+
+def with_run_token(setup: CaseSetup) -> CaseSetup:
+    """Replace "{run}" in any setup value with this run's token."""
+
+    data = setup.model_dump()
+    for key, value in data.items():
+        if isinstance(value, str) and "{run}" in value:
+            data[key] = value.replace("{run}", RUN_TOKEN)
+    return CaseSetup.model_validate(data)
+
+
 def fixture_for(application: str, fixture_mode: str) -> FastAPI:
     """Build the evaluation target an application/mode pair names."""
 
@@ -499,7 +640,9 @@ def run_live_group(
 ) -> list[CaseResult]:
     """Run each live case against its own freshly started fixture.
 
-    Cases must not share a fixture instance. The evaluation targets hold
+    External targets are the exception: they are shared, so their cases rely
+    on "{run}" identifiers rather than a fresh instance. Local fixtures must
+    not be shared. The evaluation targets hold
     state in memory that a browser restart does not clear: a created
     registration account, and an account lockout. Login enumeration
     deliberately fails logins for the known account, which locks that account
@@ -510,7 +653,7 @@ def run_live_group(
     for case in cases:
         case_root = data_root / case.case_id
         case_root.mkdir(parents=True, exist_ok=True)
-        with serve(fixture_for(case.application, case.fixture_mode)) as origin:
+        with target_origin(case) as origin:
             results.append(
                 run_live_case(
                     case,
@@ -966,7 +1109,10 @@ def main(argv: list[str] | None = None) -> int:
 
     live = [c for c in selected if c.execution_mode is ExecutionMode.LIVE_SCAN]
     if not arguments.reuse_scan_data:
-        for fixture_mode in ("secure", "vulnerable"):
+        present_modes = {case.fixture_mode for case in live}
+        ordered_modes = [m for m in ("secure", "vulnerable") if m in present_modes]
+        ordered_modes += sorted(present_modes - {"secure", "vulnerable"})
+        for fixture_mode in ordered_modes:
             group = [case for case in live if case.fixture_mode == fixture_mode]
             print(f"Live, {fixture_mode} ({len(group)} cases)...", flush=True)
             for result in run_live_group(
