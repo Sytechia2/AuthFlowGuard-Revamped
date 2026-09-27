@@ -293,12 +293,24 @@ def execute_worker_command(
         block=True,
         timeout=5,
     )
-    try:
+    published = False
+
+    async def execute_and_publish() -> None:
+        nonlocal published
         if command.operation is WorkerOperation.OBSERVE_GUIDANCE:
-            message = asyncio.run(_execute_observation_command(command, cancel_event))
+            result = await _execute_observation_command(command, cancel_event)
         else:
-            message = asyncio.run(_execute_scan_command(command, cancel_event, output))
+            result = await _execute_scan_command(command, cancel_event, output)
+        # Publish before the event loop shuts down, so a hang in loop or
+        # interpreter teardown cannot hide a result that is already final.
+        output.put(result.model_dump(mode="json"), block=True, timeout=5)
+        published = True
+
+    try:
+        asyncio.run(execute_and_publish())
     except BaseException:
+        if published:
+            return
         message = WorkerMessage(
             correlation_id=command.correlation_id,
             scan_id=command.scan_id,
@@ -309,4 +321,4 @@ def execute_worker_command(
             error="The isolated scan worker failed",
             cleanup_confirmed=True,
         )
-    output.put(message.model_dump(mode="json"), block=True, timeout=5)
+        output.put(message.model_dump(mode="json"), block=True, timeout=5)
