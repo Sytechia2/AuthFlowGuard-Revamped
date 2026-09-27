@@ -1,2 +1,4 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Auto detect text files and perform LF normalization.
+# Check out with LF on every platform too: the formatters (Prettier, ruff)
+# expect LF, and CRLF working copies on Windows fail `npm run check`.
+* text=auto eol=lf
