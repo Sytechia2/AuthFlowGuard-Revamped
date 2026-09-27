@@ -1000,6 +1000,7 @@ def write_results(
     run_directory: Path,
     run_id: str,
     discovery_mode: str = "rules",
+    case_file: Path = Path("evaluation/cases/formal_cases.json"),
 ) -> Path:
     """Write one run's results beside, never into, the authored case file."""
 
@@ -1016,7 +1017,7 @@ def write_results(
                 "run_id": run_id,
                 "discovery_mode": discovery_mode,
                 "generated_at": datetime.now(UTC).isoformat(),
-                "case_file": "evaluation/cases/formal_cases.json",
+                "case_file": case_file.as_posix(),
                 "results": [result.as_dict() for result in results],
             },
             indent=2,
@@ -1143,6 +1144,7 @@ def main(argv: list[str] | None = None) -> int:
         run_directory,
         arguments.run_id,
         discovery_mode=arguments.discovery_mode,
+        case_file=arguments.cases,
     )
     print(f"\nSummary: {summarise(results)}")
     print(f"Results written to {destination}")
