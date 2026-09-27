@@ -10,8 +10,9 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from authflowguard.action_executor import BrowserActionExecutor
+from authflowguard.action_executor import CONTROL_SELECTOR, BrowserActionExecutor
 from authflowguard.models import (
     AuthFeature,
     AuthProfile,
@@ -34,6 +35,7 @@ from authflowguard.secrets import RuntimeSecrets
 OWASP_REFERENCE = "WSTG-IDNT-04"
 ANALYSER_VERSION = "1.0"
 PAIR_COUNT = 3
+STEP_APPEAR_TIMEOUT_MS = 2000
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,21 @@ def _fill_references(
     return username_reference, password_reference
 
 
+async def _step_target_available(page: Page, step: BrowserAction) -> bool:
+    """Whether the control a recorded step acts on is present and visible."""
+
+    if step.observed_control_id is None:
+        return True
+    number = int(step.observed_control_id.removeprefix("control-"))
+    control = page.locator(CONTROL_SELECTOR).nth(number - 1)
+    try:
+        # Allow a client-rendered step a moment to appear.
+        await control.wait_for(state="visible", timeout=STEP_APPEAR_TIMEOUT_MS)
+    except PlaywrightTimeoutError:
+        return False
+    return True
+
+
 async def _run_failed_login_attempt(
     *,
     browser: Browser,
@@ -147,10 +164,21 @@ async def _run_failed_login_attempt(
             scan_id,
         )
         action_events: list[EvidenceEvent] = []
+        steps_completed = 0
         for step in steps:
             if cancel_requested():
                 raise asyncio.CancelledError("Login enumeration cancelled")
+            if steps_completed and not await _step_target_available(page, step):
+                # A multi-step login can reject an unknown identifier before
+                # the next step's control appears. That early end is the
+                # application's observable response, so it is recorded. The
+                # known-identifier attempt must complete every step, so a
+                # broken flow remains an error rather than a comparison.
+                if label == "nonexistent":
+                    break
+                raise ValueError("The known-identifier attempt could not continue")
             result = await executor.execute(_new_attempt_action(step))
+            steps_completed += 1
             action_events.extend(_event_for_check(event) for event in result.events)
             events.extend(_event_for_check(event) for event in result.events)
 
@@ -166,12 +194,15 @@ async def _run_failed_login_attempt(
                 "redacted_details": {
                     **page_evidence.redacted_details,
                     "comparison_label": label,
-                    "signature": await _page_signature(
-                        page,
-                        page_evidence,
-                        action_events,
-                        identifier,
-                    ),
+                    "signature": {
+                        **await _page_signature(
+                            page,
+                            page_evidence,
+                            action_events,
+                            identifier,
+                        ),
+                        "steps_completed": steps_completed,
+                    },
                 },
             }
         )
