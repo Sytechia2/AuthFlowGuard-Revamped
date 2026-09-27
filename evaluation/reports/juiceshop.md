@@ -74,7 +74,7 @@ fallback.
 
 ### Repeatability
 
-The six cases were run seven times in full. Six runs were 6 of 6. In the
+The six cases were run nine times in full. Eight runs were 6 of 6. In the
 other, J-CHK-004's scan finished in 15 s with the correct
 `finding_confirmed` and persisted it, but the runner's wait on the worker
 raised `TimeoutError` afterwards, so the harness recorded the case as blocked
@@ -233,7 +233,7 @@ normalization above.
 
 ## Regression
 
-Full backend suite: 315 passed; `ruff`, `ruff format --check` and `mypy` clean.
+Full backend suite: 316 passed; `ruff`, `ruff format --check` and `mypy` clean.
 Every change has tests that fail on the old code, including tests for the
 cases that must stay `inconclusive` or `execution_error`, and a secure
 single-page app that must come back clean.
@@ -243,9 +243,9 @@ of `formal-cases.md`), compared with the previously submitted results:
 
 | Application | Previous `formal-cases.md` (22 Sep) | This branch | Average live scan, same machine (`main` → branch) |
 | --- | --- | --- | --- |
-| A | 24 / 24 pass | 24 / 24 pass | 5.1 s → 5.6 s |
+| A | 24 / 24 pass | 24 / 24 pass | 5.1 s → 5.7 s |
 | B | 1 pass, 2 fail, 1 blocked | **4 / 4 pass** | 98 s → 11 s |
-| C | 16 / 16 pass | 16 / 16 pass | 8.9 s → 8.7 s |
+| C | 16 / 16 pass | 16 / 16 pass | 8.9 s → 9.2 s |
 | **Total** | **41 / 44** | **44 / 44** | |
 
 No verdict on A or C changed. Application B's change is described in the next
