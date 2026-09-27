@@ -427,6 +427,7 @@ def run_live_case(
         result.detail = "The case has no setup block, so it cannot be run live."
         return result
     case = case.model_copy(update={"setup": with_run_token(case.setup)})
+    assert case.setup is not None  # re-narrow after the copy
 
     if (
         discovery_mode == "bedrock"
