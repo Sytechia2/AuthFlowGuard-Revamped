@@ -509,8 +509,17 @@ def run_live_case(
         try:
             record.future.result(timeout=SCAN_TIMEOUT_SECONDS)
         except Exception as error:  # noqa: BLE001 - recorded, never raised
-            result.detail = f"{guidance_note} Guided scan raised: {error!r}"
-            return result
+            result.duration_seconds = time.monotonic() - started
+            # The wait can fail after the scan has already finished and
+            # persisted its result; the persisted state is authoritative.
+            # The failed wait stays visible in the detail.
+            if record.state is not ScanState.COMPLETED:
+                result.detail = f"{guidance_note} Guided scan raised: {error!r}"
+                return result
+            guidance_note = (
+                f"{guidance_note} (Waiting for the worker raised {error!r} "
+                "after the scan had completed.)"
+            )
         result.duration_seconds = time.monotonic() - started
 
     snapshot = client.get(f"/api/scans/{scan_id}").json()

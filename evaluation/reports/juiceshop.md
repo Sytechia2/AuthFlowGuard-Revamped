@@ -72,6 +72,19 @@ Runs: `evaluation/results/J-baseline-main` and `evaluation/results/J-spa-support
 Automatic discovery paused on all six; each continued through the guided
 fallback.
 
+### Repeatability
+
+The six cases were run six times in full on the final code. Five runs were 6
+of 6. In the other, J-CHK-004's scan finished in 15 s with the correct
+`finding_confirmed` and persisted it, but the runner's wait on the worker
+raised `TimeoutError` afterwards, so the harness recorded the case as blocked
+(with a misleading 3.1 s duration). The runner now reads the persisted
+result when a scan has completed, keeps the failed wait visible in the case
+detail, and records the true duration. The underlying intermittent wait
+failure is in the process-worker path and was not diagnosed further.
+
+No run produced a wrong verdict.
+
 ## Defects fixed
 
 Each was isolated by reproducing it directly, confirmed by removing it in
@@ -262,3 +275,5 @@ product code:
   On Juice Shop that is a cookie-banner link. It now prefers a submit button
   with a login-like label, verified against Juice Shop and Application C.
 - Results record the case file actually used.
+- When waiting on the worker fails after a scan has completed, the runner uses
+  the persisted result and notes the failed wait in the case detail.
