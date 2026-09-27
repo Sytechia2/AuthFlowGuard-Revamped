@@ -1,7 +1,9 @@
 """CHK-006: logout invalidation with replay of the captured session."""
 
 import json
+import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -15,6 +17,8 @@ from authflowguard.checks.session_common import (
     execute_login_steps,
     login_steps_for,
     protected_state,
+    replay_rejected,
+    replay_server_error,
 )
 from authflowguard.models import (
     AuthProfile,
@@ -27,6 +31,7 @@ from authflowguard.models import (
     SecurityPolicy,
     TestRunEvidence,
 )
+from authflowguard.page_settling import background_requests_settled, goto_and_settle
 from authflowguard.secrets import RuntimeSecrets
 
 OWASP_REFERENCE = "WSTG-SESS-06"
@@ -39,7 +44,24 @@ class LogoutInvalidationRun:
         self.events = events
 
 
-async def _submit_logout(page: Any) -> int | None:
+LOGOUT_LABEL = re.compile(r"\b(log|sign)\s*-?\s*(out|off)\b", re.IGNORECASE)
+LOGOUT_URL = re.compile(r"(log|sign)[-_]?(out|off)", re.IGNORECASE)
+MENU_LABEL = re.compile(r"account|user|profile|menu", re.IGNORECASE)
+CLICKABLE = 'button, a[href], [role="button"], [role="menuitem"]'
+MENU_TOGGLE = f'{CLICKABLE}, [aria-haspopup="true"], [aria-haspopup="menu"]'
+MAX_MENU_TOGGLES = 3
+
+
+@dataclass
+class LogoutAttempt:
+    """How logout was performed and what the server was told."""
+
+    method: str
+    status: int | None
+    request_observed: bool
+
+
+async def _submit_logout_form(page: Any) -> LogoutAttempt | None:
     forms = page.locator("form")
     for index in range(await forms.count()):
         form = forms.nth(index)
@@ -55,8 +77,94 @@ async def _submit_logout(page: Any) -> int | None:
         ) as response_info:
             await submit.click()
         response = await response_info.value
-        return response.status if response is not None else None
-    raise ValueError("The protected page has no identifiable logout form")
+        return LogoutAttempt(
+            method="form",
+            status=response.status if response is not None else None,
+            request_observed=True,
+        )
+    return None
+
+
+async def _control_label(control: Any) -> str:
+    parts = await control.evaluate(
+        """element => [element.innerText, element.getAttribute('aria-label'),
+                       element.getAttribute('title'), element.id]"""
+    )
+    return " ".join(part for part in parts if part)
+
+
+async def _find_visible_control(
+    page: Any, selector: str, label: re.Pattern[str]
+) -> Any:
+    controls = page.locator(selector)
+    for index in range(await controls.count()):
+        control = controls.nth(index)
+        if await control.is_visible() and label.search(await _control_label(control)):
+            return control
+    return None
+
+
+async def _find_logout_control(page: Any) -> Any:
+    control = await _find_visible_control(page, CLICKABLE, LOGOUT_LABEL)
+    if control is not None:
+        return control
+    # Single-page apps often keep logout inside an account menu.
+    toggles = page.locator(MENU_TOGGLE)
+    opened = 0
+    for index in range(await toggles.count()):
+        if opened >= MAX_MENU_TOGGLES:
+            break
+        toggle = toggles.nth(index)
+        if not await toggle.is_visible():
+            continue
+        if not MENU_LABEL.search(await _control_label(toggle)):
+            continue
+        await toggle.click()
+        opened += 1
+        await page.wait_for_timeout(300)
+        control = await _find_visible_control(page, CLICKABLE, LOGOUT_LABEL)
+        if control is not None:
+            return control
+        await page.keyboard.press("Escape")
+    return None
+
+
+async def _click_logout_control(page: Any, app_url: str) -> LogoutAttempt | None:
+    control = await _find_logout_control(page)
+    if control is None and page.url.split("#", 1)[0] != app_url.split("#", 1)[0]:
+        # The protected resource may be a page without the app's navigation.
+        await goto_and_settle(page, app_url)
+        control = await _find_logout_control(page)
+    if control is None:
+        return None
+
+    statuses: list[int] = []
+
+    def record(response: Any) -> None:
+        request = response.request
+        if request.method.upper() != "GET" or LOGOUT_URL.search(request.url):
+            statuses.append(response.status)
+
+    page.on("response", record)
+    try:
+        async with background_requests_settled(page):
+            await control.click()
+    finally:
+        page.remove_listener("response", record)
+    return LogoutAttempt(
+        method="control",
+        status=statuses[-1] if statuses else None,
+        request_observed=bool(statuses),
+    )
+
+
+async def _submit_logout(page: Any, app_url: str) -> LogoutAttempt:
+    attempt = await _submit_logout_form(page)
+    if attempt is None:
+        attempt = await _click_logout_control(page, app_url)
+    if attempt is None:
+        raise ValueError("The application has no identifiable logout control")
+    return attempt
 
 
 async def run_logout_invalidation_check(
@@ -105,8 +213,11 @@ async def run_logout_invalidation_check(
                     old_cookies = await context.cookies()
                     observations["active_session"] = cookie_snapshot(old_cookies)
                     completed_steps.append("capture_session")
-                    logout_status = await _submit_logout(page)
+                    logout = await _submit_logout(page, str(profile.target.target_url))
+                    logout_status = logout.status
                     observations["logout_status"] = logout_status
+                    observations["logout_method"] = logout.method
+                    observations["logout_request_observed"] = logout.request_observed
                     after_logout = await protected_state(
                         page, protected_resource, account_marker_selector
                     )
@@ -209,6 +320,23 @@ async def run_logout_invalidation_check(
     return LogoutInvalidationRun(evidence=evidence, events=events)
 
 
+def _client_side_logout_demonstrated(observations: dict[str, Any]) -> bool:
+    """Logout by a control that sent no request, proven by a signed-out page.
+
+    Only a positive record from the runner counts: evidence that merely lacks
+    a logout status stays inconclusive.
+    """
+
+    post_logout = observations.get("post_logout_control")
+    return (
+        observations.get("logout_method") == "control"
+        and observations.get("logout_request_observed") is False
+        and isinstance(post_logout, dict)
+        and isinstance(post_logout.get("status"), int)
+        and post_logout.get("marker_present") is False
+    )
+
+
 def analyse_logout_invalidation(
     evidence: TestRunEvidence, profile: AuthProfile, policy: SecurityPolicy
 ) -> CheckResult:
@@ -254,7 +382,8 @@ def analyse_logout_invalidation(
     anonymous = cast(dict[str, Any], anonymous)
     statuses = [item.get("status") for item in (authenticated, replay, anonymous)]
     logout_status = observations.get("logout_status")
-    if not isinstance(logout_status, int) or any(
+    client_side_logout = _client_side_logout_demonstrated(observations)
+    if (not isinstance(logout_status, int) and not client_side_logout) or any(
         not isinstance(status, int) for status in statuses
     ):
         return CheckResult(
@@ -262,8 +391,9 @@ def analyse_logout_invalidation(
             outcome=CheckOutcome.INCONCLUSIVE,
             explanation="Logout controls did not produce usable statuses.",
         )
-    status_values = [cast(int, status) for status in [*statuses, logout_status]]
-    if any(status >= 500 for status in status_values):
+    if (isinstance(logout_status, int) and logout_status >= 500) or (
+        replay_server_error(authenticated, replay, anonymous)
+    ):
         return CheckResult(
             **base,
             outcome=CheckOutcome.EXECUTION_ERROR,
@@ -277,7 +407,12 @@ def analyse_logout_invalidation(
     elif replay_status == 200 and replay.get("marker_present"):
         outcome = CheckOutcome.FINDING_CONFIRMED
         explanation = "The captured session retained authenticated access after logout."
-    elif replay_status in {401, 403} and not anonymous.get("marker_present"):
+        if client_side_logout:
+            explanation += (
+                " Logout sent no request to the server; it only cleared state in "
+                "the browser."
+            )
+    elif replay_rejected(replay, anonymous):
         outcome = CheckOutcome.NO_ISSUE_OBSERVED
         explanation = (
             "The captured session was rejected after logout, matching the "

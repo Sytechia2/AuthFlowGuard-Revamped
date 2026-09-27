@@ -15,6 +15,8 @@ from authflowguard.checks.session_common import (
     execute_login_steps,
     login_steps_for,
     protected_state,
+    replay_rejected,
+    replay_server_error,
 )
 from authflowguard.models import (
     AuthProfile,
@@ -261,8 +263,7 @@ def analyse_session_fixation(
             outcome=CheckOutcome.INCONCLUSIVE,
             explanation="Session fixation controls did not produce usable statuses.",
         )
-    status_values = [cast(int, status) for status in statuses]
-    if any(status >= 500 for status in status_values):
+    if replay_server_error(authenticated, replay, anonymous):
         return CheckResult(
             **base,
             outcome=CheckOutcome.EXECUTION_ERROR,
@@ -278,7 +279,7 @@ def analyse_session_fixation(
         explanation = (
             "The original pre-login session retained authenticated access after login."
         )
-    elif replay_status in {401, 403} and not anonymous.get("marker_present"):
+    elif replay_rejected(replay, anonymous):
         outcome = CheckOutcome.NO_ISSUE_OBSERVED
         explanation = (
             "The original pre-login session did not authenticate in the isolated "

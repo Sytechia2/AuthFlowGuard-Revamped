@@ -3,7 +3,7 @@
 import hashlib
 import json
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from playwright.async_api import Page
@@ -121,4 +121,47 @@ def check_event(
         kind=kind,
         summary=summary,
         redacted_details=details,
+    )
+
+
+def replay_server_error(
+    authenticated: dict[str, Any], replay: dict[str, Any], anonymous: dict[str, Any]
+) -> bool:
+    """Whether a server error prevents a trustworthy replay verdict.
+
+    A 5xx normally means the procedure failed. Some applications, however,
+    answer every signed-out request to a protected page with a 5xx. When the
+    replay receives exactly the anonymous control's status, that status is
+    how the application rejects signed-out visitors, not a failure. When the
+    replay shows the account marker, an anonymous 5xx without the marker still
+    proves the marker is not public.
+    """
+
+    authenticated_status = cast(int, authenticated["status"])
+    replay_status = cast(int, replay["status"])
+    anonymous_status = cast(int, anonymous["status"])
+    if authenticated_status >= 500:
+        return True
+    if replay_status >= 500:
+        return replay_status != anonymous_status
+    if anonymous_status >= 500:
+        replay_authenticated = replay_status == 200 and bool(
+            replay.get("marker_present")
+        )
+        return not replay_authenticated or bool(anonymous.get("marker_present"))
+    return False
+
+
+def replay_rejected(replay: dict[str, Any], anonymous: dict[str, Any]) -> bool:
+    """Whether the replay was refused like a signed-out visitor."""
+
+    if anonymous.get("marker_present"):
+        return False
+    replay_status = cast(int, replay["status"])
+    if replay_status in {401, 403}:
+        return True
+    return (
+        replay_status >= 500
+        and replay_status == anonymous["status"]
+        and not replay.get("marker_present")
     )

@@ -42,6 +42,8 @@ from authflowguard.models import (
 )
 from authflowguard.scan_manager import ScanExecutionInput, ScanManager, ScanState
 from authflowguard.secrets import RuntimeSecrets
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from test_form_enumeration import serve
 
 
@@ -299,3 +301,193 @@ def test_scan_manager_persists_and_reanalyses_session_check(
     assert (
         manager.reanalyse(record.scan_id)[0].outcome is CheckOutcome.NO_ISSUE_OBSERVED
     )
+
+
+def _replay_evidence(check: CheckId, **observations: Any) -> EvidencePackage:
+    return EvidencePackage(
+        evidence_id=uuid4(),
+        scan_id=uuid4(),
+        check_id=check,
+        profile_version="1.0",
+        observations={**observations, "captured_at": "2026-01-01T00:00:00+00:00"},
+        coverage=Coverage(limitations=["Fixture evidence."]),
+    )
+
+
+AUTHENTICATED = {"status": 200, "marker_present": True}
+SIGNED_OUT_500 = {"status": 500, "marker_present": False}
+
+
+@pytest.mark.parametrize(
+    ("replay", "anonymous", "expected"),
+    [
+        # Replay answered exactly like a signed-out visitor: the 500 is how
+        # the application rejects unauthenticated requests.
+        (SIGNED_OUT_500, SIGNED_OUT_500, CheckOutcome.NO_ISSUE_OBSERVED),
+        # The account marker proves authentication despite an anonymous 500.
+        (AUTHENTICATED, SIGNED_OUT_500, CheckOutcome.FINDING_CONFIRMED),
+        # A server error only on the replay is still a failed procedure.
+        (
+            {"status": 503, "marker_present": False},
+            {"status": 401, "marker_present": False},
+            CheckOutcome.EXECUTION_ERROR,
+        ),
+        # Different server errors cannot be read as the same rejection.
+        (
+            {"status": 502, "marker_present": False},
+            SIGNED_OUT_500,
+            CheckOutcome.EXECUTION_ERROR,
+        ),
+        # A rejected replay cannot be compared with a failing baseline.
+        (
+            {"status": 401, "marker_present": False},
+            SIGNED_OUT_500,
+            CheckOutcome.EXECUTION_ERROR,
+        ),
+    ],
+)
+def test_session_fixation_compares_server_errors_with_signed_out_baseline(
+    replay: dict[str, Any], anonymous: dict[str, Any], expected: CheckOutcome
+) -> None:
+    evidence = _replay_evidence(
+        CheckId.SESSION_FIXATION,
+        authenticated_control=AUTHENTICATED,
+        original_session_replay=replay,
+        anonymous_control=anonymous,
+    )
+    result = analyse_session_fixation(
+        evidence, profile_for("http://app"), SecurityPolicy()
+    )
+    assert result.outcome is expected
+
+
+def test_session_fixation_authenticated_server_error_is_execution_error() -> None:
+    evidence = _replay_evidence(
+        CheckId.SESSION_FIXATION,
+        authenticated_control={"status": 500, "marker_present": True},
+        original_session_replay=SIGNED_OUT_500,
+        anonymous_control=SIGNED_OUT_500,
+    )
+    result = analyse_session_fixation(
+        evidence, profile_for("http://app"), SecurityPolicy()
+    )
+    assert result.outcome is CheckOutcome.EXECUTION_ERROR
+
+
+CLIENT_SIDE_LOGOUT = {
+    "logout_status": None,
+    "logout_method": "control",
+    "logout_request_observed": False,
+    "post_logout_control": SIGNED_OUT_500,
+}
+
+
+@pytest.mark.parametrize(
+    ("logout", "expected"),
+    [
+        (CLIENT_SIDE_LOGOUT, CheckOutcome.FINDING_CONFIRMED),
+        # Missing logout evidence stays inconclusive, as in A-CHK-006-ambiguous.
+        ({"post_logout_control": SIGNED_OUT_500}, CheckOutcome.INCONCLUSIVE),
+        # The browser still showed the account after logout: not demonstrated.
+        (
+            {**CLIENT_SIDE_LOGOUT, "post_logout_control": AUTHENTICATED},
+            CheckOutcome.INCONCLUSIVE,
+        ),
+        # A logout request was sent but its status is unknown.
+        (
+            {**CLIENT_SIDE_LOGOUT, "logout_request_observed": True},
+            CheckOutcome.INCONCLUSIVE,
+        ),
+    ],
+)
+def test_logout_accepts_only_a_demonstrated_client_side_logout(
+    logout: dict[str, Any], expected: CheckOutcome
+) -> None:
+    evidence = _replay_evidence(
+        CheckId.LOGOUT_INVALIDATION,
+        authenticated_control=AUTHENTICATED,
+        old_session_replay=AUTHENTICATED,
+        anonymous_control=SIGNED_OUT_500,
+        **logout,
+    )
+    result = analyse_logout_invalidation(
+        evidence, profile_for("http://app"), SecurityPolicy()
+    )
+    assert result.outcome is expected
+    if expected is CheckOutcome.FINDING_CONFIRMED:
+        assert "sent no request" in result.explanation
+
+
+def create_client_logout_app() -> FastAPI:
+    """Like Juice Shop: logout sits in an account menu and only clears the
+    browser, and signed-out visitors to the protected page get a 500."""
+
+    application = FastAPI()
+    session_value = "stateless-session"
+
+    @application.get("/login", response_class=HTMLResponse)
+    def login_page() -> str:
+        return """<!doctype html><title>Shop</title>
+        <nav>
+            <button aria-label="Show account menu" aria-haspopup="menu"
+                    onclick="document.getElementById('menu').hidden = false">
+                Account
+            </button>
+            <div id="menu" hidden>
+                <button onclick="document.cookie = 'session=; Max-Age=0; Path=/'">
+                    Logout
+                </button>
+            </div>
+        </nav>
+        <form method="post" action="/login">
+            <input name="username"><input name="password" type="password">
+            <button type="submit">Log in</button>
+        </form>"""
+
+    @application.post("/login")
+    def login() -> Response:
+        response = RedirectResponse("/login", status_code=303)
+        response.set_cookie("session", session_value, path="/")
+        return response
+
+    @application.get("/account", response_class=HTMLResponse)
+    def account(request: Request) -> Response:
+        if request.cookies.get("session") != session_value:
+            return HTMLResponse("Blocked illegal activity", status_code=500)
+        return HTMLResponse('<p data-testid="account-marker">Signed in</p>')
+
+    return application
+
+
+def test_client_side_menu_logout_is_found_and_reported() -> None:
+    with serve(create_client_logout_app()) as origin:
+        base_profile = profile_for(origin)
+        navigate, *controls = base_profile.authentication_steps[AuthFeature.LOGIN]
+        # The menu toggle and logout button come first on this page.
+        shifted = [
+            step.model_copy(update={"observed_control_id": f"control-{number}"})
+            for step, number in zip(controls, (3, 4, 5), strict=True)
+        ]
+        profile = base_profile.model_copy(
+            update={"authentication_steps": {AuthFeature.LOGIN: [navigate, *shifted]}}
+        )
+        secrets = RuntimeSecrets({"username": "user", "password": "pass"})
+        run = asyncio.run(
+            run_logout_invalidation_check(
+                profile=profile,
+                scan_id=uuid4(),
+                runtime_secrets=secrets,
+                username_reference="username",
+                password_reference="password",
+                protected_resource=f"{origin}/account",
+                account_marker_selector='[data-testid="account-marker"]',
+            )
+        )
+
+    observations = run.evidence.observations
+    assert run.evidence.errors == []
+    assert observations["logout_method"] == "control"
+    assert observations["logout_request_observed"] is False
+    assert observations["post_logout_control"]["marker_present"] is False
+    result = analyse_logout_invalidation(run.evidence, profile, SecurityPolicy())
+    assert result.outcome is CheckOutcome.FINDING_CONFIRMED
