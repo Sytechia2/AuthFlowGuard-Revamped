@@ -5,17 +5,20 @@ unknown attempt can turn it into a known account. Callers must supply a fresh
 disposable identifier and isolate/reset evaluation application state between runs.
 """
 
+import asyncio
 import hashlib
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from playwright.async_api import Browser, Page, async_playwright
+from playwright.async_api import Browser, Page, Request, Response, async_playwright
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from authflowguard.action_executor import CONTROL_SELECTOR, BrowserActionExecutor
 from authflowguard.models import (
@@ -32,8 +35,15 @@ from authflowguard.models import (
     SecurityPolicy,
     TestRunEvidence,
 )
-from authflowguard.playwright_worker import PlaywrightWorker
-from authflowguard.scope import url_is_in_scope
+from authflowguard.page_settling import (
+    BACKGROUND_REQUEST_TIMEOUT_SECONDS,
+    QUIET_WINDOW_SECONDS,
+)
+from authflowguard.playwright_worker import (
+    PlaywrightWorker,
+    SafeControlDescription,
+)
+from authflowguard.scope import url_is_in_scope, url_without_query_keeping_route
 from authflowguard.secrets import RuntimeSecrets
 
 ANALYSER_VERSION = "1.0"
@@ -125,6 +135,20 @@ def _safe_event(event: EvidenceEvent, check_id: CheckId) -> EvidenceEvent:
     )
 
 
+def _safe_visible_messages(normalized: str) -> list[str]:
+    return sorted(
+        name
+        for name, pattern in {
+            "existing_account": r"already\s+(registered|exists|in use)|must be unique",
+            "unknown_account": r"no account exists|account (?:was )?not found",
+            "generic_instructions": (
+                r"if an account exists|check your email|instructions.*sent"
+            ),
+        }.items()
+        if re.search(pattern, normalized, re.I)
+    )
+
+
 async def _find_form_url(page: Page, check_id: CheckId) -> str:
     pattern = (
         r"\b(register|registration|sign\s*up|create\s+(?:an?\s+)?account)\b"
@@ -137,7 +161,7 @@ async def _find_form_url(page: Page, check_id: CheckId) -> str:
         link = links.nth(index)
         if await link.is_visible():
             href = await link.get_attribute("href")
-            if href and not href.startswith("#"):
+            if href and (not href.startswith("#") or href.startswith("#/")):
                 destinations.add(urljoin(page.url, href))
     if len(destinations) != 1:
         raise ValueError("No unambiguous form link was observed")
@@ -225,6 +249,426 @@ async def _form_actions(
     return actions, destination
 
 
+FORM_FILLER = "AuthFlowGuard evaluation"
+IDENTIFIER_LOOKUP_WINDOW_SECONDS = 2.0
+IDENTIFIER_HINT = re.compile(r"e-?mail|user\s*name|username|login", re.I)
+FILLABLE_INPUT_TYPES = {None, "text", "email", "tel", "url", "search"}
+CLIENT_STATE_FIELDS = (
+    "background_responses",
+    "visible_text_fingerprint",
+    "title_fingerprint",
+    "route_fingerprint",
+    "control_fingerprint",
+)
+
+
+def _is_identifier_control(control: SafeControlDescription) -> bool:
+    if control["tag"] != "input" or control["type"] not in FILLABLE_INPUT_TYPES:
+        return False
+    if control["type"] == "email" or control["autocomplete"] in {"username", "email"}:
+        return True
+    hints = " ".join(
+        value or ""
+        for value in (
+            control["name"],
+            control["id"],
+            control["aria_label"],
+            control["placeholder"],
+        )
+    )
+    return bool(IDENTIFIER_HINT.search(hints))
+
+
+class _IdentifierResponses:
+    """Background responses to requests that carry the identifier.
+
+    Requests that do not carry the identifier (polling, analytics, assets) are
+    ignored so unrelated traffic cannot create a difference. Bodies are read
+    in memory and only normalized fingerprints are kept.
+    """
+
+    def __init__(self, page: Page, identifier: str) -> None:
+        self._page = page
+        self._markers = {identifier, quote(identifier), quote(identifier, safe="")}
+        self._responses: list[Response] = []
+        self._pending: set[Request] = set()
+        self._started = 0
+
+    def __enter__(self) -> "_IdentifierResponses":
+        self._page.on("request", self._started_request)
+        self._page.on("requestfinished", self._finished_request)
+        self._page.on("requestfailed", self._finished_request)
+        self._page.on("response", self._record)
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self._page.remove_listener("request", self._started_request)
+        self._page.remove_listener("requestfinished", self._finished_request)
+        self._page.remove_listener("requestfailed", self._finished_request)
+        self._page.remove_listener("response", self._record)
+
+    def _carries_identifier(self, request: Request) -> bool:
+        if request.resource_type not in {"fetch", "xhr"}:
+            return False
+        carried = f"{request.url} {request.post_data or ''}"
+        return any(marker in carried for marker in self._markers)
+
+    def _started_request(self, request: Request) -> None:
+        if self._carries_identifier(request):
+            self._pending.add(request)
+            self._started += 1
+
+    def _finished_request(self, request: Request) -> None:
+        self._pending.discard(request)
+
+    def _record(self, response: Response) -> None:
+        if self._carries_identifier(response.request):
+            self._responses.append(response)
+
+    async def settle(self, lookup_window: float) -> None:
+        """Wait for identifier requests, including debounced lookups.
+
+        Many forms look an identifier up only after typing pauses. Wait up to
+        lookup_window for such a request to start, then for all of them to
+        finish, bounded overall.
+        """
+
+        loop = asyncio.get_running_loop()
+        start_deadline = loop.time() + lookup_window
+        deadline = start_deadline + BACKGROUND_REQUEST_TIMEOUT_SECONDS
+        while loop.time() < deadline:
+            if not self._pending and (self._started or loop.time() >= start_deadline):
+                break
+            await asyncio.sleep(0.05)
+        # Let the page render the response it just received.
+        await asyncio.sleep(QUIET_WINDOW_SECONDS)
+
+    def take(self) -> list[Response]:
+        taken, self._responses = self._responses, []
+        self._started = 0
+        return taken
+
+
+def _normalize_body(body: str, sensitive_values: list[str]) -> str:
+    """Normalize a background response body, keeping its meaning.
+
+    JSON keeps its keys, booleans, nulls and normalized text; every number
+    becomes a placeholder, because record ids and counters differ between any
+    two requests. A body that is not JSON is normalized as text.
+    """
+
+    def normalize(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: normalize(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        if isinstance(value, bool) or value is None:
+            return value
+        if isinstance(value, int | float):
+            return "<number>"
+        return normalize_response(str(value), sensitive_values)
+
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return normalize_response(body, sensitive_values)
+    return json.dumps(normalize(parsed), sort_keys=True)
+
+
+async def _response_summaries(
+    responses: list[Response], sensitive_values: list[str]
+) -> list[list[Any]]:
+    summaries = []
+    for response in responses:
+        try:
+            body = await response.text()
+        except PlaywrightError:
+            body = ""
+        summaries.append(
+            [
+                response.request.method,
+                _fingerprint(
+                    normalize_response(urlsplit(response.url).path, sensitive_values)
+                ),
+                response.status,
+                _fingerprint(_normalize_body(body, sensitive_values)),
+            ]
+        )
+    return sorted(summaries)
+
+
+async def _client_page_state(
+    page: Page, responses: list[Response], sensitive_values: list[str]
+) -> dict[str, Any]:
+    controls = await page.locator(CONTROL_SELECTOR).evaluate_all(
+        """elements => elements.filter(e => e.type !== 'hidden').map(e => ({
+            tag: e.tagName.toLowerCase(), type: e.type,
+            visible: !!e.getClientRects().length, disabled: !!e.disabled,
+            invalid: e.getAttribute('aria-invalid') === 'true'
+        }))"""
+    )
+    return {
+        "background_responses": await _response_summaries(responses, sensitive_values),
+        "visible_text_fingerprint": _fingerprint(
+            normalize_response(
+                await page.locator("body").inner_text(), sensitive_values
+            )
+        ),
+        "title_fingerprint": _fingerprint(
+            normalize_response(await page.title(), sensitive_values)
+        ),
+        "route_fingerprint": _fingerprint(
+            normalize_response(
+                url_without_query_keeping_route(page.url), sensitive_values
+            )
+        ),
+        "control_fingerprint": _fingerprint(json.dumps(controls, sort_keys=True)),
+    }
+
+
+async def _complete_registration_fields(
+    page: Page,
+    controls: list[SafeControlDescription],
+    identifier_index: int,
+    execute: Callable[[BrowserAction, str], Awaitable[None]],
+) -> None:
+    """Fill the rest of the identifier's form with disposable values."""
+
+    elements = page.locator(CONTROL_SELECTOR)
+    identifier_element = elements.nth(identifier_index)
+    identifier_form = await identifier_element.evaluate_handle("e => e.form")
+    for index, control in enumerate(controls):
+        if index == identifier_index or not control["visible"]:
+            continue
+        element = elements.nth(index)
+        same_form = await element.evaluate(
+            "(element, form) => !!form && element.form === form", identifier_form
+        )
+        if not same_form or control["value_present"] or not await element.is_enabled():
+            continue
+        if control["tag"] == "input" and control["type"] == "password":
+            reference = "registration-password"
+        elif control["tag"] == "input" and control["type"] in FILLABLE_INPUT_TYPES:
+            reference = "form-filler"
+        else:
+            continue
+        await execute(
+            BrowserAction(
+                action_type=BrowserActionType.FILL,
+                observed_control_id=control["observed_control_id"],
+                value_reference=reference,
+                description="Fill a required registration field",
+            ),
+            reference,
+        )
+    # Choose the first option of each unset dropdown in the same form. Custom
+    # dropdowns are comboboxes that are not native <select> elements.
+    form = identifier_element.locator("xpath=ancestor::form[1]")
+    selects = form.locator("select")
+    for index in range(await selects.count()):
+        select = selects.nth(index)
+        if await select.is_visible() and not await select.input_value():
+            values = await select.locator("option").evaluate_all(
+                "options => options.map(o => o.value).filter(Boolean)"
+            )
+            if values:
+                await select.select_option(values[0])
+    comboboxes = form.locator('[role="combobox"]:not(input):not(select)')
+    for index in range(await comboboxes.count()):
+        combobox = comboboxes.nth(index)
+        if not await combobox.is_visible():
+            continue
+        # Open it from the keyboard, as accessible comboboxes support; a
+        # pointer click can be intercepted by a floating label.
+        await combobox.focus()
+        await page.keyboard.press("Enter")
+        option = page.locator('[role="option"]:visible').first
+        try:
+            await option.wait_for(timeout=2000)
+        except PlaywrightTimeoutError:
+            await page.keyboard.press("Escape")
+            continue
+        await option.click()
+
+
+async def _client_form_attempt(
+    *,
+    page: Page,
+    check_id: CheckId,
+    identifier: str,
+    sensitive_values: list[str],
+    execute: Callable[[BrowserAction, str], Awaitable[None]],
+) -> dict[str, Any]:
+    """Compare how a client-rendered form reacts to one identifier.
+
+    The identifier is entered and the page's reaction recorded, because many
+    single-page apps look the identifier up before anything is submitted.
+    Registration then completes the form with disposable values and submits
+    it. Reset forms are never submitted here: completing one could change a
+    real account's password.
+    """
+
+    controls = await PlaywrightWorker().read_controls(page)
+    candidates = [
+        index
+        for index, control in enumerate(controls)
+        if control["visible"] and _is_identifier_control(control)
+    ]
+    if len(candidates) != 1:
+        raise ValueError("Form controls are missing or ambiguous")
+    identifier_index = candidates[0]
+    identifier_id = controls[identifier_index]["observed_control_id"]
+
+    with _IdentifierResponses(page, identifier) as responses:
+        await execute(
+            BrowserAction(
+                action_type=BrowserActionType.FILL,
+                observed_control_id=identifier_id,
+                value_reference="identifier",
+                description="Fill the comparison identifier",
+            ),
+            "identifier",
+        )
+        await execute(
+            BrowserAction(
+                action_type=BrowserActionType.PRESS_KEY,
+                observed_control_id=identifier_id,
+                key="Tab",
+                description="Leave the identifier field",
+            ),
+            "leave-identifier",
+        )
+        await responses.settle(IDENTIFIER_LOOKUP_WINDOW_SECONDS)
+        reaction = await _client_page_state(page, responses.take(), sensitive_values)
+
+        submission: dict[str, Any] | None = None
+        if check_id is CheckId.REGISTRATION_ENUMERATION:
+            await _complete_registration_fields(
+                page, controls, identifier_index, execute
+            )
+            current = await PlaywrightWorker().read_controls(page)
+            submits = [
+                control
+                for control in current
+                if control["visible"]
+                and control["tag"] in {"button", "input"}
+                and control["type"] == "submit"
+            ]
+            if len(submits) != 1:
+                raise ValueError("Form controls are missing or ambiguous")
+            submit_id = submits[0]["observed_control_id"]
+            submit = page.locator(CONTROL_SELECTOR).nth(
+                int(submit_id.removeprefix("control-")) - 1
+            )
+            if await submit.is_enabled():
+                await execute(
+                    BrowserAction(
+                        action_type=BrowserActionType.CLICK,
+                        observed_control_id=submit_id,
+                        description="Submit the comparison form",
+                    ),
+                    "submit",
+                )
+                await responses.settle(0)
+                submission = await _client_page_state(
+                    page, responses.take(), sensitive_values
+                )
+
+    visible_text = normalize_response(
+        await page.locator("body").inner_text(), sensitive_values
+    )
+    return {
+        "interaction": "client",
+        "reaction": reaction,
+        "submission_observed": submission is not None,
+        "submission": submission,
+        "safe_visible_messages": _safe_visible_messages(visible_text),
+    }
+
+
+async def _has_native_post_form(page: Page) -> bool:
+    forms = page.locator("form")
+    methods = [
+        (await forms.nth(index).get_attribute("method") or "get").lower()
+        for index in range(await forms.count())
+        if await forms.nth(index).is_visible()
+    ]
+    return methods == ["post"]
+
+
+async def _native_form_attempt(
+    *,
+    page: Page,
+    profile: AuthProfile,
+    check_id: CheckId,
+    sensitive_values: list[str],
+    execute: Callable[[BrowserAction, str], Awaitable[None]],
+    cancel_requested: Callable[[], bool],
+) -> dict[str, Any]:
+    actions, destination = await _form_actions(page, profile, check_id)
+    # Hidden values are read only for in-memory normalization; the browser
+    # submits the fresh CSRF token naturally without replaying it.
+    hidden_values = await page.locator('input[type="hidden"]').evaluate_all(
+        "elements => elements.map(element => element.value).filter(Boolean)"
+    )
+    for action in actions[:-1]:
+        await execute(action, action.value_reference or "fill")
+    async with page.expect_response(
+        lambda response: (
+            response.request.method == "POST"
+            and response.request.is_navigation_request()
+            and response.request.frame == page.main_frame
+            and response.url == destination
+        ),
+    ) as submitted:
+        async with page.expect_navigation(wait_until="domcontentloaded") as navigated:
+            await execute(actions[-1], "submit")
+    response = await submitted.value
+    final_response = await navigated.value
+    allowed = {200, 201, 202, 302, 303}
+    if check_id is CheckId.REGISTRATION_ENUMERATION:
+        allowed.add(409)
+    if response.status not in allowed or final_response is None:
+        raise ValueError("Unexpected form response")
+    if final_response.status not in allowed:
+        raise ValueError("Unexpected final response")
+    _check_cancelled(cancel_requested)
+    normalized = normalize_response(
+        await page.locator("body").inner_text(),
+        [*sensitive_values, *hidden_values],
+    )
+    controls = await page.locator("input, button, select, textarea").evaluate_all(
+        """elements => elements.filter(e => e.type !== 'hidden').map(e => ({
+            tag: e.tagName.toLowerCase(), type: e.type,
+            visible: !!e.getClientRects().length, disabled: !!e.disabled,
+            invalid: e.getAttribute('aria-invalid') === 'true',
+            valid: e.validity ? e.validity.valid : true
+        }))"""
+    )
+    indicators = _safe_visible_messages(normalized)
+    signature = {
+        "status_code": response.status,
+        "final_status_code": final_response.status,
+        "normalized_body_fingerprint": _fingerprint(normalized),
+        "title_fingerprint": _fingerprint(
+            normalize_response(
+                await page.title(),
+                [*sensitive_values, *hidden_values],
+            )
+        ),
+        "redirect_path_fingerprint": _fingerprint(
+            normalize_response(
+                urlsplit(page.url).path,
+                [*sensitive_values, *hidden_values],
+            )
+        ),
+        "control_fingerprint": _fingerprint(json.dumps(controls, sort_keys=True)),
+        "safe_visible_messages": indicators,
+        "submission_observed": True,
+    }
+    return signature
+
+
 async def _run_attempt(
     *,
     browser: Browser,
@@ -243,7 +687,11 @@ async def _run_attempt(
 ) -> dict[str, Any]:
     context = await browser.new_context(service_workers="block")
     secrets = RuntimeSecrets(
-        {"identifier": identifier, "registration-password": password}
+        {
+            "identifier": identifier,
+            "registration-password": password,
+            "form-filler": FORM_FILLER,
+        }
     )
     try:
         page = await context.new_page()
@@ -290,79 +738,23 @@ async def _run_attempt(
             ),
             "open-form",
         )
-        actions, destination = await _form_actions(page, profile, check_id)
-        # Hidden values are read only for in-memory normalization; the browser
-        # submits the fresh CSRF token naturally without replaying it.
-        hidden_values = await page.locator('input[type="hidden"]').evaluate_all(
-            "elements => elements.map(element => element.value).filter(Boolean)"
-        )
-        for action in actions[:-1]:
-            await execute(action, action.value_reference or "fill")
-        async with page.expect_response(
-            lambda response: (
-                response.request.method == "POST"
-                and response.request.is_navigation_request()
-                and response.request.frame == page.main_frame
-                and response.url == destination
-            ),
-        ) as submitted:
-            async with page.expect_navigation(
-                wait_until="domcontentloaded"
-            ) as navigated:
-                await execute(actions[-1], "submit")
-        response = await submitted.value
-        final_response = await navigated.value
-        allowed = {200, 201, 202, 302, 303}
-        if check_id is CheckId.REGISTRATION_ENUMERATION:
-            allowed.add(409)
-        if response.status not in allowed or final_response is None:
-            raise ValueError("Unexpected form response")
-        if final_response.status not in allowed:
-            raise ValueError("Unexpected final response")
-        _check_cancelled(cancel_requested)
-        normalized = normalize_response(
-            await page.locator("body").inner_text(),
-            [*sensitive_values, *hidden_values],
-        )
-        controls = await page.locator("input, button, select, textarea").evaluate_all(
-            """elements => elements.filter(e => e.type !== 'hidden').map(e => ({
-                tag: e.tagName.toLowerCase(), type: e.type,
-                visible: !!e.getClientRects().length, disabled: !!e.disabled,
-                invalid: e.getAttribute('aria-invalid') === 'true',
-                valid: e.validity ? e.validity.valid : true
-            }))"""
-        )
-        indicators = sorted(
-            name
-            for name, pattern in {
-                "existing_account": r"already\s+(registered|exists|in use)",
-                "unknown_account": r"no account exists|account (?:was )?not found",
-                "generic_instructions": (
-                    r"if an account exists|check your email|instructions.*sent"
-                ),
-            }.items()
-            if re.search(pattern, normalized, re.I)
-        )
-        signature = {
-            "status_code": response.status,
-            "final_status_code": final_response.status,
-            "normalized_body_fingerprint": _fingerprint(normalized),
-            "title_fingerprint": _fingerprint(
-                normalize_response(
-                    await page.title(),
-                    [*sensitive_values, *hidden_values],
-                )
-            ),
-            "redirect_path_fingerprint": _fingerprint(
-                normalize_response(
-                    urlsplit(page.url).path,
-                    [*sensitive_values, *hidden_values],
-                )
-            ),
-            "control_fingerprint": _fingerprint(json.dumps(controls, sort_keys=True)),
-            "safe_visible_messages": indicators,
-            "submission_observed": True,
-        }
+        if await _has_native_post_form(page):
+            signature = await _native_form_attempt(
+                page=page,
+                profile=profile,
+                check_id=check_id,
+                sensitive_values=sensitive_values,
+                execute=execute,
+                cancel_requested=cancel_requested,
+            )
+        else:
+            signature = await _client_form_attempt(
+                page=page,
+                check_id=check_id,
+                identifier=identifier,
+                sensitive_values=sensitive_values,
+                execute=execute,
+            )
         events.append(
             EvidenceEvent(
                 event_id=uuid4(),
@@ -476,6 +868,115 @@ async def run_form_enumeration_check(
     )
 
 
+def _valid_client_state(state: Any) -> bool:
+    return (
+        isinstance(state, dict)
+        and all(field in state for field in CLIENT_STATE_FIELDS)
+        and isinstance(state["background_responses"], list)
+        and all(
+            isinstance(item, list)
+            and len(item) == 4
+            and type(item[2]) is int
+            and 100 <= item[2] < 600
+            for item in state["background_responses"]
+        )
+        and all(
+            isinstance(state[field], str)
+            and re.fullmatch(r"[0-9a-f]{64}", state[field])
+            for field in CLIENT_STATE_FIELDS[1:]
+        )
+    )
+
+
+def _valid_client_signature(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("interaction") == "client"
+        and _valid_client_state(value.get("reaction"))
+        and isinstance(value.get("submission_observed"), bool)
+        and (
+            _valid_client_state(value.get("submission"))
+            if value.get("submission_observed")
+            else value.get("submission") is None
+        )
+        and isinstance(value.get("safe_visible_messages"), list)
+    )
+
+
+def _client_statuses(signature: dict[str, Any]) -> list[int]:
+    states = [signature["reaction"], signature.get("submission") or {}]
+    return [
+        item[2] for state in states for item in state.get("background_responses", [])
+    ]
+
+
+def _analyse_client_forms(
+    known: dict[str, Any],
+    unknown: dict[str, Any],
+    check_id: CheckId,
+    policy: SecurityPolicy,
+    name: str,
+) -> tuple[CheckOutcome, str]:
+    """Compare two client-rendered form attempts.
+
+    Identical observations only count as "no issue" when the procedure
+    demonstrably exercised the form; otherwise nothing was compared.
+    """
+
+    if any(
+        status >= 500 for sig in (known, unknown) for status in _client_statuses(sig)
+    ):
+        return (
+            CheckOutcome.EXECUTION_ERROR,
+            f"{name} evidence records a server error from the application.",
+        )
+    if check_id is CheckId.REGISTRATION_ENUMERATION:
+        accepted = unknown["submission_observed"] and any(
+            200 <= item[2] < 300
+            for item in unknown["submission"]["background_responses"]
+        )
+        if not accepted:
+            return (
+                CheckOutcome.INCONCLUSIVE,
+                "The disposable registration was not accepted, so a difference "
+                "cannot be attributed to account existence.",
+            )
+    elif not all(
+        sig["reaction"]["background_responses"] or sig["submission_observed"]
+        for sig in (known, unknown)
+    ):
+        return (
+            CheckOutcome.INCONCLUSIVE,
+            f"The {name.lower()} form did not react to the identifier, so nothing "
+            "was compared.",
+        )
+    if not policy.account_existence_is_private:
+        return (
+            CheckOutcome.NO_ISSUE_OBSERVED,
+            "The configured policy does not require account-existence privacy.",
+        )
+    differences = [
+        f"{stage}.{field}"
+        for stage in ("reaction", "submission")
+        for field in CLIENT_STATE_FIELDS
+        if (known.get(stage) or {}).get(field) != (unknown.get(stage) or {}).get(field)
+    ]
+    if known["submission_observed"] != unknown["submission_observed"]:
+        differences.append("submission_observed")
+    if known["safe_visible_messages"] != unknown["safe_visible_messages"]:
+        differences.append("safe_visible_messages")
+    if differences:
+        return (
+            CheckOutcome.FINDING_CONFIRMED,
+            f"{name} responses differed between the known and nonexistent "
+            "identifier in the captured pair: " + ", ".join(differences) + ".",
+        )
+    return (
+        CheckOutcome.NO_ISSUE_OBSERVED,
+        f"{name} responses had no observable difference in the captured pair.",
+    )
+
+
 def analyse_form_enumeration(
     evidence: TestRunEvidence,
     profile: AuthProfile,
@@ -525,6 +1026,11 @@ def analyse_form_enumeration(
     if evidence.errors:
         outcome = CheckOutcome.EXECUTION_ERROR
         explanation = f"{name} comparison failed or was cancelled before completion."
+    elif _valid_client_signature(known) and _valid_client_signature(unknown):
+        assert isinstance(known, dict) and isinstance(unknown, dict)
+        outcome, explanation = _analyse_client_forms(
+            known, unknown, check_id, policy, name
+        )
     elif not valid(known) or not valid(unknown):
         outcome = CheckOutcome.INCONCLUSIVE
         explanation = (
