@@ -74,8 +74,8 @@ fallback.
 
 ### Repeatability
 
-The six cases were run six times in full on the final code. Five runs were 6
-of 6. In the other, J-CHK-004's scan finished in 15 s with the correct
+The six cases were run seven times in full. Six runs were 6 of 6. In the
+other, J-CHK-004's scan finished in 15 s with the correct
 `finding_confirmed` and persisted it, but the runner's wait on the worker
 raised `TimeoutError` afterwards, so the harness recorded the case as blocked
 (with a misleading 3.1 s duration). The runner now reads the persisted
@@ -233,30 +233,57 @@ normalization above.
 
 ## Regression
 
-Full backend suite: 311 passed; `ruff`, `ruff format --check` and `mypy` clean.
+Full backend suite: 315 passed; `ruff`, `ruff format --check` and `mypy` clean.
 Every change has tests that fail on the old code, including tests for the
 cases that must stay `inconclusive` or `execution_error`, and a secure
 single-page app that must come back clean.
 
-Formal cases on Applications A, B and C (run `ABC-spa-support`), compared with
-the submitted results:
+Formal cases on Applications A, B and C (run `ABC-spa-support`, now the source
+of `formal-cases.md`), compared with the previously submitted results:
 
-| Application | Submitted results (`formal-cases.md`) | This branch | Average live scan, same machine (`main` → branch) |
+| Application | Previous `formal-cases.md` (22 Sep) | This branch | Average live scan, same machine (`main` → branch) |
 | --- | --- | --- | --- |
 | A | 24 / 24 pass | 24 / 24 pass | 5.1 s → 5.6 s |
-| B | 1 pass, 2 fail, 1 blocked | 1 pass, 3 fail | — |
-| C | 16 / 16 pass | 16 / 16 pass | 8.9 s → 9.1 s |
+| B | 1 pass, 2 fail, 1 blocked | **4 / 4 pass** | 98 s → 11 s |
+| C | 16 / 16 pass | 16 / 16 pass | 8.9 s → 8.7 s |
+| **Total** | **41 / 44** | **44 / 44** | |
 
-No verdict on A or C changed. The one change on B is an improvement:
-`B-CHK-001-vulnerable` was blocked because the guided fallback observed the
-React page before its form had rendered (4 controls). It now observes the full
-form, logs in, and stops at the same enumeration error that `B-CHK-001-secure`
-already reported on `main`. That error is separate from this work and was not
-investigated here.
+No verdict on A or C changed. Application B's change is described in the next
+section.
 
 Timings were measured by running `main` and this branch on the same machine;
-the submitted runs were recorded on a different machine and are not
+the previous results were recorded on a different machine and are not
 comparable for time.
+
+## Application B: multi-step login enumeration
+
+Application B signs in in two steps: an email, then a verification code. Its
+login-enumeration cases failed on `main` for two reasons, one in the tool and
+one in the test application.
+
+**Tool defect.** When the email did not exist, Application B rejected it at
+the first step and never showed the code field. The runner still tried to
+fill that hidden field, waited out Playwright's 30-second timeout, and
+discarded the attempt, so every comparison ended in `execution_error`. The
+runner now waits up to 2 s for each step's control. If it never appears on a
+nonexistent-identifier attempt, the attempt ends there and the page is
+recorded, because the early end is the application's observable response.
+The known-identifier attempt must still complete every step; if it cannot,
+the attempt fails at once with a clear error, so a broken flow is never
+compared as if it were a response (tested).
+
+**Test-application defect.** The secure mode's rationale says known and
+unknown emails receive equivalent responses. Its first step did not: the known
+email received `200 "Code sent."` and a code field, any other email `401`.
+That difference is itself account enumeration. With the runner fixed and the
+old application, the tool reported `finding_confirmed` on the "secure" mode,
+which was correct. The secure mode now answers the first step identically for
+every email and rejects an unknown one only at verification with the same
+generic message, as its rationale describes. The vulnerable mode is unchanged,
+and the case expectations were not edited.
+
+`B-CHK-001-ambiguous` re-analyses the secure case's evidence with one pair
+removed, so it passes once the secure case produces complete evidence.
 
 ## Harness changes
 

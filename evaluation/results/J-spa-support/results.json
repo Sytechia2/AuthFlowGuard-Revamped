@@ -1,7 +1,7 @@
 {
   "case_file": "evaluation/cases/juiceshop_cases.json",
   "discovery_mode": "rules",
-  "generated_at": "2026-09-27T16:14:45.162075+00:00",
+  "generated_at": "2026-09-27T17:01:13.877548+00:00",
   "results": [
     {
       "actual_outcome": "no_issue_observed",
@@ -10,12 +10,12 @@
       "check_id": "login_enumeration",
       "detail": "Automatic discovery paused; completed through the guided fallback. No observable page, title, URL, or control-state difference was found across the three paired comparisons.",
       "discovery": "guided",
-      "duration_seconds": 16.72,
-      "evidence_id": "77c3c4bc-0da1-4902-a832-47b0766a7660",
+      "duration_seconds": 17.65,
+      "evidence_id": "cd2d0832-87e6-4de1-b7fa-001b5454ac69",
       "execution_mode": "live_scan",
       "expected_outcome": "no_issue_observed",
       "origin_used": "http://127.0.0.1:3000",
-      "scan_id": "c1d08b2e-6f41-4fe8-aa22-e1b1ab87b43f",
+      "scan_id": "09f02dda-9b81-4bb4-a301-c2b3a33a2823",
       "verdict": "pass"
     },
     {
@@ -25,12 +25,12 @@
       "check_id": "registration_enumeration",
       "detail": "Automatic discovery paused; completed through the guided fallback. Registration responses differed between the known and nonexistent identifier in the captured pair: submission.background_responses, submission.visible_text_fingerprint, submission.route_fingerprint, submission.control_fingerprint, sa",
       "discovery": "guided",
-      "duration_seconds": 18.33,
-      "evidence_id": "4245634c-d643-444d-ac33-e93c4740e81c",
+      "duration_seconds": 17.26,
+      "evidence_id": "c65584bd-9fb4-4e85-aa87-25d21cddd21d",
       "execution_mode": "live_scan",
       "expected_outcome": "finding_confirmed",
       "origin_used": "http://127.0.0.1:3000",
-      "scan_id": "b5d15c62-539d-4a94-a474-dc7f12d15bd0",
+      "scan_id": "bc32de5e-f564-4380-8618-b259d5265c7f",
       "verdict": "pass"
     },
     {
@@ -40,12 +40,12 @@
       "check_id": "reset_request_enumeration",
       "detail": "Automatic discovery paused; completed through the guided fallback. Reset-request responses differed between the known and nonexistent identifier in the captured pair: reaction.background_responses, reaction.control_fingerprint.",
       "discovery": "guided",
-      "duration_seconds": 14.28,
-      "evidence_id": "a2539585-039f-4368-9df5-ca4fddb93105",
+      "duration_seconds": 13.19,
+      "evidence_id": "7682d4d5-5eba-4225-a5a0-168131912ede",
       "execution_mode": "live_scan",
       "expected_outcome": "finding_confirmed",
       "origin_used": "http://127.0.0.1:3000",
-      "scan_id": "47948ca5-00b1-4dc0-badb-ae0465a0affa",
+      "scan_id": "f6fa1c02-d83d-4923-9049-f2b4240c77ce",
       "verdict": "pass"
     },
     {
@@ -55,12 +55,12 @@
       "check_id": "login_throttling",
       "detail": "Automatic discovery paused; completed through the guided fallback. The valid login succeeded after bounded failures; no lockout response was observed.",
       "discovery": "guided",
-      "duration_seconds": 13.83,
-      "evidence_id": "91edf5b7-33f9-4f65-95ec-c25eae8b7b0a",
+      "duration_seconds": 13.76,
+      "evidence_id": "49d06da0-14a0-4b89-82b7-14e6100d633e",
       "execution_mode": "live_scan",
       "expected_outcome": "finding_confirmed",
       "origin_used": "http://127.0.0.1:3000",
-      "scan_id": "6fa1af3e-9f9e-45dd-8576-acc704370ff0",
+      "scan_id": "ba1b7c6e-4f8a-4d88-9a5d-c539ca799680",
       "verdict": "pass"
     },
     {
@@ -70,12 +70,12 @@
       "check_id": "session_fixation",
       "detail": "Automatic discovery paused; completed through the guided fallback. The original pre-login session did not authenticate in the isolated replay.",
       "discovery": "guided",
-      "duration_seconds": 11.67,
-      "evidence_id": "a66ebba1-020a-4ce0-9bc9-1362d829bdaf",
+      "duration_seconds": 11.01,
+      "evidence_id": "323b830e-5f74-48b0-bbc9-1c55f52a57fa",
       "execution_mode": "live_scan",
       "expected_outcome": "no_issue_observed",
       "origin_used": "http://127.0.0.1:3000",
-      "scan_id": "554f8bf3-8e8f-47ac-aa8e-42861f1664a3",
+      "scan_id": "a98b72e4-7f2a-402a-9f8a-999c5cb9e633",
       "verdict": "pass"
     },
     {
@@ -85,12 +85,12 @@
       "check_id": "logout_invalidation",
       "detail": "Automatic discovery paused; completed through the guided fallback. The captured session retained authenticated access after logout. Logout sent no request to the server; it only cleared state in the browser.",
       "discovery": "guided",
-      "duration_seconds": 15.16,
-      "evidence_id": "23b9a980-1433-4eed-b582-4a7e60e5c1af",
+      "duration_seconds": 14.48,
+      "evidence_id": "6325814e-7482-43d8-819c-9141ed49d21c",
       "execution_mode": "live_scan",
       "expected_outcome": "finding_confirmed",
       "origin_used": "http://127.0.0.1:3000",
-      "scan_id": "529f224d-f93f-4de2-96df-f9833ed08e3c",
+      "scan_id": "1f5a8190-1d99-42e9-845c-045ce13d61d2",
       "verdict": "pass"
     }
   ],
