@@ -691,3 +691,43 @@ def test_rules_do_not_guess_between_different_link_destinations() -> None:
     ]
 
     assert rules_link_suggestions(controls) == []
+
+
+def test_an_invalid_claimant_does_not_make_a_role_ambiguous() -> None:
+    # The live measurement's answer on the controlled app: the model named
+    # both the page's own "Login" link and "Register" as the registration
+    # link. The link back to the login page fails its own check, so
+    # "Register" is the only valid claimant and is kept.
+    controls = [
+        link("control-1", f"{APP}/#/login", "Login"),
+        link("control-2", f"{APP}/#/register", "Register"),
+        link("control-3", f"{APP}/#/sign-up", "Sign up"),
+    ]
+
+    one_valid = validate_role_suggestions(
+        controls,
+        suggest(
+            ("control-1", ControlRole.REGISTRATION_LINK),
+            ("control-2", ControlRole.REGISTRATION_LINK),
+        ),
+        context=LOGIN_CONTEXT,
+    )
+    two_valid = validate_role_suggestions(
+        controls,
+        suggest(
+            ("control-2", ControlRole.REGISTRATION_LINK),
+            ("control-3", ControlRole.REGISTRATION_LINK),
+        ),
+        context=LOGIN_CONTEXT,
+    )
+
+    assert one_valid.control_for(ControlRole.REGISTRATION_LINK) == "control-2"
+    assert one_valid.rejected == (
+        RejectedSuggestion(
+            "control-1", ControlRole.REGISTRATION_LINK, RoleRejection.SAME_PAGE
+        ),
+    )
+    assert two_valid.control_for(ControlRole.REGISTRATION_LINK) is None
+    assert {item.reason for item in two_valid.rejected} == {
+        RoleRejection.SEVERAL_CONTROLS
+    }

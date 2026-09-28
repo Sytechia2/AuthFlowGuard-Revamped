@@ -376,9 +376,11 @@ def validate_role_suggestions(
     - ``account_menu``: a visible button that declares a popup
       (``aria-haspopup`` or ``aria-expanded``), not matching the strict
       destructive rule;
-    - one control per role and one role per control: when a role names
-      several controls, or a control is given several roles, all of those
-      suggestions are dropped;
+    - one role per control: a control given several roles loses them all;
+    - one control per role: when several controls that each pass the checks
+      above claim a role, all of them are dropped; a claimant that fails its
+      own checks is rejected for that reason and does not make the role
+      ambiguous;
     - the username must be in the password's form;
     - ``submit`` must not be one of ``used_controls``, the controls an
       earlier step of the same flow already acted on.
@@ -406,22 +408,21 @@ def validate_role_suggestions(
         )
 
     roles_per_control: dict[str, set[ControlRole]] = {}
-    controls_per_role: dict[ControlRole, set[str]] = {}
     for suggestion in unique:
         roles_per_control.setdefault(suggestion.observed_control_id, set()).add(
             suggestion.role
         )
-        controls_per_role.setdefault(suggestion.role, set()).add(
-            suggestion.observed_control_id
-        )
 
-    candidates: dict[ControlRole, str] = {}
+    # Each suggestion is checked on its own first. A role is ambiguous only
+    # when several controls that could each play it claim it: in a live run
+    # the model named both "Register" and a link back to the login page as
+    # the registration link, and the correct one was lost with the invalid
+    # one. Two valid claimants are still both dropped.
+    fitting: list[RoleSuggestion] = []
     for suggestion in unique:
         observed = by_id.get(suggestion.observed_control_id)
         if observed is None:
             reject(suggestion, RoleRejection.UNKNOWN_CONTROL)
-        elif len(controls_per_role[suggestion.role]) > 1:
-            reject(suggestion, RoleRejection.SEVERAL_CONTROLS)
         elif len(roles_per_control[suggestion.observed_control_id]) > 1:
             reject(suggestion, RoleRejection.SEVERAL_ROLES)
         elif (
@@ -433,6 +434,19 @@ def validate_role_suggestions(
             reason := _kind_rejection(suggestion.role, observed, context)
         ) is not None:
             reject(suggestion, reason)
+        else:
+            fitting.append(suggestion)
+
+    controls_per_role: dict[ControlRole, set[str]] = {}
+    for suggestion in fitting:
+        controls_per_role.setdefault(suggestion.role, set()).add(
+            suggestion.observed_control_id
+        )
+
+    candidates: dict[ControlRole, str] = {}
+    for suggestion in fitting:
+        if len(controls_per_role[suggestion.role]) > 1:
+            reject(suggestion, RoleRejection.SEVERAL_CONTROLS)
         else:
             candidates[suggestion.role] = suggestion.observed_control_id
 
