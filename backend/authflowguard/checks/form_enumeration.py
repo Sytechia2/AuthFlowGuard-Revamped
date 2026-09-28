@@ -21,6 +21,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from authflowguard.action_executor import CONTROL_SELECTOR, BrowserActionExecutor
+from authflowguard.control_fingerprint import with_fingerprint
 from authflowguard.control_safety import describe_error
 from authflowguard.models import (
     AuthFeature,
@@ -30,6 +31,7 @@ from authflowguard.models import (
     CheckId,
     CheckOutcome,
     CheckResult,
+    ControlFingerprint,
     Coverage,
     EvidenceEvent,
     EvidenceKind,
@@ -268,6 +270,11 @@ async def _form_actions(
     return actions, destination
 
 
+# Fingerprints of the page's controls now, keyed by control-N. Actions built
+# from an observation are pinned with them at once, so each finds the control
+# it was built for even when the form re-renders before it runs.
+Fingerprints = Callable[[], Awaitable[dict[str, ControlFingerprint]]]
+
 FORM_FILLER = "AuthFlowGuard evaluation"
 IDENTIFIER_LOOKUP_WINDOW_SECONDS = 2.0
 IDENTIFIER_HINT = re.compile(r"e-?mail|user\s*name|username|login", re.I)
@@ -450,8 +457,12 @@ async def _complete_registration_fields(
     controls: list[SafeControlDescription],
     identifier_index: int,
     execute: Callable[[BrowserAction, str], Awaitable[None]],
+    pins: dict[str, ControlFingerprint],
 ) -> None:
-    """Fill the rest of the identifier's form with disposable values."""
+    """Fill the rest of the identifier's form with disposable values.
+
+    ``pins`` are the fingerprints taken when ``controls`` was read.
+    """
 
     elements = page.locator(CONTROL_SELECTOR)
     identifier_element = elements.nth(identifier_index)
@@ -472,11 +483,14 @@ async def _complete_registration_fields(
         else:
             continue
         await execute(
-            BrowserAction(
-                action_type=BrowserActionType.FILL,
-                observed_control_id=control["observed_control_id"],
-                value_reference=reference,
-                description="Fill a required registration field",
+            with_fingerprint(
+                BrowserAction(
+                    action_type=BrowserActionType.FILL,
+                    observed_control_id=control["observed_control_id"],
+                    value_reference=reference,
+                    description="Fill a required registration field",
+                ),
+                pins,
             ),
             reference,
         )
@@ -517,6 +531,7 @@ async def _client_form_attempt(
     identifier: str,
     sensitive_values: list[str],
     execute: Callable[[BrowserAction, str], Awaitable[None]],
+    fingerprints: Fingerprints,
 ) -> dict[str, Any]:
     """Compare how a client-rendered form reacts to one identifier.
 
@@ -528,6 +543,7 @@ async def _client_form_attempt(
     """
 
     controls = await PlaywrightWorker().read_controls(page)
+    pins = await fingerprints()
     candidates = [
         index
         for index, control in enumerate(controls)
@@ -540,20 +556,26 @@ async def _client_form_attempt(
 
     with _IdentifierResponses(page, identifier) as responses:
         await execute(
-            BrowserAction(
-                action_type=BrowserActionType.FILL,
-                observed_control_id=identifier_id,
-                value_reference="identifier",
-                description="Fill the comparison identifier",
+            with_fingerprint(
+                BrowserAction(
+                    action_type=BrowserActionType.FILL,
+                    observed_control_id=identifier_id,
+                    value_reference="identifier",
+                    description="Fill the comparison identifier",
+                ),
+                pins,
             ),
             "identifier",
         )
         await execute(
-            BrowserAction(
-                action_type=BrowserActionType.PRESS_KEY,
-                observed_control_id=identifier_id,
-                key="Tab",
-                description="Leave the identifier field",
+            with_fingerprint(
+                BrowserAction(
+                    action_type=BrowserActionType.PRESS_KEY,
+                    observed_control_id=identifier_id,
+                    key="Tab",
+                    description="Leave the identifier field",
+                ),
+                pins,
             ),
             "leave-identifier",
         )
@@ -563,9 +585,10 @@ async def _client_form_attempt(
         submission: dict[str, Any] | None = None
         if check_id is CheckId.REGISTRATION_ENUMERATION:
             await _complete_registration_fields(
-                page, controls, identifier_index, execute
+                page, controls, identifier_index, execute, pins
             )
             current = await PlaywrightWorker().read_controls(page)
+            current_pins = await fingerprints()
             submits = [
                 control
                 for control in current
@@ -581,10 +604,13 @@ async def _client_form_attempt(
             )
             if await submit.is_enabled():
                 await execute(
-                    BrowserAction(
-                        action_type=BrowserActionType.CLICK,
-                        observed_control_id=submit_id,
-                        description="Submit the comparison form",
+                    with_fingerprint(
+                        BrowserAction(
+                            action_type=BrowserActionType.CLICK,
+                            observed_control_id=submit_id,
+                            description="Submit the comparison form",
+                        ),
+                        current_pins,
                     ),
                     "submit",
                 )
@@ -623,8 +649,11 @@ async def _native_form_attempt(
     sensitive_values: list[str],
     execute: Callable[[BrowserAction, str], Awaitable[None]],
     cancel_requested: Callable[[], bool],
+    fingerprints: Fingerprints,
 ) -> dict[str, Any]:
     actions, destination = await _form_actions(page, profile, check_id)
+    pins = await fingerprints()
+    actions = [with_fingerprint(action, pins) for action in actions]
     # Hidden values are read only for in-memory normalization; the browser
     # submits the fresh CSRF token naturally without replaying it.
     hidden_values = await page.locator('input[type="hidden"]').evaluate_all(
@@ -771,6 +800,7 @@ async def _run_attempt(
                 sensitive_values=sensitive_values,
                 execute=execute,
                 cancel_requested=cancel_requested,
+                fingerprints=executor.control_fingerprints,
             )
         else:
             signature = await _client_form_attempt(
@@ -779,6 +809,7 @@ async def _run_attempt(
                 identifier=identifier,
                 sensitive_values=sensitive_values,
                 execute=execute,
+                fingerprints=executor.control_fingerprints,
             )
         events.append(
             EvidenceEvent(

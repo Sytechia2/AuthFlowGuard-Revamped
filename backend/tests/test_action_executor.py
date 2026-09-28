@@ -13,7 +13,10 @@ from authflowguard.action_executor import (
     BrowserActionExecutor,
     InvalidControlReferenceError,
 )
-from authflowguard.control_safety import UnsafeControlError
+from authflowguard.control_safety import (
+    RecordedControlNotFoundError,
+    UnsafeControlError,
+)
 from authflowguard.models import (
     ActionWaitCondition,
     BrowserAction,
@@ -724,6 +727,290 @@ def test_a_click_timeout_becomes_a_safe_error() -> None:
             </body>""",
             RuntimeSecrets({}),
             frozenset(),
+            check,
+        )
+    )
+
+
+Load = Callable[[str], Awaitable[None]]
+
+
+async def run_on_pages(
+    secrets: RuntimeSecrets,
+    password_references: frozenset[str],
+    check: Callable[[Page, BrowserActionExecutor, Load], Awaitable[None]],
+) -> None:
+    """Like ``run_on_page``, but ``load(body)`` serves and opens a new page.
+
+    One executor sees every load, as when a flow recorded on one visit is
+    replayed on a later one.
+    """
+
+    served = {"body": "<body></body>"}
+    target = TargetScope(
+        target_url=f"{SAFETY_ORIGIN}/page", permitted_origins=[SAFETY_ORIGIN]
+    )
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            page.set_default_timeout(2000)
+
+            async def serve(route: Route) -> None:
+                html = (
+                    "<!doctype html><html><head><title>Replay</title></head>"
+                    f"{served['body']}</html>"
+                )
+                await route.fulfill(status=200, content_type="text/html", body=html)
+
+            await page.route(f"{SAFETY_ORIGIN}/**", serve)
+            executor = BrowserActionExecutor(
+                page,
+                target,
+                secrets,
+                uuid4(),
+                password_references=password_references,
+            )
+
+            async def load(body: str) -> None:
+                served["body"] = body
+                await executor.execute(
+                    BrowserAction(
+                        action_type=BrowserActionType.NAVIGATE,
+                        url=f"{SAFETY_ORIGIN}/page",
+                        description="Open the page",
+                    )
+                )
+
+            await check(page, executor, load)
+        finally:
+            await browser.close()
+
+
+LOGIN_FORM = """<form id="login" action="/session" onsubmit="return false">
+    <input id="username" type="email" name="email" autocomplete="username">
+    <input id="password" type="password" name="password">
+    <button id="sign-in" type="submit"
+            onclick="document.body.dataset.signedIn = 'yes'">Sign in</button>
+</form>"""
+# A consent banner and a newsletter box inserted before the login form: the
+# newsletter's email field is the same kind of control as the username field.
+BANNER = """<div id="banner">
+    <input id="analytics" type="checkbox" name="analytics">
+    <button type="button" onclick="document.body.dataset.accepted = 'yes'">
+        Accept
+    </button>
+    <a href="/privacy">Privacy</a>
+</div>
+<form id="newsletter" action="/newsletter" onsubmit="return false">
+    <input id="newsletter-email" type="email" name="email">
+    <button type="submit" onclick="document.body.dataset.subscribed = 'yes'">
+        Subscribe
+    </button>
+</form>"""
+
+
+async def record(
+    executor: BrowserActionExecutor, action: BrowserAction
+) -> BrowserAction:
+    """Execute ``action`` and return it as a recorder would save it."""
+
+    return (await executor.execute(action)).recorded(action)
+
+
+def test_a_recorded_control_is_still_used_after_a_banner_moves_it() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor, load: Load) -> None:
+        await load(f"<body>{LOGIN_FORM}</body>")
+        flow = [
+            await record(executor, fill("control-1", "username")),
+            await record(executor, fill("control-2", "password")),
+            await record(executor, click("control-3")),
+        ]
+        assert all(action.control_fingerprint is not None for action in flow)
+        assert flow[0].control_fingerprint is not None
+        assert flow[0].control_fingerprint.form == "id=login action=/session"
+
+        await load(f"<body>{KEY_RECORDER}{BANNER}{LOGIN_FORM}</body>")
+        results = [await executor.execute(action) for action in flow]
+
+        assert await page.locator("#username").input_value() == LIVE_USERNAME
+        assert await page.locator("#password").input_value() == LIVE_PASSWORD
+        assert await page.locator("#newsletter-email").input_value() == ""
+        assert await page.evaluate("document.body.dataset.signedIn") == "yes"
+        assert await page.evaluate("document.body.dataset.accepted") is None
+        assert await page.evaluate("document.body.dataset.subscribed") is None
+        # The same controls, found further down the page.
+        assert [
+            result.control_fingerprint == action.control_fingerprint
+            for result, action in zip(results, flow, strict=True)
+        ] == [True, True, True]
+
+    asyncio.run(
+        run_on_pages(RuntimeSecrets(LOGIN_SECRETS), frozenset({"password"}), check)
+    )
+
+
+def test_a_removed_control_is_refused_without_using_the_old_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(BrowserActionExecutor, "CONTROL_LOOKUP_TIMEOUT_SECONDS", 0.3)
+
+    async def check(page: Page, executor: BrowserActionExecutor, load: Load) -> None:
+        await load(f"<body>{LOGIN_FORM}</body>")
+        username = await record(executor, fill("control-1", "username"))
+
+        # control-1 is now a search box: the same kind of control, so only
+        # the fingerprint stops the username being sent as a search.
+        await load(
+            f"""<body>{KEY_RECORDER}
+                <input id="search" type="search" name="q">
+                <input id="password" type="password" name="password"></body>"""
+        )
+        with pytest.raises(RecordedControlNotFoundError) as caught:
+            await executor.execute(username)
+
+        assert str(caught.value) == (
+            "The email input recorded for this flow as control-1 is not on the "
+            "page, so the value was not typed into it."
+        )
+        assert LIVE_USERNAME not in str(caught.value)
+        assert await page.locator("#search").input_value() == ""
+        assert await page.evaluate("window.typed") == ""
+
+    asyncio.run(
+        run_on_pages(RuntimeSecrets(LOGIN_SECRETS), frozenset({"password"}), check)
+    )
+
+
+def test_the_recorded_one_of_two_identical_controls_is_chosen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(BrowserActionExecutor, "CONTROL_LOOKUP_TIMEOUT_SECONDS", 0.3)
+    # A layout rendered twice, as a desktop and a mobile copy.
+    copies = """<input class="copy" type="text" name="code">
+        <input class="copy" type="text" name="code">"""
+
+    async def check(page: Page, executor: BrowserActionExecutor, load: Load) -> None:
+        await load(f"<body>{copies}</body>")
+        second = await record(executor, fill("control-2", "username"))
+        assert second.control_fingerprint is not None
+        assert second.control_fingerprint.ordinal == 2
+        assert second.control_fingerprint.duplicates == 2
+
+        # A banner shifts both: control-2 is now the first copy.
+        await load(f"<body>{BANNER}{copies}</body>")
+        await executor.execute(second)
+        values = await page.locator(".copy").evaluate_all(
+            "elements => elements.map(element => element.value)"
+        )
+        assert values == ["", LIVE_USERNAME]
+
+        # A third copy leaves the recorded ordinal ambiguous.
+        await load(f'<body>{KEY_RECORDER}{copies}<input type="text" name="code">')
+        with pytest.raises(RecordedControlNotFoundError, match="several controls"):
+            await executor.execute(second)
+        assert await page.evaluate("window.typed") == ""
+
+    asyncio.run(
+        run_on_pages(RuntimeSecrets(LOGIN_SECRETS), frozenset({"password"}), check)
+    )
+
+
+def test_a_generated_id_that_changes_between_loads_is_still_resolved() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor, load: Load) -> None:
+        await load('<body><input id="mat-input-0" type="email" name="email"></body>')
+        username = await record(executor, fill("control-1", "username"))
+
+        # The framework numbered a new search box first this time.
+        await load(
+            """<body>
+                <input id="mat-input-0" type="search" name="q">
+                <input id="mat-input-1" type="email" name="email"></body>"""
+        )
+        await executor.execute(username)
+
+        assert await page.locator("#mat-input-1").input_value() == LIVE_USERNAME
+        assert await page.locator("#mat-input-0").input_value() == ""
+
+    asyncio.run(
+        run_on_pages(RuntimeSecrets(LOGIN_SECRETS), frozenset({"password"}), check)
+    )
+
+
+def test_an_action_saved_without_a_fingerprint_is_resolved_by_position() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor, load: Load) -> None:
+        await load(f"<body>{LOGIN_FORM}</body>")
+        old_action = fill("control-2", "password")
+        assert old_action.control_fingerprint is None
+
+        result = await executor.execute(old_action)
+
+        assert await page.locator("#password").input_value() == LIVE_PASSWORD
+        # The control it used is fingerprinted, so a recorder can upgrade it.
+        assert result.control_fingerprint is not None
+        assert result.control_fingerprint.name == "password"
+        assert result.recorded(old_action).control_fingerprint == (
+            result.control_fingerprint
+        )
+
+    asyncio.run(
+        run_on_pages(RuntimeSecrets(LOGIN_SECRETS), frozenset({"password"}), check)
+    )
+
+
+def test_fingerprints_never_hold_what_a_field_contains() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor, load: Load) -> None:
+        await load(f"<body>{LOGIN_FORM}</body>")
+        await page.locator("#username").fill(LIVE_USERNAME)
+        await page.locator("#password").fill(LIVE_PASSWORD)
+
+        fingerprints = await executor.control_fingerprints()
+
+        saved = "".join(
+            fingerprint.model_dump_json() for fingerprint in fingerprints.values()
+        )
+        assert LIVE_USERNAME not in saved
+        assert LIVE_PASSWORD not in saved
+        assert fingerprints["control-3"].text == "Sign in"
+
+    # No runtime secrets, so redaction is not what keeps the values out.
+    asyncio.run(run_on_pages(RuntimeSecrets({}), frozenset(), check))
+
+
+def test_a_briefly_disabled_field_is_filled_once_it_is_enabled() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor) -> None:
+        await executor.execute(fill("control-1", "username"))
+        assert await page.locator("#username").input_value() == LIVE_USERNAME
+
+    asyncio.run(
+        run_on_page(
+            """<body><input id="username" type="email" disabled>
+                <script>
+                    setTimeout(() => {
+                        document.getElementById('username').disabled = false;
+                    }, 300);
+                </script></body>""",
+            RuntimeSecrets(LOGIN_SECRETS),
+            frozenset({"password"}),
+            check,
+        )
+    )
+
+
+def test_a_field_that_stays_disabled_is_refused() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor) -> None:
+        with pytest.raises(UnsafeControlError) as caught:
+            await executor.execute(fill("control-1", "username"))
+        assert str(caught.value) == (
+            "control-1 is disabled, so the value was not typed into it."
+        )
+        assert await page.locator("#username").input_value() == ""
+
+    asyncio.run(
+        run_on_page(
+            '<body><input id="username" type="email" disabled></body>',
+            RuntimeSecrets(LOGIN_SECRETS),
+            frozenset({"password"}),
             check,
         )
     )

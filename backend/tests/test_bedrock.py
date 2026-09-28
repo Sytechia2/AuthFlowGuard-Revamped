@@ -315,3 +315,19 @@ def test_bedrock_rejects_malformed_message_content(content: Any) -> None:
 def test_model_without_known_pricing_is_rejected() -> None:
     with pytest.raises(ValidationError, match="no configured price"):
         make_configuration(model_id="unknown.model-v1:0")
+
+
+def test_bedrock_cannot_supply_a_control_fingerprint() -> None:
+    # The executor fingerprints the control it acts on; a fingerprint chosen
+    # by the model could steer a replay to a different control.
+    response = make_valid_response()
+    response["output"]["message"]["content"][0]["toolUse"]["input"][
+        "control_fingerprint"
+    ] = {"tag": "input", "input_type": "search"}
+    client = BedrockActionClient(
+        make_configuration(),
+        FakeBedrockRuntimeClient(response),
+    )
+
+    with pytest.raises(BedrockResponseError, match="reserved for the executor"):
+        client.choose_action(make_observation())

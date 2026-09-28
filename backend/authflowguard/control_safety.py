@@ -1,6 +1,7 @@
 """Safety rules for acting on a resolved page control.
 
-Controls are referenced by position, so a replay against the wrong page can
+A recorded control is found by its fingerprint where it has one and by
+position otherwise, and either way a replay against the wrong page can
 resolve a reference to an unrelated element. These rules decide, from a few
 nonsecret facts about the element, whether an action may touch it at all.
 They are pure so they can be tested without a browser; the executor gathers
@@ -13,6 +14,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import Self
+
+from authflowguard.models import ControlFingerprint
 
 # Words that name an irreversible account action wherever they appear in a
 # control's label.
@@ -126,6 +129,17 @@ class ControlRefusal(Enum):
         "{control} did not accept the key within the time limit, so {outcome}."
     )
     FILL_FAILED = "The browser could not fill {control}, so {outcome}."
+    # The recorded control's fingerprint resolved to no control, or to
+    # several that its recorded ordinal no longer tells apart. The control at
+    # the recorded position is never used instead.
+    NOT_ON_PAGE = (
+        "{element} recorded for this flow as {control} is not on the page, "
+        "so {outcome}."
+    )
+    AMBIGUOUS_ON_PAGE = (
+        "{element} recorded for this flow as {control} now matches several "
+        "controls on the page, so {outcome}."
+    )
 
 
 class ControlOutcome(Enum):
@@ -135,6 +149,8 @@ class ControlOutcome(Enum):
     VALUE_NOT_TYPED = "the value was not typed into it"
     NOT_CLICKED = "it was not clicked"
     KEY_NOT_PRESSED = "no key was pressed on it"
+    NOT_SELECTED = "no option was selected in it"
+    NOT_WAITED_FOR = "the flow did not wait for it"
 
 
 _CONTROL_ID = re.compile(r"control-[1-9][0-9]{0,5}")
@@ -163,14 +179,22 @@ class UnsafeControlError(SafeMessageError):
         refusal: ControlRefusal,
         outcome: ControlOutcome,
         facts: ControlFacts | None = None,
+        *,
+        recorded: ControlFingerprint | None = None,
     ) -> None:
         if not _CONTROL_ID.fullmatch(control_id):
             control_id = "the control"
         self.control_id = control_id
         self.refusal = refusal
         self.outcome = outcome
-        # Only the fixed description is kept, never the facts' label.
-        self.element = describe_element(facts) if facts is not None else "a control"
+        # Only the fixed description is kept, never the facts' label or the
+        # fingerprint's attributes.
+        if recorded is not None:
+            self.element = describe_recorded(recorded)
+        elif facts is not None:
+            self.element = describe_element(facts)
+        else:
+            self.element = "a control"
         self.step: int | None = None
         super().__init__(self._render())
 
@@ -187,7 +211,7 @@ class UnsafeControlError(SafeMessageError):
             element=self.element,
             outcome=self.outcome.value,
         )
-        if message.startswith("the control"):
+        if message.startswith("the "):
             message = "T" + message[1:]
         if self.step is not None:
             return f"Step {self.step}: {message}"
@@ -217,24 +241,45 @@ def describe_error(error: BaseException) -> str:
     return type(error).__name__
 
 
+class RecordedControlNotFoundError(UnsafeControlError):
+    """A recorded control's fingerprint no longer resolves to one control.
+
+    The page no longer has the control the flow was recorded against, so a
+    saved flow that raises it is stale rather than unsafe to run.
+    """
+
+
+def _describe_kind(tag: str, input_type: str | None) -> str:
+    """Name a control's kind with fixed words only, without an article."""
+
+    tag = tag.lower()
+    if tag == "input":
+        effective_type = (input_type or "text").lower()
+        if effective_type in {"button", "submit", "reset", "image"}:
+            return "button"
+        if effective_type in _DESCRIBABLE_INPUT_TYPES:
+            return f"{effective_type} input"
+        return "input"
+    return {
+        "button": "button",
+        "a": "link",
+        "select": "drop-down list",
+        "textarea": "text area",
+    }.get(tag, "control")
+
+
 def describe_element(facts: ControlFacts) -> str:
     """Describe a control's kind with fixed words only."""
 
-    tag = facts.tag.lower()
-    if tag == "input":
-        input_type = (facts.input_type or "text").lower()
-        if input_type in {"button", "submit", "reset", "image"}:
-            return "a button"
-        if input_type in _DESCRIBABLE_INPUT_TYPES:
-            article = "an" if input_type[0] in "aeiou" else "a"
-            return f"{article} {input_type} input"
-        return "an input"
-    return {
-        "button": "a button",
-        "a": "a link",
-        "select": "a drop-down list",
-        "textarea": "a text area",
-    }.get(tag, "a control")
+    kind = _describe_kind(facts.tag, facts.input_type)
+    article = "an" if kind[0] in "aeiou" else "a"
+    return f"{article} {kind}"
+
+
+def describe_recorded(fingerprint: ControlFingerprint) -> str:
+    """Name a recorded control's kind with fixed words only."""
+
+    return f"the {_describe_kind(fingerprint.tag, fingerprint.input_type)}"
 
 
 def is_text_entry(facts: ControlFacts) -> bool:

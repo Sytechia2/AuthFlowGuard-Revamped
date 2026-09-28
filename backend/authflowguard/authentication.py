@@ -2,7 +2,8 @@
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from uuid import UUID
@@ -29,7 +30,7 @@ from authflowguard.automatic_actions import (
     ProgressCallback,
 )
 from authflowguard.cancellation import close_resources
-from authflowguard.control_safety import flow_step
+from authflowguard.control_safety import RecordedControlNotFoundError, flow_step
 from authflowguard.evaluation.cost_tracking import (
     CostLedger,
     CostLedgerStore,
@@ -144,6 +145,37 @@ def _prepare_guided_actions(
     return [
         _sanitize_recorded_action(action, target, runtime_secrets) for action in actions
     ]
+
+
+def _without_fingerprints(actions: list[BrowserAction]) -> list[BrowserAction]:
+    """Drop fingerprints from submitted guidance actions.
+
+    A recording keeps the fingerprint the executor reads from the control it
+    actually acted on, never one supplied with the request.
+    """
+
+    return [
+        action.model_copy(update={"control_fingerprint": None})
+        if action.control_fingerprint is not None
+        else action
+        for action in actions
+    ]
+
+
+@contextmanager
+def _saved_flow_step(step: int) -> Iterator[None]:
+    """Name the step, and treat a recorded control that is gone as staleness.
+
+    A saved flow whose control no longer resolves describes a page that has
+    changed, so it goes down the stale-profile path, which asks the
+    developer for guidance, instead of failing the scan.
+    """
+
+    try:
+        with flow_step(step):
+            yield
+    except RecordedControlNotFoundError as error:
+        raise StaleAuthProfileError(error.safe_message) from error
 
 
 def _control_id(control: SafeControlDescription) -> str:
@@ -379,10 +411,24 @@ async def _execute_steps(
     password_references: frozenset[str],
     step_control_signatures: list[dict[str, str]] | None = None,
     control_signatures_expected: dict[str, str] | None = None,
-) -> tuple[list[EvidenceEvent], list[TrafficReference], dict[str, str]]:
+    saved_flow: bool = False,
+) -> tuple[
+    list[EvidenceEvent], list[TrafficReference], dict[str, str], list[BrowserAction]
+]:
+    """Run ``steps`` and return them as recorded, with control fingerprints.
+
+    A step with a fingerprint is checked only by resolving it in the
+    executor. A step without one (a flow saved before fingerprints) is
+    checked against the position-keyed signatures, when given, and then
+    gains the fingerprint of the control it used, so the next save of the
+    flow no longer depends on positions. ``saved_flow`` sends a recorded
+    control that is gone down the stale-profile path.
+    """
+
     events: list[EvidenceEvent] = []
     traffic: list[TrafficReference] = []
     control_signatures: dict[str, str] = {}
+    recorded_steps: list[BrowserAction] = []
     executor = BrowserActionExecutor(
         page,
         target,
@@ -392,7 +438,7 @@ async def _execute_steps(
     )
     recorder = PlaywrightWorker()
     for step_idx, action in enumerate(steps):
-        if action.observed_control_id:
+        if action.observed_control_id and action.control_fingerprint is None:
             controls = await recorder.read_controls(page)
             current_sigs = {_control_id(c): _control_signature(c) for c in controls}
             current_sig = current_sigs.get(action.observed_control_id)
@@ -415,10 +461,13 @@ async def _execute_steps(
                     f"The recorded control '{action.observed_control_id}' "
                     "changed signature during replay"
                 )
-        with flow_step(step_idx + 1):
-            _collect_result(await executor.execute(action), events, traffic)
+        step = _saved_flow_step if saved_flow else flow_step
+        with step(step_idx + 1):
+            result = await executor.execute(action)
+        _collect_result(result, events, traffic)
+        recorded_steps.append(result.recorded(action))
         await _capture_control_signatures(page, control_signatures)
-    return events, traffic, control_signatures
+    return events, traffic, control_signatures, recorded_steps
 
 
 async def record_guided_flow(
@@ -436,19 +485,21 @@ async def record_guided_flow(
     ``password_references`` names the references that hold passwords.
     """
 
-    recorded_actions = _prepare_guided_actions(actions, target, runtime_secrets)
+    prepared_actions = _without_fingerprints(
+        _prepare_guided_actions(actions, target, runtime_secrets)
+    )
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
         context: BrowserContext | None = None
         try:
             context = await _new_context(browser)
             page = await context.new_page()
-            events, traffic, _control_signatures = await _execute_steps(
+            events, traffic, _signatures, recorded_actions = await _execute_steps(
                 page=page,
                 target=target,
                 runtime_secrets=runtime_secrets,
                 scan_id=scan_id,
-                steps=recorded_actions,
+                steps=prepared_actions,
                 password_references=password_references,
             )
             return GuidedFlowRecording(
@@ -517,7 +568,9 @@ async def execute_guided_verified_login_flow(
     if not account_marker_selector.strip():
         raise ValueError("The account marker selector must not be empty")
 
-    recorded_actions = _prepare_guided_actions(actions, target, runtime_secrets)
+    prepared_actions = _without_fingerprints(
+        _prepare_guided_actions(actions, target, runtime_secrets)
+    )
     events: list[EvidenceEvent] = []
     traffic: list[TrafficReference] = []
     recorder = PlaywrightWorker()
@@ -529,12 +582,17 @@ async def execute_guided_verified_login_flow(
         try:
             authenticated_context = await _new_context(browser)
             authenticated_page = await authenticated_context.new_page()
-            action_events, action_traffic, control_signatures = await _execute_steps(
+            (
+                action_events,
+                action_traffic,
+                control_signatures,
+                recorded_actions,
+            ) = await _execute_steps(
                 page=authenticated_page,
                 target=target,
                 runtime_secrets=runtime_secrets,
                 scan_id=scan_id,
-                steps=recorded_actions,
+                steps=prepared_actions,
                 password_references=password_references,
             )
             events.extend(action_events)
@@ -545,7 +603,7 @@ async def execute_guided_verified_login_flow(
                 url=protected_resource,
                 description="Open the protected resource after guided login",
             )
-            protected_events, protected_traffic, _ = await _execute_steps(
+            protected_events, protected_traffic, _, _ = await _execute_steps(
                 page=authenticated_page,
                 target=target,
                 runtime_secrets=runtime_secrets,
@@ -576,7 +634,7 @@ async def execute_guided_verified_login_flow(
                 url=protected_resource,
                 description="Open the protected resource anonymously",
             )
-            anonymous_events, anonymous_traffic, _ = await _execute_steps(
+            anonymous_events, anonymous_traffic, _, _ = await _execute_steps(
                 page=anonymous_page,
                 target=target,
                 runtime_secrets=RuntimeSecrets({}),
@@ -636,12 +694,23 @@ async def revalidate_auth_profile(
     login_steps = profile.authentication_steps.get(AuthFeature.LOGIN, [])
     if not login_steps:
         raise StaleAuthProfileError("The saved login flow has no login steps")
-    if not profile.control_signatures and not profile.step_control_signatures:
+    # A fingerprinted step is checked by resolving its fingerprint, wherever
+    # its control now sits. Position-keyed signatures check only steps saved
+    # without one; applying them to a fingerprinted flow would call it stale
+    # whenever anything was inserted before its controls.
+    fingerprinted = any(
+        action.control_fingerprint is not None for action in login_steps
+    )
+    if (
+        not fingerprinted
+        and not profile.control_signatures
+        and not profile.step_control_signatures
+    ):
         raise StaleAuthProfileError(
             "The saved login flow has no page-control signatures; guidance is required"
         )
 
-    if profile.step_control_signatures:
+    if profile.step_control_signatures or fingerprinted:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
             context: BrowserContext | None = None
@@ -666,7 +735,11 @@ async def revalidate_auth_profile(
                         password_references=password_references,
                     )
                 for step_idx, action in enumerate(login_steps):
-                    if step_idx == 1 and profile.control_signatures:
+                    if (
+                        step_idx == 1
+                        and profile.control_signatures
+                        and not fingerprinted
+                    ):
                         first_controls = await recorder.read_controls(page)
                         first_sigs = {
                             _control_id(c): _control_signature(c)
@@ -681,7 +754,10 @@ async def revalidate_auth_profile(
                                     "The saved login flow is stale: changed "
                                     f"{control_id}"
                                 )
-                    if action.observed_control_id:
+                    if (
+                        action.observed_control_id
+                        and action.control_fingerprint is None
+                    ):
                         controls = await recorder.read_controls(page)
                         current_sigs = {
                             _control_id(c): _control_signature(c) for c in controls
@@ -708,8 +784,11 @@ async def revalidate_auth_profile(
                         action.action_type is BrowserActionType.FILL
                         and runtime_secrets is None
                     ):
+                        if action.control_fingerprint is not None:
+                            with _saved_flow_step(step_idx + 1):
+                                await executor.require_control(action)
                         break
-                    with flow_step(step_idx + 1):
+                    with _saved_flow_step(step_idx + 1):
                         await executor.execute(action)
             finally:
                 await close_resources(context, browser)
@@ -814,7 +893,7 @@ async def replay_verified_auth_profile(
         try:
             authenticated_context = await _new_context(browser)
             authenticated_page = await authenticated_context.new_page()
-            action_events, action_traffic, _ = await _execute_steps(
+            action_events, action_traffic, _, recorded_steps = await _execute_steps(
                 page=authenticated_page,
                 target=target,
                 runtime_secrets=runtime_secrets,
@@ -823,6 +902,7 @@ async def replay_verified_auth_profile(
                 password_references=password_references,
                 step_control_signatures=profile.step_control_signatures,
                 control_signatures_expected=profile.control_signatures,
+                saved_flow=True,
             )
             events.extend(action_events)
             traffic.extend(action_traffic)
@@ -831,7 +911,7 @@ async def replay_verified_auth_profile(
                 url=protected_resource,
                 description="Open the saved protected resource",
             )
-            protected_events, protected_traffic, _ = await _execute_steps(
+            protected_events, protected_traffic, _, _ = await _execute_steps(
                 page=authenticated_page,
                 target=target,
                 runtime_secrets=runtime_secrets,
@@ -862,7 +942,7 @@ async def replay_verified_auth_profile(
                 url=protected_resource,
                 description="Open the saved resource anonymously",
             )
-            anonymous_events, anonymous_traffic, _ = await _execute_steps(
+            anonymous_events, anonymous_traffic, _, _ = await _execute_steps(
                 page=anonymous_page,
                 target=target,
                 runtime_secrets=RuntimeSecrets({}),
@@ -883,9 +963,11 @@ async def replay_verified_auth_profile(
             source = DiscoverySource.GUIDED
             if profile.discovery_history:
                 source = profile.discovery_history[-1].source
+            # A flow saved before fingerprints gains them here, from the
+            # controls its position-checked steps just used.
             replayed_profile = build_verified_login_profile(
                 target=target,
-                login_steps=replayed_steps,
+                login_steps=recorded_steps,
                 protected_resource=protected_resource,
                 account_marker_description=runtime_secrets.redact_text(
                     protected_check.account_marker_description
@@ -964,11 +1046,11 @@ async def execute_verified_login_flow(
                 password_reference,
                 second_factor_reference,
             )
-            login_steps = [navigation, *discovered_steps[1:]]
+            login_steps = [navigation]
             for action in discovered_steps[1:]:
-                _collect_result(
-                    await authenticated_executor.execute(action), events, traffic
-                )
+                result = await authenticated_executor.execute(action)
+                _collect_result(result, events, traffic)
+                login_steps.append(result.recorded(action))
 
             protected_action = BrowserAction(
                 action_type=BrowserActionType.NAVIGATE,

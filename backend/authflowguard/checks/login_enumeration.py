@@ -10,9 +10,8 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from authflowguard.action_executor import CONTROL_SELECTOR, BrowserActionExecutor
+from authflowguard.action_executor import BrowserActionExecutor
 from authflowguard.control_safety import describe_error, flow_step
 from authflowguard.models import (
     AuthFeature,
@@ -119,19 +118,17 @@ def _fill_references(
     return username_reference, password_reference
 
 
-async def _step_target_available(page: Page, step: BrowserAction) -> bool:
-    """Whether the control a recorded step acts on is present and visible."""
+async def _step_target_available(
+    executor: BrowserActionExecutor, step: BrowserAction
+) -> bool:
+    """Whether the control a recorded step acts on is present and visible.
 
-    if step.observed_control_id is None:
-        return True
-    number = int(step.observed_control_id.removeprefix("control-"))
-    control = page.locator(CONTROL_SELECTOR).nth(number - 1)
-    try:
-        # Allow a client-rendered step a moment to appear.
-        await control.wait_for(state="visible", timeout=STEP_APPEAR_TIMEOUT_MS)
-    except PlaywrightTimeoutError:
-        return False
-    return True
+    The executor finds it the way it will act on it: by fingerprint when the
+    step has one, otherwise by position.
+    """
+
+    # Allow a client-rendered step a moment to appear.
+    return await executor.control_is_available(step, STEP_APPEAR_TIMEOUT_MS)
 
 
 async def _run_failed_login_attempt(
@@ -176,7 +173,7 @@ async def _run_failed_login_attempt(
         for step_number, step in enumerate(steps, start=1):
             if cancel_requested():
                 raise asyncio.CancelledError("Login enumeration cancelled")
-            if steps_completed and not await _step_target_available(page, step):
+            if steps_completed and not await _step_target_available(executor, step):
                 # A multi-step login can reject an unknown identifier before
                 # the next step's control appears. That early end is the
                 # application's observable response, so it is recorded. The

@@ -348,6 +348,13 @@ class BedrockActionClient:
                 "Bedrock returned an invalid browser action"
             ) from error
 
+        if isinstance(action_input, dict) and "control_fingerprint" in action_input:
+            # The executor records a fingerprint from the control it acts on;
+            # one chosen by the model could steer it to another control.
+            raise BedrockResponseError(
+                "Bedrock returned a field reserved for the executor"
+            )
+
         if isinstance(action_input, dict) and not action_input.get("description"):
             action_input = action_input.copy()
             action_type = action_input.get("action_type", "browser")

@@ -455,7 +455,9 @@ class AutomaticBrowserController:
                 )
                 events.extend(execution.events)
                 traffic.extend(execution.traffic)
-                self._executed_actions.append(decision.action)
+                # Saved with the fingerprint of the control it acted on, so a
+                # replay finds that control even if the page shifts.
+                self._executed_actions.append(execution.recorded(decision.action))
                 self._executed_signatures.append(current_step_sigs)
                 if (
                     decision.action.action_type is BrowserActionType.FILL

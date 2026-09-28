@@ -477,8 +477,13 @@ def test_replay_control_signature_validation_rejects_tampered_control() -> None:
             )
         )
 
+        # A profile saved before fingerprints is checked by the position-keyed
+        # signatures, so tampering one makes it stale.
         tampered_profile = execution.profile.model_copy(deep=True)
-        # Tamper control signature for one of the controls
+        tampered_profile.authentication_steps[AuthFeature.LOGIN] = [
+            step.model_copy(update={"control_fingerprint": None})
+            for step in tampered_profile.authentication_steps[AuthFeature.LOGIN]
+        ]
         for cid in tampered_profile.control_signatures:
             tampered_profile.control_signatures[cid] = "corrupted_signature_hash"
             break
@@ -492,6 +497,28 @@ def test_replay_control_signature_validation_rejects_tampered_control() -> None:
                 )
             )
         assert "is stale: changed" in str(exc_info.value)
+
+        # The AI flow saved fingerprints, which are what a replay checks now:
+        # a tampered fingerprint makes the profile stale.
+        fingerprinted = execution.profile.model_copy(deep=True)
+        steps = fingerprinted.authentication_steps[AuthFeature.LOGIN]
+        control_steps = [step for step in steps if step.observed_control_id]
+        assert control_steps
+        assert all(step.control_fingerprint is not None for step in control_steps)
+        first = control_steps[0]
+        assert first.control_fingerprint is not None
+        first.control_fingerprint = first.control_fingerprint.model_copy(
+            update={"name": "corrupted-name"}
+        )
+
+        with pytest.raises(StaleAuthProfileError, match="not on the page"):
+            asyncio.run(
+                revalidate_auth_profile(
+                    profile=fingerprinted,
+                    scan_id=uuid4(),
+                    password_references=frozenset({"password"}),
+                )
+            )
 
 
 def test_durable_accounting_persistence_and_write_failure(tmp_path: Path) -> None:

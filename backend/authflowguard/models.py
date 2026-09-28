@@ -143,11 +143,46 @@ class ScanRequest(ContractModel):
         return self
 
 
+class ControlFingerprint(ContractModel):
+    """What a recorded control is, so a replay can find it wherever it moved.
+
+    Only attributes and fixed facts are kept, never what a field holds.
+    ``text`` is set only for buttons and links: their visible label, which
+    the observation sent to the model already includes. ``form`` names the
+    enclosing form by its stable attributes, or is None outside any form.
+    ``ordinal`` is the control's 1-based place among the ``duplicates``
+    controls that had the same identity when it was recorded; it tells
+    identical controls apart only while their number is unchanged.
+    """
+
+    tag: str = Field(min_length=1)
+    input_type: str | None = None
+    id: str | None = None
+    name: str | None = None
+    autocomplete: str | None = None
+    placeholder: str | None = None
+    aria_label: str | None = None
+    role: str | None = None
+    text: str | None = None
+    form: str | None = None
+    ordinal: int = Field(default=1, ge=1)
+    duplicates: int = Field(default=1, ge=1)
+
+    @model_validator(mode="after")
+    def ordinal_must_be_within_duplicates(self) -> "ControlFingerprint":
+        if self.ordinal > self.duplicates:
+            raise ValueError("ordinal must not exceed duplicates")
+        return self
+
+
 class BrowserAction(ContractModel):
     schema_version: str = SCHEMA_VERSION
     action_id: UUID = Field(default_factory=uuid4)
     action_type: BrowserActionType
     observed_control_id: str | None = None
+    # Captured by the executor when the action is recorded. Actions saved
+    # before fingerprints existed have none and are replayed by position.
+    control_fingerprint: ControlFingerprint | None = None
     url: HttpUrl | None = None
     value_reference: str | None = None
     option_value: str | None = None
@@ -157,6 +192,9 @@ class BrowserAction(ContractModel):
 
     @model_validator(mode="after")
     def required_fields_must_match_action_type(self) -> "BrowserAction":
+        if self.control_fingerprint is not None and self.observed_control_id is None:
+            raise ValueError("A control fingerprint requires observed_control_id")
+
         if self.action_type is BrowserActionType.NAVIGATE and self.url is None:
             raise ValueError("A navigate action requires url")
 
@@ -262,6 +300,9 @@ class AuthProfile(ContractModel):
     )
     relevant_traffic: list[TrafficReference] = Field(default_factory=list)
     session_references: list[SessionReference] = Field(default_factory=list)
+    # Position-keyed hashes of the page's controls. They check only steps
+    # without a control_fingerprint; a fingerprinted step is checked by
+    # resolving its fingerprint, which tolerates controls that moved.
     control_signatures: dict[str, str] = Field(default_factory=dict)
     step_control_signatures: list[dict[str, str]] = Field(default_factory=list)
     protected_resource_check: ProtectedResourceCheck | None = None
