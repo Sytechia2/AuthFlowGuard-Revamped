@@ -33,8 +33,10 @@ from authflowguard.evaluation.cost_tracking import (
 )
 from authflowguard.evaluation.model_double import DeterministicModelDouble
 from authflowguard.login_suggestions import (
+    LOGIN_OBJECTIVE,
     ClassificationBudget,
     SuggestionStatus,
+    classification_objective,
     classify_within_budget,
     observation_for_classification,
 )
@@ -872,3 +874,139 @@ def test_rules_mode_suggests_links_without_a_model(
     assert suggested["link_sources"] == {"reset_link": "rules"}
     assert double.classify_calls == 0
     assert ledger_entries(tmp_path, record) == []
+
+
+def test_objective_describes_each_requested_role_including_links() -> None:
+    # A live measurement found that naming the link roles alone made the
+    # model skip them; each role is now described and links are said to count.
+    objective = classification_objective(
+        (
+            ControlRole.USERNAME,
+            ControlRole.PASSWORD,
+            ControlRole.SUBMIT,
+            ControlRole.REGISTRATION_LINK,
+            ControlRole.RESET_LINK,
+        )
+    )
+
+    assert "registration_link: the link or button that opens the sign-up" in (objective)
+    assert "Not yet a customer?" in objective
+    assert "reset_link: the link or button that opens the forgotten-password" in (
+        objective
+    )
+    assert "whenever the page has one" in objective
+    assert (
+        classification_objective(
+            (ControlRole.USERNAME, ControlRole.PASSWORD, ControlRole.SUBMIT)
+        )
+        == LOGIN_OBJECTIVE
+    )
+
+
+def test_observation_sends_link_paths_without_origin_query_or_token() -> None:
+    controls = [
+        {
+            "observed_control_id": "control-1",
+            "tag": "a",
+            "text": "Not yet a customer?",
+            "href": "https://shop.example/#/register",
+            "visible": True,
+        },
+        {
+            "observed_control_id": "control-2",
+            "tag": "a",
+            "text": "Help",
+            "href": "https://shop.example/help?session=abc123#access_token=xyz",
+            "visible": True,
+        },
+        {
+            "observed_control_id": "control-3",
+            "tag": "a",
+            "text": "Menu",
+            "href": "javascript:void(0)",
+            "visible": True,
+        },
+    ]
+
+    observation = observation_for_classification(
+        page_url="https://shop.example/#/login",
+        page_title="Login",
+        controls=controls,
+        redact=str,
+        used_controls=["control-3"],
+    )
+    paths = {c.observed_control_id: c.link_path for c in observation.controls}
+    payload = str(observation.sanitized_dict(exclude_none=True))
+
+    assert paths == {
+        "control-1": "/#/register",
+        "control-2": "/help",
+        "control-3": None,
+    }
+    assert "abc123" not in payload
+    assert "xyz" not in payload
+    assert "shop.example/help" not in payload
+    assert observation.used_controls == ["control-3"]
+
+
+def test_a_button_used_by_an_earlier_step_is_refused_as_submit(
+    tmp_path: Path,
+) -> None:
+    # The live measurement's mistake: on a one-time-code page the model chose
+    # the first step's Continue button, which is still on the page.
+    controls = [
+        {
+            "observed_control_id": "control-1",
+            "tag": "input",
+            "type": "text",
+            "visible": True,
+        },
+        {
+            "observed_control_id": "control-2",
+            "tag": "button",
+            "type": "submit",
+            "text": "Continue",
+            "visible": True,
+        },
+        {
+            "observed_control_id": "control-3",
+            "tag": "button",
+            "type": "button",
+            "text": "Verify",
+            "visible": True,
+        },
+    ]
+    classifier = ScriptedClassifier(
+        [
+            RoleSuggestion("control-1", ControlRole.VERIFICATION_CODE),
+            RoleSuggestion("control-2", ControlRole.SUBMIT),
+        ]
+    )
+    store = CostLedgerStore(tmp_path / "cost-ledger.ndjson")
+    observation = observation_for_classification(
+        page_url="https://app.example/login",
+        page_title="Verify",
+        controls=controls,
+        redact=str,
+        used_controls=["control-2"],
+    )
+
+    suggested = classify_within_budget(
+        classifier,
+        observation,
+        controls,
+        ClassificationBudget(
+            scan_id=uuid4(),
+            limit_usd=0.05,
+            ledger=store.load_into(),
+            ledger_store=store,
+            usage_source=UsageSource.MOCK,
+            model_id="amazon.nova-micro-v1:0",
+        ),
+        roles=(ControlRole.VERIFICATION_CODE, ControlRole.SUBMIT),
+        used_controls=["control-2"],
+    )
+
+    assert classifier.observations[0].used_controls == ["control-2"]
+    assert suggested.roles.control_for(ControlRole.VERIFICATION_CODE) == "control-1"
+    assert suggested.roles.control_for(ControlRole.SUBMIT) is None

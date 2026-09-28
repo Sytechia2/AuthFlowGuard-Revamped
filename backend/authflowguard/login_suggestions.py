@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from authflowguard.bedrock import (
@@ -49,6 +50,7 @@ from authflowguard.evaluation.cost_tracking import (
     UsageSource,
     WorkflowPhase,
 )
+from authflowguard.scope import url_without_query_keeping_route
 
 Control = Mapping[str, object]
 Redact = Callable[[str], str]
@@ -56,10 +58,35 @@ Redact = Callable[[str], str]
 # A login page rarely has this many visible controls; the cap keeps a
 # cluttered page's request inside the per-request cost limit.
 MAXIMUM_CONTROLS_FOR_CLASSIFICATION = 80
+LINK_PATH_LIMIT = 200
 CLASSIFICATION_WORKFLOW = "login_discovery"
 LOGIN_OBJECTIVE = (
     "Identify the username, password and submit controls of the login form."
 )
+# What each role means, sent with the roles a request asks for. Naming a role
+# alone was not enough: in a live measurement the model never assigned a
+# link role it was asked for, because nothing said links count.
+ROLE_DESCRIPTIONS = {
+    ControlRole.USERNAME: "the field that takes the username or email address",
+    ControlRole.PASSWORD: "the password field",
+    ControlRole.SUBMIT: (
+        "the button that sends this step of the login; never a control listed "
+        "in used_controls"
+    ),
+    ControlRole.VERIFICATION_CODE: "the field that takes a one-time code",
+    ControlRole.REGISTRATION_LINK: (
+        "the link or button that opens the sign-up page, for example "
+        "'Register', 'Sign up', 'Create account' or 'Not yet a customer?'; it "
+        "is often outside the login form"
+    ),
+    ControlRole.RESET_LINK: (
+        "the link or button that opens the forgotten-password page, for "
+        "example 'Forgot your password?' or 'Reset password'; it is often "
+        "outside the login form"
+    ),
+    ControlRole.LOGOUT: "the control that signs the user out",
+    ControlRole.ACCOUNT_MENU: "the button that opens the menu holding logout",
+}
 
 
 class SuggestionSource(StrEnum):
@@ -174,7 +201,16 @@ def classification_objective(roles: Sequence[ControlRole]) -> str:
 
     if tuple(roles) == LOGIN_ROLES:
         return LOGIN_OBJECTIVE
-    return "Assign only these roles: " + ", ".join(role.value for role in roles) + "."
+    described = "; ".join(
+        f"{role.value}: {ROLE_DESCRIPTIONS[role]}"
+        if role in ROLE_DESCRIPTIONS
+        else role.value
+        for role in roles
+    )
+    return (
+        "Assign each of these roles to its control whenever the page has one, "
+        f"and only these roles: {described}."
+    )
 
 
 def rules_link_roles(
@@ -247,6 +283,19 @@ def _optional_text(control: Control, key: str, redact: Redact) -> str | None:
     return redact(value) if isinstance(value, str) else None
 
 
+def _link_path(control: Control, redact: Redact) -> str | None:
+    """A link's path and client-side route, without origin, query or token."""
+
+    href = control.get("href")
+    if not isinstance(href, str):
+        return None
+    parts = urlsplit(url_without_query_keeping_route(href))
+    if parts.scheme not in {"http", "https"}:
+        return None
+    path = (parts.path or "/") + (f"#{parts.fragment}" if parts.fragment else "")
+    return redact(path)[:LINK_PATH_LIMIT]
+
+
 def observation_for_classification(
     *,
     page_url: str,
@@ -254,8 +303,14 @@ def observation_for_classification(
     controls: Sequence[Control],
     redact: Redact,
     objective: str = LOGIN_OBJECTIVE,
+    used_controls: Sequence[str] = (),
 ) -> PageObservationForModel:
-    """Describe the visible controls for a model, without any field values."""
+    """Describe the visible controls for a model, without any field values.
+
+    A link's destination is sent as its path and client-side route only
+    (``link_path``), so the model can tell a sign-up link from a help link
+    without seeing a query string.
+    """
 
     model_controls: list[ObservedControlForModel] = []
     for control in controls:
@@ -277,6 +332,7 @@ def observation_for_classification(
                 aria_label=_optional_text(control, "aria_label", redact),
                 text=_optional_text(control, "text", redact),
                 role=_optional_text(control, "role", redact),
+                link_path=_link_path(control, redact),
                 form_index=(
                     form_index
                     if isinstance(form_index, int) and not isinstance(form_index, bool)
@@ -292,6 +348,7 @@ def observation_for_classification(
         page_title=redact(page_title),
         objective=objective,
         controls=model_controls,
+        used_controls=list(used_controls),
     )
 
 
@@ -317,6 +374,7 @@ def classify_within_budget(
     *,
     roles: Sequence[ControlRole] = LOGIN_ROLES,
     context: RoleContext | None = None,
+    used_controls: Sequence[str] = (),
 ) -> SuggestedControls:
     """Reserve, send and reconcile one classification request, then validate.
 
@@ -396,7 +454,12 @@ def classify_within_budget(
         reconcile(decision.input_tokens, decision.output_tokens)
 
     validated = _requested_roles_only(
-        validate_role_suggestions(controls, decision.suggestions, context=context),
+        validate_role_suggestions(
+            controls,
+            decision.suggestions,
+            context=context,
+            used_controls=used_controls,
+        ),
         roles,
     )
     return SuggestedControls(

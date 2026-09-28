@@ -82,7 +82,7 @@ from authflowguard.login_suggestions import (
     observation_for_classification,
 )
 from authflowguard.models import BrowserAction, BrowserActionType, TargetScope
-from authflowguard.playwright_worker import PlaywrightWorker
+from authflowguard.playwright_worker import CONTROL_SELECTOR, PlaywrightWorker
 from authflowguard.scope import url_without_query_keeping_route
 from authflowguard.secrets import RuntimeSecrets
 
@@ -637,6 +637,34 @@ class ObservedPage:
     title: str
     controls: list[dict[str, Any]]
     error: str | None = None
+    # Controls the page's own setup steps clicked, such as the first step's
+    # Continue button on a one-time-code page.
+    used_controls: list[str] = field(default_factory=list)
+
+
+# The id of the control the selector names, numbered as ``read_controls``
+# numbers controls (the Nth element matching the control selector).
+_CONTROL_ID_SCRIPT = """([selector, controlSelector]) => {
+    const element = document.querySelector(selector);
+    if (!element) return null;
+    const index = [...document.querySelectorAll(controlSelector)].indexOf(element);
+    return index < 0 ? null : `control-${index + 1}`;
+}"""
+
+
+async def _clicked_controls(page: Page, steps: Iterable[SetupStep]) -> list[str]:
+    """The ids, on the current page, of the controls these steps clicked."""
+
+    used: list[str] = []
+    for step in steps:
+        if step.kind not in {"click", "click_if_present"}:
+            continue
+        control_id = await page.evaluate(
+            _CONTROL_ID_SCRIPT, [step.target, CONTROL_SELECTOR]
+        )
+        if isinstance(control_id, str) and control_id not in used:
+            used.append(control_id)
+    return used
 
 
 async def _run_steps(
@@ -699,6 +727,7 @@ async def observe_application(
                         url=url_without_query_keeping_route(page.url),
                         title=await page.title(),
                         controls=[dict(control) for control in controls],
+                        used_controls=await _clicked_controls(page, truth.steps),
                     )
                 except (PlaywrightError, KeyError) as error:
                     first_line = (str(error).splitlines() or [""])[0]
@@ -792,6 +821,7 @@ def classify_page(
         controls=observed.controls,
         redact=redact,
         objective=classification_objective(roles),
+        used_controls=observed.used_controls,
     )
     if isinstance(classifier.inner, RulesClassifier):
         classifier.inner.controls = observed.controls
@@ -805,7 +835,13 @@ def classify_page(
     before = len(budget.ledger)
     classifier.last = None
     suggested = classify_within_budget(
-        classifier, observation, observed.controls, budget, roles=roles, context=context
+        classifier,
+        observation,
+        observed.controls,
+        budget,
+        roles=roles,
+        context=context,
+        used_controls=observed.used_controls,
     )
     decision = classifier.last
     if (
@@ -1204,6 +1240,7 @@ def _measure_application(
                 controls=observed.controls,
                 redact=redact,
                 objective=classification_objective(truth.requested_roles),
+                used_controls=observed.used_controls,
             ),
             settings,
         )

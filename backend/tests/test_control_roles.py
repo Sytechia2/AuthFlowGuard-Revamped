@@ -238,6 +238,51 @@ def test_verification_code_accepts_a_text_like_input_even_while_hidden() -> None
     assert rejected.rejected[0].reason is RoleRejection.NOT_TEXT_FIELD
 
 
+# A one-time-code page that still shows the first step's Continue button, as
+# the React/JSON fixture does. A live model picked Continue as the submit.
+CODE_STEP = [
+    control("control-1", "input", "email", id="username"),
+    control("control-2", "button", "submit", id="continue", text="Continue"),
+    control("control-3", "input", "text", id="verification-code"),
+    control("control-4", "button", "button", id="verify", text="Verify"),
+]
+
+
+def test_a_control_used_by_an_earlier_step_is_not_the_submit() -> None:
+    validated = validate_role_suggestions(
+        CODE_STEP,
+        suggest(
+            ("control-3", ControlRole.VERIFICATION_CODE),
+            ("control-2", ControlRole.SUBMIT),
+        ),
+        used_controls=["control-2"],
+    )
+
+    assert validated.control_for(ControlRole.VERIFICATION_CODE) == "control-3"
+    assert validated.control_for(ControlRole.SUBMIT) is None
+    assert validated.rejected == (
+        RejectedSuggestion("control-2", ControlRole.SUBMIT, RoleRejection.ALREADY_USED),
+    )
+
+
+def test_the_new_step_button_and_other_roles_are_unaffected_by_used_controls() -> None:
+    submit = validate_role_suggestions(
+        CODE_STEP,
+        suggest(("control-4", ControlRole.SUBMIT)),
+        used_controls=["control-2"],
+    )
+    # Only submit is restricted: an account menu opened by an earlier step is
+    # still the account menu.
+    menu = validate_role_suggestions(
+        [control("control-1", "button", aria_label="Account", has_popup=True)],
+        suggest(("control-1", ControlRole.ACCOUNT_MENU)),
+        used_controls=["control-1"],
+    )
+
+    assert submit.control_for(ControlRole.SUBMIT) == "control-4"
+    assert menu.control_for(ControlRole.ACCOUNT_MENU) == "control-1"
+
+
 def test_unknown_controls_are_rejected() -> None:
     validated = validate_role_suggestions(
         JUICE_SHOP_LIKE, suggest(("control-99", ControlRole.PASSWORD))

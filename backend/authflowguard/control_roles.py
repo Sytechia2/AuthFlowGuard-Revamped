@@ -12,7 +12,7 @@ Every rejection is a fixed reason code. Nothing here returns page text.
 """
 
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from urllib.parse import urlsplit
@@ -93,6 +93,9 @@ class RoleRejection(StrEnum):
     NO_DESTINATION = "no_destination"
     OUT_OF_SCOPE = "out_of_scope"
     SAME_PAGE = "same_page_link"
+    # A multi-step login can leave an earlier step's button on the page; the
+    # button that finished a previous step does not finish the next one.
+    ALREADY_USED = "already_used_in_earlier_step"
 
 
 # Attribute types (lower-cased; no attribute means text) that accept a
@@ -352,6 +355,7 @@ def validate_role_suggestions(
     suggestions: Iterable[RoleSuggestion],
     *,
     context: RoleContext | None = None,
+    used_controls: Collection[str] = (),
 ) -> ValidatedRoles:
     """Keep each suggested role only if its control fits it.
 
@@ -375,7 +379,9 @@ def validate_role_suggestions(
     - one control per role and one role per control: when a role names
       several controls, or a control is given several roles, all of those
       suggestions are dropped;
-    - the username must be in the password's form.
+    - the username must be in the password's form;
+    - ``submit`` must not be one of ``used_controls``, the controls an
+      earlier step of the same flow already acted on.
 
     ``other`` is ignored. Without ``context`` no link can be accepted for a
     role that leads to another page.
@@ -418,6 +424,11 @@ def validate_role_suggestions(
             reject(suggestion, RoleRejection.SEVERAL_CONTROLS)
         elif len(roles_per_control[suggestion.observed_control_id]) > 1:
             reject(suggestion, RoleRejection.SEVERAL_ROLES)
+        elif (
+            suggestion.role is ControlRole.SUBMIT
+            and suggestion.observed_control_id in used_controls
+        ):
+            reject(suggestion, RoleRejection.ALREADY_USED)
         elif (
             reason := _kind_rejection(suggestion.role, observed, context)
         ) is not None:
