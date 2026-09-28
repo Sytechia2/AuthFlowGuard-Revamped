@@ -498,6 +498,221 @@ describe("setup workflow", () => {
     );
   });
 
+  function suggestedControl(
+    id: string,
+    tag: string,
+    type: string | null,
+    label: string,
+  ) {
+    return {
+      observed_control_id: id,
+      tag,
+      id: null,
+      name: null,
+      type,
+      placeholder: null,
+      autocomplete: null,
+      aria_label: label,
+      text: null,
+      value_present: tag === "input" ? false : null,
+      visible: true,
+    };
+  }
+
+  async function openDiscoveryWithObservation(observation: unknown) {
+    const fetchMock = setupMockFetch([
+      {
+        url: "/api/scans",
+        method: "POST",
+        response: { scan_id: "suggested-scan", state: "created" },
+        status: 201,
+      },
+      {
+        url: "/api/scans/suggested-scan/start",
+        method: "POST",
+        response: { scan_id: "suggested-scan", state: "running" },
+      },
+      {
+        url: "/api/scans/suggested-scan",
+        response: {
+          scan_id: "suggested-scan",
+          state: "awaiting_guidance",
+          target_url: "https://shop.example.test/#/login",
+          error: "Expected one submit control, found 5",
+          event_count: 0,
+          evidence_count: 0,
+          result_count: 0,
+          results: [],
+        },
+      },
+      {
+        url: "/api/scans/suggested-scan/guidance/observe",
+        method: "POST",
+        response: observation,
+      },
+      {
+        url: "/api/scans/suggested-scan/guidance",
+        method: "POST",
+        response: { scan_id: "suggested-scan", state: "running" },
+      },
+    ]);
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("Target URL"), {
+      target: { value: "https://shop.example.test/#/login" },
+    });
+    fireEvent.change(screen.getByLabelText("Permitted origins"), {
+      target: { value: "https://shop.example.test" },
+    });
+    fireEvent.change(screen.getByLabelText("Known account username"), {
+      target: { value: "developer@example.test" },
+    });
+    fireEvent.change(screen.getByLabelText("Known account password"), {
+      target: { value: "known-password" },
+    });
+    fireEvent.change(screen.getByLabelText("Nonexistent account username"), {
+      target: { value: "missing@example.test" },
+    });
+    fireEvent.change(screen.getByLabelText("Invalid password"), {
+      target: { value: "wrong-password" },
+    });
+    fireEvent.change(screen.getByLabelText("Protected resource URL"), {
+      target: { value: "https://shop.example.test/#/account" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /start local scan/i }));
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: "Open Discovery" }),
+      ).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open Discovery" }));
+    await waitFor(() => {
+      expect(
+        screen.getByRole("heading", { name: "Help us log in" }),
+      ).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Find login fields" }));
+    await waitFor(() => {
+      expect(screen.getByText("control-6")).toBeInTheDocument();
+    });
+    return fetchMock;
+  }
+
+  const juiceShopLikeControls = [
+    suggestedControl("control-2", "input", "text", "Search"),
+    suggestedControl("control-3", "button", null, "Add to Basket"),
+    suggestedControl("control-5", "input", null, "Login email"),
+    suggestedControl("control-6", "input", "password", "Login password"),
+    suggestedControl("control-7", "button", "submit", "Login"),
+    suggestedControl("control-8", "button", null, "Show password"),
+  ];
+
+  test("pre-fills AI-suggested sign-in controls and submits the user's choices", async () => {
+    const fetchMock = await openDiscoveryWithObservation({
+      url: "https://shop.example.test/",
+      title: "Shop",
+      controls: juiceShopLikeControls,
+      suggested_controls: {
+        username: "control-5",
+        password: "control-6",
+        submit: "control-7",
+        source: "ai",
+        status: "ai_suggested",
+        rejected: [],
+      },
+    });
+
+    expect(
+      screen.getByText("Suggested by AI — check before continuing."),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Username or email field")).toHaveValue(
+      "control-5",
+    );
+    expect(screen.getByLabelText("Password field")).toHaveValue("control-6");
+    expect(screen.getByLabelText("Sign-in button")).toHaveValue("control-7");
+    // Nothing is sent until the user presses the submit button.
+    expect(
+      fetchMock.mock.calls.some(
+        ([input]) => input === "/api/scans/suggested-scan/guidance",
+      ),
+    ).toBe(false);
+
+    fireEvent.change(screen.getByLabelText("Sign-in button"), {
+      target: { value: "control-8" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: /save and verify guided flow/i }),
+    );
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/scans/suggested-scan/guidance",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+    const call = fetchMock.mock.calls.find(
+      ([input]) => input === "/api/scans/suggested-scan/guidance",
+    ) as [string, RequestInit];
+    const body = JSON.parse(String(call[1].body)) as {
+      actions: { action_type: string; observed_control_id?: string }[];
+    };
+    expect(body.actions.map((action) => action.observed_control_id)).toEqual([
+      undefined,
+      "control-5",
+      "control-6",
+      "control-8",
+    ]);
+  });
+
+  test("labels rules suggestions and ignores ones that are not options", async () => {
+    await openDiscoveryWithObservation({
+      url: "https://shop.example.test/",
+      title: "Shop",
+      controls: juiceShopLikeControls,
+      suggested_controls: {
+        username: "control-5",
+        password: "control-6",
+        // Not a button, so it is not an option of the sign-in dropdown.
+        submit: "control-2",
+        source: "rules",
+        status: "rules_detected",
+        rejected: [],
+      },
+    });
+
+    expect(
+      screen.getByText(
+        "Detected from the page's labels — check before continuing.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Username or email field")).toHaveValue(
+      "control-5",
+    );
+    expect(screen.getByLabelText("Sign-in button")).toHaveValue("");
+  });
+
+  test("shows no note and pre-fills nothing without suggestions", async () => {
+    await openDiscoveryWithObservation({
+      url: "https://shop.example.test/",
+      title: "Shop",
+      controls: juiceShopLikeControls,
+      suggested_controls: {
+        username: null,
+        password: null,
+        submit: null,
+        source: null,
+        status: "ai_failed",
+        rejected: [],
+      },
+    });
+
+    expect(
+      screen.queryByText(/check before continuing/),
+    ).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Username or email field")).toHaveValue("");
+    expect(screen.getByLabelText("Password field")).toHaveValue("");
+  });
+
   test("navigation switches between testing and results views", () => {
     mockHealthResponse(true, "ok");
     render(<App />);

@@ -108,8 +108,21 @@ type SafeControl = {
   placeholder: string | null;
   autocomplete: string | null;
   aria_label: string | null;
+  text?: string | null;
   value_present: boolean | null;
   visible: boolean;
+};
+
+type SuggestionSource = "rules" | "ai";
+
+// Controls the backend suggests for each sign-in question. The backend has
+// already checked that each one fits its role; the developer still confirms.
+type SuggestedControls = {
+  username: string | null;
+  password: string | null;
+  submit: string | null;
+  source: SuggestionSource | null;
+  status?: string;
 };
 
 type GuidanceActionType = "navigate" | "fill" | "click";
@@ -126,6 +139,7 @@ type GuidanceObservation = {
   url?: string;
   title?: string;
   controls: SafeControl[];
+  suggested_controls?: SuggestedControls | null;
 };
 
 function controlLabel(control: SafeControl): string {
@@ -134,9 +148,66 @@ function controlLabel(control: SafeControl): string {
     control.name ??
     control.id ??
     control.placeholder ??
+    control.text ??
     (control.type === "password" ? "Password field" : "Unnamed control");
   const kind = control.type ? ` (${control.type})` : "";
   return `${label}${kind}`;
+}
+
+function isUsernameOption(control: SafeControl): boolean {
+  return (
+    control.visible && control.tag === "input" && control.type !== "password"
+  );
+}
+
+function isPasswordOption(control: SafeControl): boolean {
+  return (
+    control.visible && control.tag === "input" && control.type === "password"
+  );
+}
+
+function isSubmitOption(control: SafeControl): boolean {
+  return (
+    control.visible &&
+    (control.tag === "button" ||
+      (control.tag === "input" &&
+        ["submit", "button", "image"].includes(control.type ?? "")))
+  );
+}
+
+const suggestionNotes: Record<SuggestionSource, string> = {
+  ai: "Suggested by AI — check before continuing.",
+  rules: "Detected from the page's labels — check before continuing.",
+};
+
+// The step index of each sign-in question in the guided flow.
+const suggestedSteps: {
+  step: number;
+  role: "username" | "password" | "submit";
+  isOption: (control: SafeControl) => boolean;
+}[] = [
+  { step: 1, role: "username", isOption: isUsernameOption },
+  { step: 2, role: "password", isOption: isPasswordOption },
+  { step: 3, role: "submit", isOption: isSubmitOption },
+];
+
+// Pre-select only a suggestion that is one of the dropdown's own options.
+function suggestedControlIds(
+  observation: GuidanceObservation,
+): Map<number, string> {
+  const suggested = observation.suggested_controls;
+  const chosen = new Map<number, string>();
+  if (!suggested?.source) return chosen;
+  for (const { step, role, isOption } of suggestedSteps) {
+    const controlId = suggested[role];
+    const control = observation.controls.find(
+      (candidate) => candidate.observed_control_id === controlId,
+    );
+    if (control && isOption(control)) {
+      chosen.set(step, control.observed_control_id);
+    }
+  }
+  return chosen;
 }
 
 const workflowViews: WorkflowView[] = [
@@ -1017,6 +1088,8 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
   const [isObserving, setIsObserving] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [suggestionSource, setSuggestionSource] =
+    useState<SuggestionSource | null>(null);
 
   useEffect(() => {
     if (!scanId) return;
@@ -1068,12 +1141,20 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
       // Navigate to the address the user typed: the observed URL can lose a
       // hash route such as #/login and replay would open the app's home page.
       const navigateUrl = requestedUrl || (observed.url ?? "");
+      // Pre-select the suggested controls. The developer can change any of
+      // them and must still submit the flow themselves.
+      const suggestedIds = suggestedControlIds(observed);
       setActions((currentActions) =>
         currentActions.map((action, index) =>
           index === 0
             ? { ...action, url: navigateUrl }
-            : { ...action, controlId: "" },
+            : { ...action, controlId: suggestedIds.get(index) ?? "" },
         ),
+      );
+      setSuggestionSource(
+        suggestedIds.size > 0
+          ? (observed.suggested_controls?.source ?? null)
+          : null,
       );
     } catch (observeError) {
       setError(
@@ -1269,6 +1350,11 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
           Choose the recognizable controls below. The selected values are saved
           as safe references; live usernames and passwords never enter the flow.
         </p>
+        {suggestionSource && (
+          <p className="suggestion-note" role="status">
+            {suggestionNotes[suggestionSource]}
+          </p>
+        )}
         <div className="guided-questions">
           <label className="field">
             <span>Which field is your username or email?</span>
@@ -1282,12 +1368,7 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
             >
               <option value="">Choose a field</option>
               {(observation?.controls ?? [])
-                .filter(
-                  (control) =>
-                    control.visible &&
-                    control.tag === "input" &&
-                    control.type !== "password",
-                )
+                .filter(isUsernameOption)
                 .map((control) => (
                   <option
                     key={control.observed_control_id}
@@ -1310,12 +1391,7 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
             >
               <option value="">Choose a field</option>
               {(observation?.controls ?? [])
-                .filter(
-                  (control) =>
-                    control.visible &&
-                    control.tag === "input" &&
-                    control.type === "password",
-                )
+                .filter(isPasswordOption)
                 .map((control) => (
                   <option
                     key={control.observed_control_id}
@@ -1338,13 +1414,7 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
             >
               <option value="">Choose a button</option>
               {(observation?.controls ?? [])
-                .filter(
-                  (control) =>
-                    control.visible &&
-                    (control.tag === "button" ||
-                      (control.tag === "input" &&
-                        ["submit", "button"].includes(control.type ?? ""))),
-                )
+                .filter(isSubmitOption)
                 .map((control) => (
                   <option
                     key={control.observed_control_id}
