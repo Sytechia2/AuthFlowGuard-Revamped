@@ -21,6 +21,15 @@ from playwright.async_api import (
 )
 
 from authflowguard.cancellation import cancellation_checkpoint
+from authflowguard.control_safety import (
+    ControlFacts,
+    ControlOutcome,
+    ControlRefusal,
+    UnsafeControlError,
+    activation_refusal,
+    describe_element,
+    fill_refusal,
+)
 from authflowguard.evidence import publish_completed_events
 from authflowguard.models import (
     ActionWaitCondition,
@@ -36,6 +45,32 @@ from authflowguard.scope import url_is_in_scope, url_without_query_or_fragment
 from authflowguard.secrets import RuntimeSecrets
 
 CONTROL_SELECTOR = "input, button, select, textarea, a[href]"
+
+# Reads only nonsecret facts about a control. A text field's value is never
+# read: it may already hold a credential. Button-like inputs show their value
+# as their label, so theirs is read.
+_CONTROL_FACTS_SCRIPT = """element => {
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    const tag = element.tagName.toLowerCase();
+    const inputType = tag === 'input' ? String(element.type).toLowerCase() : null;
+    const parts = [element.getAttribute('aria-label'), element.getAttribute('title')];
+    if (tag === 'button' || tag === 'a') {
+        parts.push(element.innerText);
+    } else if (['button', 'submit', 'reset', 'image'].includes(inputType)) {
+        parts.push(element.value, element.getAttribute('alt'));
+    }
+    return {
+        tag,
+        input_type: inputType,
+        visible: rect.width > 0 && rect.height > 0
+            && style.visibility !== 'hidden' && style.visibility !== 'collapse',
+        enabled: !element.matches(':disabled')
+            && element.getAttribute('aria-disabled') !== 'true',
+        read_only: !!element.readOnly,
+        label: parts.filter(Boolean).join(' ').slice(0, 500),
+    };
+}"""
 
 
 class InvalidControlReferenceError(ValueError):
@@ -99,11 +134,23 @@ class BrowserActionExecutor:
         target: TargetScope,
         secrets: RuntimeSecrets,
         scan_id: UUID,
+        *,
+        password_references: frozenset[str],
     ) -> None:
+        """Bind the executor to one page, scope and set of runtime secrets.
+
+        ``password_references`` names the secret references that hold
+        passwords. It is required so that every caller states it: a password
+        is typed only into a password field, and a password field receives
+        only one of these references. Pass an empty set when the caller never
+        fills a password.
+        """
+
         self._page = page
         self._target = target
         self._secrets = secrets
         self._scan_id = scan_id
+        self._password_references = frozenset(password_references)
         self._scope_guard_installed = False
 
     async def execute(self, action: BrowserAction) -> ActionExecutionResult:
@@ -400,6 +447,9 @@ class BrowserActionExecutor:
 
     async def _click(self, action: BrowserAction) -> None:
         control = await self._find_control(action.observed_control_id)
+        await self._require_activatable(
+            control, action.observed_control_id, ControlOutcome.NOT_CLICKED
+        )
         async with background_requests_settled(self._page):
             await control.click()
         try:
@@ -417,6 +467,26 @@ class BrowserActionExecutor:
         if action.value_reference is None:
             raise ValueError("A fill action requires value_reference")
 
+        password_value = action.value_reference in self._password_references
+        outcome = (
+            ControlOutcome.PASSWORD_NOT_TYPED
+            if password_value
+            else ControlOutcome.VALUE_NOT_TYPED
+        )
+        control_id = action.observed_control_id or ""
+        facts = await self._read_control_facts(control)
+        refusal = fill_refusal(facts, password_value=password_value)
+        if refusal is ControlRefusal.NOT_VISIBLE:
+            await self._wait_until_visible(control, control_id, facts, outcome)
+            facts = await self._read_control_facts(control)
+            refusal = fill_refusal(facts, password_value=password_value)
+        if refusal is not None:
+            raise UnsafeControlError(
+                control_id, refusal, outcome, describe_element(facts)
+            )
+
+        # Resolve only after every check passed, so a refused action never
+        # holds the live value.
         live_value = self._secrets.resolve(action.value_reference)
         await control.fill(live_value)
 
@@ -434,6 +504,9 @@ class BrowserActionExecutor:
                 return
 
             control = await self._find_control(action.observed_control_id)
+            await self._require_activatable(
+                control, action.observed_control_id, ControlOutcome.KEY_NOT_PRESSED
+            )
             await control.press(action.key)
 
     async def _wait(self, action: BrowserAction) -> None:
@@ -456,6 +529,58 @@ class BrowserActionExecutor:
             await self._page.wait_for_load_state("domcontentloaded")
         else:
             await self._page.wait_for_load_state("networkidle")
+
+    async def _read_control_facts(self, control: Locator) -> ControlFacts:
+        facts = await control.evaluate(_CONTROL_FACTS_SCRIPT)
+        return ControlFacts(
+            tag=str(facts["tag"]),
+            input_type=(
+                str(facts["input_type"]) if facts["input_type"] is not None else None
+            ),
+            visible=bool(facts["visible"]),
+            enabled=bool(facts["enabled"]),
+            read_only=bool(facts["read_only"]),
+            label=str(facts["label"]),
+        )
+
+    async def _wait_until_visible(
+        self,
+        control: Locator,
+        control_id: str,
+        facts: ControlFacts,
+        outcome: ControlOutcome,
+    ) -> None:
+        """Allow a client-rendered control the page's usual time to appear."""
+
+        try:
+            await control.wait_for(state="visible")
+        except PlaywrightTimeoutError as error:
+            raise UnsafeControlError(
+                control_id,
+                ControlRefusal.NOT_VISIBLE,
+                outcome,
+                describe_element(facts),
+            ) from error
+
+    async def _require_activatable(
+        self,
+        control: Locator,
+        observed_control_id: str | None,
+        outcome: ControlOutcome,
+    ) -> None:
+        """Refuse to click or send keys to a hidden or destructive control."""
+
+        control_id = observed_control_id or ""
+        facts = await self._read_control_facts(control)
+        refusal = activation_refusal(facts)
+        if refusal is ControlRefusal.NOT_VISIBLE:
+            await self._wait_until_visible(control, control_id, facts, outcome)
+            facts = await self._read_control_facts(control)
+            refusal = activation_refusal(facts)
+        if refusal is not None:
+            raise UnsafeControlError(
+                control_id, refusal, outcome, describe_element(facts)
+            )
 
     async def _find_control(self, observed_control_id: str | None) -> Locator:
         control_number = self._parse_control_number(observed_control_id)

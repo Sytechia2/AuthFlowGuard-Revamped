@@ -375,13 +375,20 @@ async def _execute_steps(
     runtime_secrets: RuntimeSecrets,
     scan_id: UUID,
     steps: list[BrowserAction],
+    password_references: frozenset[str],
     step_control_signatures: list[dict[str, str]] | None = None,
     control_signatures_expected: dict[str, str] | None = None,
 ) -> tuple[list[EvidenceEvent], list[TrafficReference], dict[str, str]]:
     events: list[EvidenceEvent] = []
     traffic: list[TrafficReference] = []
     control_signatures: dict[str, str] = {}
-    executor = BrowserActionExecutor(page, target, runtime_secrets, scan_id)
+    executor = BrowserActionExecutor(
+        page,
+        target,
+        runtime_secrets,
+        scan_id,
+        password_references=password_references,
+    )
     recorder = PlaywrightWorker()
     for step_idx, action in enumerate(steps):
         if action.observed_control_id:
@@ -418,11 +425,13 @@ async def record_guided_flow(
     target: TargetScope,
     runtime_secrets: RuntimeSecrets,
     actions: list[BrowserAction],
+    password_references: frozenset[str],
 ) -> GuidedFlowRecording:
     """Execute and retain a developer-guided flow as safe structured actions.
 
     A caller supplies actions created by the guidance UI. Fill actions must use
     local credential references; live values are resolved only by the executor.
+    ``password_references`` names the references that hold passwords.
     """
 
     recorded_actions = _prepare_guided_actions(actions, target, runtime_secrets)
@@ -438,6 +447,7 @@ async def record_guided_flow(
                 runtime_secrets=runtime_secrets,
                 scan_id=scan_id,
                 steps=recorded_actions,
+                password_references=password_references,
             )
             return GuidedFlowRecording(
                 actions=recorded_actions,
@@ -468,7 +478,9 @@ async def observe_guidance_page(
         try:
             context = await _new_context(browser)
             page = await context.new_page()
-            executor = BrowserActionExecutor(page, target, runtime_secrets, scan_id)
+            executor = BrowserActionExecutor(
+                page, target, runtime_secrets, scan_id, password_references=frozenset()
+            )
             navigation = BrowserAction(
                 action_type=BrowserActionType.NAVIGATE,
                 url=page_url,
@@ -488,11 +500,15 @@ async def execute_guided_verified_login_flow(
     target: TargetScope,
     runtime_secrets: RuntimeSecrets,
     actions: list[BrowserAction],
+    password_references: frozenset[str],
     protected_resource: str,
     account_marker_selector: str,
     account_marker_description: str,
 ) -> VerifiedLoginExecution:
-    """Record a guided login and verify it against an isolated anonymous context."""
+    """Record a guided login and verify it against an isolated anonymous context.
+
+    ``password_references`` names the references that hold passwords.
+    """
 
     if not url_is_in_scope(protected_resource, target):
         raise ValueError("The protected resource is outside permitted_origins")
@@ -517,6 +533,7 @@ async def execute_guided_verified_login_flow(
                 runtime_secrets=runtime_secrets,
                 scan_id=scan_id,
                 steps=recorded_actions,
+                password_references=password_references,
             )
             events.extend(action_events)
             traffic.extend(action_traffic)
@@ -532,6 +549,7 @@ async def execute_guided_verified_login_flow(
                 runtime_secrets=runtime_secrets,
                 scan_id=scan_id,
                 steps=[protected_action],
+                password_references=frozenset(),
             )
             events.extend(protected_events)
             traffic.extend(protected_traffic)
@@ -562,6 +580,7 @@ async def execute_guided_verified_login_flow(
                 runtime_secrets=RuntimeSecrets({}),
                 scan_id=scan_id,
                 steps=[anonymous_action],
+                password_references=frozenset(),
             )
             events.extend(anonymous_events)
             traffic.extend(anonymous_traffic)
@@ -603,9 +622,14 @@ async def revalidate_auth_profile(
     *,
     profile: AuthProfile,
     scan_id: UUID,
+    password_references: frozenset[str],
     runtime_secrets: RuntimeSecrets | None = None,
 ) -> None:
-    """Confirm that a saved flow still describes the current login page."""
+    """Confirm that a saved flow still describes the current login page.
+
+    ``password_references`` names the references that hold passwords; it is
+    used only when ``runtime_secrets`` lets the saved fills run.
+    """
 
     login_steps = profile.authentication_steps.get(AuthFeature.LOGIN, [])
     if not login_steps:
@@ -627,12 +651,17 @@ async def revalidate_auth_profile(
                     profile.target,
                     RuntimeSecrets({}),
                     scan_id,
+                    password_references=password_references,
                 )
                 recorder = PlaywrightWorker()
 
                 if runtime_secrets is not None:
                     executor = BrowserActionExecutor(
-                        page, profile.target, runtime_secrets, scan_id
+                        page,
+                        profile.target,
+                        runtime_secrets,
+                        scan_id,
+                        password_references=password_references,
                     )
                 for step_idx, action in enumerate(login_steps):
                     if step_idx == 1 and profile.control_signatures:
@@ -708,6 +737,7 @@ async def revalidate_auth_profile(
                 profile.target,
                 RuntimeSecrets({}),
                 scan_id,
+                password_references=frozenset(),
             )
             await executor.execute(navigation)
             current_controls = await PlaywrightWorker().read_controls(page)
@@ -745,9 +775,13 @@ async def replay_verified_auth_profile(
     profile: AuthProfile,
     scan_id: UUID,
     runtime_secrets: RuntimeSecrets,
+    password_references: frozenset[str],
     account_marker_selector: str,
 ) -> VerifiedLoginExecution:
-    """Replay a saved login flow in fresh authenticated and anonymous contexts."""
+    """Replay a saved login flow in fresh authenticated and anonymous contexts.
+
+    ``password_references`` names the references that hold passwords.
+    """
 
     login_steps = profile.authentication_steps.get(AuthFeature.LOGIN, [])
     if not login_steps:
@@ -783,6 +817,7 @@ async def replay_verified_auth_profile(
                 runtime_secrets=runtime_secrets,
                 scan_id=scan_id,
                 steps=replayed_steps,
+                password_references=password_references,
                 step_control_signatures=profile.step_control_signatures,
                 control_signatures_expected=profile.control_signatures,
             )
@@ -799,6 +834,7 @@ async def replay_verified_auth_profile(
                 runtime_secrets=runtime_secrets,
                 scan_id=scan_id,
                 steps=[protected_action],
+                password_references=frozenset(),
             )
             events.extend(protected_events)
             traffic.extend(protected_traffic)
@@ -829,6 +865,7 @@ async def replay_verified_auth_profile(
                 runtime_secrets=RuntimeSecrets({}),
                 scan_id=scan_id,
                 steps=[anonymous_action],
+                password_references=frozenset(),
             )
             events.extend(anonymous_events)
             traffic.extend(anonymous_traffic)
@@ -904,6 +941,7 @@ async def execute_verified_login_flow(
                 target,
                 runtime_secrets,
                 scan_id,
+                password_references=frozenset({password_reference}),
             )
             navigation = BrowserAction(
                 action_type=BrowserActionType.NAVIGATE,
@@ -958,6 +996,7 @@ async def execute_verified_login_flow(
                 target,
                 RuntimeSecrets({}),
                 scan_id,
+                password_references=frozenset(),
             )
             anonymous_protected_action = BrowserAction(
                 action_type=BrowserActionType.NAVIGATE,
@@ -1066,6 +1105,7 @@ async def execute_ai_verified_login_flow(
                 action_client=action_client,
                 limits=limits,
                 credential_references=credential_references,
+                password_references=frozenset({password_reference}),
                 progress_callback=progress_callback,
                 usage_callback=usage_callback,
                 event_sink=event_sink,
@@ -1102,6 +1142,7 @@ async def execute_ai_verified_login_flow(
                 target,
                 runtime_secrets,
                 scan_id,
+                password_references=frozenset({password_reference}),
             )
             protected_action = BrowserAction(
                 action_type=BrowserActionType.NAVIGATE,
@@ -1153,6 +1194,7 @@ async def execute_ai_verified_login_flow(
                 target,
                 RuntimeSecrets({}),
                 scan_id,
+                password_references=frozenset(),
             )
             anonymous_protected_action = BrowserAction(
                 action_type=BrowserActionType.NAVIGATE,

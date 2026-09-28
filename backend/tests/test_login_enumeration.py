@@ -194,6 +194,7 @@ async def run_check(profile: AuthProfile) -> LoginEnumerationRun:
         known_identifier_reference="known-identifier",
         nonexistent_identifier_reference="nonexistent-identifier",
         failure_password_reference="failure-password",
+        password_references=frozenset({"login-password"}),
     )
 
 
@@ -322,6 +323,7 @@ def test_runner_rejects_a_profile_without_verified_login() -> None:
                 known_identifier_reference="known",
                 nonexistent_identifier_reference="missing",
                 failure_password_reference="wrong",
+                password_references=frozenset(),
             )
         )
 
@@ -374,6 +376,8 @@ def run_two_step_check(
                 known_identifier_reference="known-identifier",
                 nonexistent_identifier_reference="nonexistent-identifier",
                 failure_password_reference="failure-password",
+                # The scan's password reference; this flow has no password step.
+                password_references=frozenset({"login-password"}),
                 username_action_reference="login-username",
                 password_action_reference="login-code",
             )

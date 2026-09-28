@@ -142,6 +142,7 @@ async def _run_failed_login_attempt(
     identifier: str,
     username_reference: str,
     password_reference: str,
+    password_step: bool,
     failure_password: str,
     label: str,
     events: list[EvidenceEvent],
@@ -157,11 +158,17 @@ async def _run_failed_login_attempt(
     try:
         context = await browser.new_context()
         page = await context.new_page()
+        # The failed attempt types a wrong password, but where it replaces
+        # a password it is still a password and belongs only in the password
+        # field. In a two-step flow it replaces a one-time code instead.
         executor = BrowserActionExecutor(
             page,
             profile.target,
             attempt_secrets,
             scan_id,
+            password_references=(
+                frozenset({password_reference}) if password_step else frozenset()
+            ),
         )
         action_events: list[EvidenceEvent] = []
         steps_completed = 0
@@ -222,11 +229,17 @@ async def run_login_enumeration_check(
     known_identifier_reference: str,
     nonexistent_identifier_reference: str,
     failure_password_reference: str,
+    password_references: frozenset[str],
     username_action_reference: str | None = None,
     password_action_reference: str | None = None,
     cancel_requested: Callable[[], bool] = lambda: False,
 ) -> LoginEnumerationRun:
-    """Compare failed logins for known and nonexistent identifiers three times."""
+    """Compare failed logins for known and nonexistent identifiers three times.
+
+    ``password_references`` names the scan's references that hold passwords.
+    The failure password replaces the saved flow's second fill, and is typed
+    as a password only when that fill's reference is one of them.
+    """
 
     if profile.features.get(AuthFeature.LOGIN) is not FeatureStatus.VERIFIED:
         raise ValueError("The auth profile has no verified login feature")
@@ -271,6 +284,7 @@ async def run_login_enumeration_check(
                             identifier=identifier,
                             username_reference=username_reference,
                             password_reference=password_reference,
+                            password_step=password_reference in password_references,
                             failure_password=failure_password,
                             label=label,
                             events=events,

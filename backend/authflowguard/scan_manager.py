@@ -246,6 +246,19 @@ class ScanExecutionInput(BaseModel):
     def secret_values(self) -> tuple[str, ...]:
         return tuple(value for value in self.runtime_secrets.values() if value)
 
+    def password_references(self) -> frozenset[str]:
+        """The references that hold passwords, and only those.
+
+        The browser types these only into password fields and types nothing
+        else into a password field. The failure and registration passwords are
+        passwords too: the checks type them into password fields.
+        """
+
+        references = {self.password_reference, self.failure_password_reference}
+        if self.registration_password_reference is not None:
+            references.add(self.registration_password_reference)
+        return frozenset(references)
+
     def redact_text(self, value: str) -> str:
         return redact_text(value, self.runtime_secrets.values())
 
@@ -1200,11 +1213,13 @@ class ScanManager:
                         profile=saved_profile,
                         scan_id=record.scan_id,
                         runtime_secrets=runtime_secrets,
+                        password_references=execution.password_references(),
                     )
                     profile_execution = await replay_verified_auth_profile(
                         profile=saved_profile,
                         scan_id=record.scan_id,
                         runtime_secrets=runtime_secrets,
+                        password_references=execution.password_references(),
                         account_marker_selector=execution.account_marker_selector,
                     )
                 elif record.request.discovery_mode == DiscoveryMode.BEDROCK:
@@ -1367,6 +1382,7 @@ class ScanManager:
                 target=record.request.target,
                 runtime_secrets=runtime_secrets,
                 actions=guidance.actions,
+                password_references=execution.password_references(),
                 protected_resource=str(execution.protected_resource),
                 account_marker_selector=execution.account_marker_selector,
                 account_marker_description=execution.account_marker_description,
@@ -1435,6 +1451,7 @@ class ScanManager:
                         known_identifier_reference=execution.username_reference,
                         nonexistent_identifier_reference=execution.nonexistent_identifier_reference,
                         failure_password_reference=execution.failure_password_reference,
+                        password_references=execution.password_references(),
                         cancel_requested=record.cancellation.is_requested,
                     )
                 elif check_id is CheckId.RESET_REQUEST_ENUMERATION:

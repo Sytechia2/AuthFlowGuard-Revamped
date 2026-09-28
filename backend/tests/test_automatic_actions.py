@@ -162,6 +162,7 @@ async def run_controller(
             action_client=client,
             limits=limits,
             credential_references=["login-username", "login-password"],
+            password_references=frozenset({"login-password"}),
             cancel_requested=(cancel_requested.is_set if cancel_requested else None),
             event_sink=event_sink,
         )
@@ -250,6 +251,7 @@ def test_model_observation_redacts_credentials_echoed_by_the_page() -> None:
         action_client=FakeActionClient([]),
         limits=ExecutionLimits(),
         credential_references=["username"],
+        password_references=frozenset(),
     )
     controller._recorder = FakeRecorder()  # type: ignore[assignment]
 

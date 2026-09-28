@@ -184,6 +184,7 @@ def test_guided_flow_records_references_and_redacts_live_values() -> None:
                     }
                 ),
                 actions=guided_login_actions(origin),
+                password_references=frozenset({"login-password"}),
             )
         )
 
@@ -214,6 +215,7 @@ def test_guided_flow_builds_verified_profile_and_replays_in_fresh_context() -> N
                 target=target,
                 runtime_secrets=secrets,
                 actions=guided_login_actions(origin),
+                password_references=frozenset({"login-password"}),
                 protected_resource=f"{origin}/account?proof=not-saved",
                 account_marker_selector='[data-testid="account-marker"]',
                 account_marker_description=(
@@ -226,6 +228,7 @@ def test_guided_flow_builds_verified_profile_and_replays_in_fresh_context() -> N
                 profile=guided_result.profile,
                 scan_id=uuid4(),
                 runtime_secrets=secrets,
+                password_references=frozenset({"login-password"}),
                 account_marker_selector='[data-testid="account-marker"]',
             )
         )
@@ -257,6 +260,7 @@ def test_profile_replay_rejects_unverified_or_incomplete_profiles() -> None:
                 ),
                 scan_id=uuid4(),
                 runtime_secrets=RuntimeSecrets({}),
+                password_references=frozenset(),
                 account_marker_selector="#marker",
             )
         )
@@ -269,6 +273,7 @@ def test_saved_profile_revalidation_rejects_changed_control_metadata() -> None:
             revalidate_auth_profile(
                 profile=result.profile,
                 scan_id=uuid4(),
+                password_references=frozenset(),
             )
         )
         changed_profile = result.profile.model_copy(deep=True)
@@ -279,6 +284,7 @@ def test_saved_profile_revalidation_rejects_changed_control_metadata() -> None:
                 revalidate_auth_profile(
                     profile=changed_profile,
                     scan_id=uuid4(),
+                    password_references=frozenset(),
                 )
             )
 

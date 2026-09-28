@@ -302,7 +302,13 @@ def test_multipage_navigation_discovery_and_replay() -> None:
         assert len(profile.step_control_signatures) >= len(steps)
 
         # Step 2: Revalidate profile in a fresh context
-        asyncio.run(revalidate_auth_profile(profile=profile, scan_id=scan_id))
+        asyncio.run(
+            revalidate_auth_profile(
+                profile=profile,
+                scan_id=scan_id,
+                password_references=frozenset({"pass-ref"}),
+            )
+        )
 
         # Step 3: Replay profile in an isolated context
         replay_execution = asyncio.run(
@@ -310,6 +316,7 @@ def test_multipage_navigation_discovery_and_replay() -> None:
                 profile=profile,
                 scan_id=scan_id,
                 runtime_secrets=runtime_secrets,
+                password_references=frozenset({"pass-ref"}),
                 account_marker_selector='[data-testid="account-marker"]',
             )
         )
@@ -357,6 +364,7 @@ def test_failed_action_is_excluded_from_saved_replay() -> None:
                 profile=profile,
                 scan_id=uuid4(),
                 runtime_secrets=secrets,
+                password_references=frozenset({"password"}),
                 account_marker_selector='[data-testid="account-marker"]',
             )
         )
@@ -477,7 +485,11 @@ def test_replay_control_signature_validation_rejects_tampered_control() -> None:
 
         with pytest.raises(StaleAuthProfileError) as exc_info:
             asyncio.run(
-                revalidate_auth_profile(profile=tampered_profile, scan_id=uuid4())
+                revalidate_auth_profile(
+                    profile=tampered_profile,
+                    scan_id=uuid4(),
+                    password_references=frozenset({"password"}),
+                )
             )
         assert "is stale: changed" in str(exc_info.value)
 
@@ -565,6 +577,7 @@ def test_durable_accounting_persistence_and_write_failure(tmp_path: Path) -> Non
                     action_client=StubActionClient(),
                     limits=ExecutionLimits(),
                     credential_references=[],
+                    password_references=frozenset(),
                     cost_ledger=CostLedger(),
                     cost_ledger_store=failing_store,
                     model_id="amazon.nova-micro-v1:0",
@@ -610,6 +623,7 @@ def test_durable_accounting_persistence_and_write_failure(tmp_path: Path) -> Non
                         action_client=model,
                         limits=ExecutionLimits(),
                         credential_references=[],
+                        password_references=frozenset(),
                         cost_ledger=reconciliation_ledger,
                         cost_ledger_store=reconciliation_store,
                         model_id="amazon.nova-micro-v1:0",

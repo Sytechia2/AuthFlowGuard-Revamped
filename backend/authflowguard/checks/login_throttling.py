@@ -120,7 +120,13 @@ async def _attempt(
     try:
         context = await browser.new_context(service_workers="block")
         page = await context.new_page()
-        executor = BrowserActionExecutor(page, profile.target, attempt_secrets, scan_id)
+        executor = BrowserActionExecutor(
+            page,
+            profile.target,
+            attempt_secrets,
+            scan_id,
+            password_references=frozenset({password_reference}),
+        )
         for step in steps:
             if cancel_requested():
                 raise RuntimeError("Login throttling execution cancelled")

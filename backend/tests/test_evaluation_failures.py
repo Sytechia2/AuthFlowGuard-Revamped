@@ -40,6 +40,7 @@ async def run_against_outage(
             maximum_active_seconds=30,
         ),
         credential_references=["known"],
+        password_references=frozenset(),
     )
 
     await page.goto(f"{origin}/login", wait_until="domcontentloaded")

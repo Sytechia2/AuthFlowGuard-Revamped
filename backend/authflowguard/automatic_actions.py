@@ -98,6 +98,7 @@ class AutomaticBrowserController:
         action_client: ActionSelectionClient,
         limits: ExecutionLimits,
         credential_references: list[str],
+        password_references: frozenset[str],
         progress_callback: ProgressCallback | None = None,
         usage_callback: UsageCallback | None = None,
         event_sink: Callable[[list[EvidenceEvent]], None] | None = None,
@@ -131,6 +132,7 @@ class AutomaticBrowserController:
             target,
             runtime_secrets,
             scan_id,
+            password_references=password_references,
         )
         self._recorder = PlaywrightWorker()
 

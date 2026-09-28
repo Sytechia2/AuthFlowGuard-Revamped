@@ -63,11 +63,18 @@ async def execute_login_steps(
     scan_id: UUID,
     steps: list[BrowserAction],
     secrets: RuntimeSecrets,
+    password_reference: str,
     events: list[EvidenceEvent],
     check_id: CheckId,
     cancel_requested: Callable[[], bool],
 ) -> None:
-    executor = BrowserActionExecutor(page, profile.target, secrets, scan_id)
+    executor = BrowserActionExecutor(
+        page,
+        profile.target,
+        secrets,
+        scan_id,
+        password_references=frozenset({password_reference}),
+    )
     for step in steps:
         if cancel_requested():
             raise RuntimeError("Session check execution cancelled")

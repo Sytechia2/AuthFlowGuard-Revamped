@@ -715,7 +715,13 @@ async def _run_attempt(
         page = await context.new_page()
         page.set_default_timeout(ATTEMPT_TIMEOUT_MS)
         page.set_default_navigation_timeout(ATTEMPT_TIMEOUT_MS)
-        executor = BrowserActionExecutor(page, profile.target, secrets, scan_id)
+        executor = BrowserActionExecutor(
+            page,
+            profile.target,
+            secrets,
+            scan_id,
+            password_references=frozenset({"registration-password"}),
+        )
 
         async def execute(action: BrowserAction, name: str) -> None:
             _check_cancelled(cancel_requested)

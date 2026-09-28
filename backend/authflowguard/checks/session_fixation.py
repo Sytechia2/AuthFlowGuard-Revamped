@@ -92,6 +92,7 @@ async def run_session_fixation_check(
                         scan_id=scan_id,
                         steps=steps,
                         secrets=runtime_secrets,
+                        password_reference=password_reference,
                         events=events,
                         check_id=CheckId.SESSION_FIXATION,
                         cancel_requested=cancel_requested,

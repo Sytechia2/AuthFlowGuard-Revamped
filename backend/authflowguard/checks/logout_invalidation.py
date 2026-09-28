@@ -20,6 +20,7 @@ from authflowguard.checks.session_common import (
     replay_rejected,
     replay_server_error,
 )
+from authflowguard.control_safety import STRICT_DESTRUCTIVE_LABEL
 from authflowguard.models import (
     AuthProfile,
     CheckId,
@@ -48,12 +49,10 @@ LOGOUT_LABEL = re.compile(r"\b(log|sign)\s*-?\s*(out|off)\b", re.IGNORECASE)
 LOGOUT_URL = re.compile(r"(log|sign)[-_]?(out|off)", re.IGNORECASE)
 MENU_LABEL = re.compile(r"account|user|profile|menu", re.IGNORECASE)
 # The search runs signed in, often on an account page. A control named for an
-# irreversible account action is never clicked, whatever else it matches.
-DESTRUCTIVE_LABEL = re.compile(
-    r"\b(delete|remove|close|deactivate|disable|cancel|erase|terminate|"
-    r"unsubscribe)\b",
-    re.IGNORECASE,
-)
+# irreversible account action is never clicked, whatever else it matches. It
+# uses the strict rule, not the executor's narrower one: here the scanner picks
+# the control itself, so even a bare "Close" or "Cancel" is avoided.
+DESTRUCTIVE_LABEL = STRICT_DESTRUCTIVE_LABEL
 CLICKABLE = 'button, a[href], [role="button"], [role="menuitem"]'
 # Only buttons that declare a popup or expandable region are opened as menus:
 # a link navigates away, and a plain button performs its action.
@@ -222,6 +221,7 @@ async def run_logout_invalidation_check(
                         scan_id=scan_id,
                         steps=steps,
                         secrets=runtime_secrets,
+                        password_reference=password_reference,
                         events=events,
                         check_id=CheckId.LOGOUT_INVALIDATION,
                         cancel_requested=cancel_requested,
