@@ -3,7 +3,7 @@
 import time
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from authflowguard.app import app, create_app
@@ -154,6 +154,68 @@ def test_scan_api_creates_reports_status_and_cancellation(tmp_path: Path) -> Non
 
     missing = client.get(f"/api/scans/{uuid4()}")
     assert missing.status_code == 404
+
+
+def test_delete_removes_a_finished_scan_and_its_reports(tmp_path: Path) -> None:
+    application = create_app(data_root=tmp_path, worker_backend="thread")
+    client = TestClient(application)
+    scan_request = {
+        "target": {
+            "target_url": "https://app.example/login",
+            "permitted_origins": ["https://app.example"],
+        },
+        "selected_checks": [CheckId.LOGIN_ENUMERATION.value],
+    }
+    kept_id = client.post("/api/scans", json=scan_request).json()["scan_id"]
+    scan_id = client.post("/api/scans", json=scan_request).json()["scan_id"]
+    client.post(f"/api/scans/{scan_id}/cancel")
+    assert (tmp_path / scan_id / "report.html").exists()
+
+    deleted = client.delete(f"/api/scans/{scan_id}")
+
+    assert deleted.status_code == 204
+    assert not (tmp_path / scan_id).exists()
+    assert list(tmp_path.iterdir()) == [tmp_path / kept_id]
+    assert client.get(f"/api/scans/{scan_id}").status_code == 404
+    assert client.get(f"/api/scans/{scan_id}/report/html").status_code == 404
+    assert [scan["scan_id"] for scan in client.get("/api/scans").json()] == [kept_id]
+    assert client.delete(f"/api/scans/{scan_id}").status_code == 404
+
+    reopened_client = TestClient(
+        create_app(data_root=tmp_path, worker_backend="thread")
+    )
+    assert reopened_client.get(f"/api/scans/{scan_id}").status_code == 404
+
+
+def test_delete_refuses_an_active_scan_and_purges_leftover_deletions(
+    tmp_path: Path,
+) -> None:
+    application = create_app(data_root=tmp_path, worker_backend="thread")
+    client = TestClient(application)
+    scan_id = client.post(
+        "/api/scans",
+        json={
+            "target": {
+                "target_url": "https://app.example/login",
+                "permitted_origins": ["https://app.example"],
+            },
+            "selected_checks": [CheckId.LOGIN_ENUMERATION.value],
+        },
+    ).json()["scan_id"]
+    record = application.state.scan_manager.get_scan(UUID(scan_id))
+    record.worker_active = True
+
+    refused = client.delete(f"/api/scans/{scan_id}")
+
+    assert refused.status_code == 409
+    assert refused.json()["code"] == "invalid_scan_state"
+    assert (tmp_path / scan_id / "metadata.json").exists()
+
+    leftover = tmp_path / ".deleted-leftover"
+    leftover.mkdir()
+    (leftover / "report.html").write_text("stale", encoding="utf-8")
+    create_app(data_root=tmp_path, worker_backend="thread")
+    assert not leftover.exists()
 
 
 def test_automatic_discovery_failure_pauses_for_guidance(

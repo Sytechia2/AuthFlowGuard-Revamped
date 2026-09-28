@@ -1638,6 +1638,7 @@ function ResultsView({ scanId, onScanIdChange }: ResultsViewProps) {
   const [scan, setScan] = useState<ScanStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
   const [pastScans, setPastScans] = useState<ScanStatus[]>([]);
   const [isHistoryLoading, setIsHistoryLoading] = useState(true);
   const [historyError, setHistoryError] = useState<string | null>(null);
@@ -1695,6 +1696,45 @@ function ResultsView({ scanId, onScanIdChange }: ResultsViewProps) {
       );
     } finally {
       setIsLoading(false);
+    }
+  }
+
+  async function deleteScan(target: ScanStatus) {
+    const confirmed = window.confirm(
+      `Delete scan ${target.scan_id}? Its evidence, results, and reports will be permanently removed.`,
+    );
+    if (!confirmed) return;
+    setIsDeleting(true);
+    setError(null);
+    try {
+      const response = await fetch(
+        `/api/scans/${encodeURIComponent(target.scan_id)}`,
+        { method: "DELETE" },
+      );
+      if (!response.ok) {
+        const body: unknown = await response.json().catch(() => null);
+        const detail =
+          body !== null &&
+          typeof body === "object" &&
+          "detail" in body &&
+          typeof body.detail === "string"
+            ? body.detail
+            : "The scan could not be deleted.";
+        throw new Error(detail);
+      }
+      setPastScans((current) =>
+        current.filter((pastScan) => pastScan.scan_id !== target.scan_id),
+      );
+      setScan(null);
+      onScanIdChange("");
+    } catch (deleteError) {
+      setError(
+        deleteError instanceof Error
+          ? deleteError.message
+          : "Unable to delete scan.",
+      );
+    } finally {
+      setIsDeleting(false);
     }
   }
 
@@ -1820,6 +1860,23 @@ function ResultsView({ scanId, onScanIdChange }: ResultsViewProps) {
             >
               Open HTML report
             </a>
+            <button
+              className="danger-button"
+              disabled={
+                isDeleting ||
+                scan.state === "running" ||
+                scan.state === "awaiting_guidance"
+              }
+              onClick={() => void deleteScan(scan)}
+              title={
+                scan.state === "running" || scan.state === "awaiting_guidance"
+                  ? "Cancel the scan before deleting it"
+                  : undefined
+              }
+              type="button"
+            >
+              {isDeleting ? "Deleting..." : "Delete scan"}
+            </button>
           </div>
 
           <div className="provenance-panel">

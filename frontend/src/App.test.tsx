@@ -675,6 +675,55 @@ describe("setup workflow", () => {
     expect(screen.getByText("$0.0452 USD")).toBeInTheDocument();
   });
 
+  test("deletes a saved scan only after confirmation", async () => {
+    const savedScan = {
+      scan_id: "scan-old",
+      state: "completed",
+      target_url: "https://app.example/login",
+      event_count: 3,
+      evidence_count: 1,
+      result_count: 1,
+      results: [],
+    };
+    const fetchMock = setupMockFetch([
+      { url: "/api/scans", method: "GET", response: [savedScan] },
+      { url: "/api/scans/scan-old", method: "GET", response: savedScan },
+      {
+        url: "/api/scans/scan-old",
+        method: "DELETE",
+        status: 204,
+        response: null,
+      },
+    ]);
+    const confirmMock = vi
+      .fn()
+      .mockReturnValueOnce(false)
+      .mockReturnValue(true);
+    vi.stubGlobal("confirm", confirmMock);
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: /results/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /scan-old/ }));
+    const deleteButton = await screen.findByRole("button", {
+      name: "Delete scan",
+    });
+    const deleteCalls = () =>
+      fetchMock.mock.calls.filter(
+        ([, init]) => (init as RequestInit | undefined)?.method === "DELETE",
+      );
+
+    fireEvent.click(deleteButton);
+    expect(deleteCalls()).toHaveLength(0);
+
+    fireEvent.click(deleteButton);
+    await waitFor(() => {
+      expect(screen.getByText("No saved scans yet.")).toBeInTheDocument();
+    });
+    expect(deleteCalls()).toHaveLength(1);
+    expect(deleteCalls()[0][0]).toBe("/api/scans/scan-old");
+    expect(screen.getByText("Evidence will appear here")).toBeInTheDocument();
+  });
+
   test("shows saved runs and loads one without manual ID entry", async () => {
     setupMockFetch([
       {

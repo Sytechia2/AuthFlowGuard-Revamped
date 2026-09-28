@@ -1,12 +1,13 @@
 """Append-only local storage for redacted scan evidence and result versions."""
 
 import json
+import shutil
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel
 
@@ -32,6 +33,8 @@ _SENSITIVE_KEY_NAMES = {
     "value",
     "values",
 }
+
+DELETED_SCAN_PREFIX = ".deleted-"
 
 _event_sink: ContextVar[Any] = ContextVar("authflowguard_event_sink", default=None)
 _transient_secret_values: ContextVar[tuple[str, ...]] = ContextVar(
@@ -265,6 +268,27 @@ class EvidenceStore:
                 continue
             scan_ids.append((metadata_path.stat().st_mtime, scan_id))
         return [scan_id for _, scan_id in sorted(scan_ids, reverse=True)]
+
+    def delete_scan(self, scan_id: UUID) -> None:
+        """Remove every saved artifact for one scan, including its reports."""
+
+        scan_dir = self._scan_dir(scan_id)
+        if not scan_dir.exists():
+            return
+        # Renaming first keeps deletion all-or-nothing for the scan index: a
+        # locked file fails the rename instead of leaving half a scan behind.
+        tombstone = self._root / f"{DELETED_SCAN_PREFIX}{scan_id}-{uuid4().hex}"
+        scan_dir.rename(tombstone)
+        shutil.rmtree(tombstone, ignore_errors=True)
+
+    def purge_deleted_scans(self) -> None:
+        """Finish removing scan directories an earlier deletion left behind."""
+
+        if not self._root.exists():
+            return
+        for directory in self._root.glob(f"{DELETED_SCAN_PREFIX}*"):
+            if directory.is_dir():
+                shutil.rmtree(directory, ignore_errors=True)
 
     def read_all_evidence(self, scan_id: UUID) -> list[TestRunEvidence]:
         """Read every persisted check evidence package for one scan."""

@@ -155,6 +155,10 @@ def create_app(
         record = scan_manager.cancel_scan(scan_id)
         return scan_manager.snapshot(record)
 
+    @application.delete("/api/scans/{scan_id}", status_code=204)
+    def delete_scan(scan_id: UUID) -> None:
+        scan_manager.delete_scan(scan_id)
+
     @application.post("/api/scans/{scan_id}/reanalyse")
     async def reanalyse_scan(scan_id: UUID) -> dict[str, object]:
         results = scan_manager.reanalyse(scan_id)

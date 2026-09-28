@@ -221,6 +221,10 @@ class ScanWorkerUnavailableError(ScanManagerError):
     status_code = 503
 
 
+class ScanDeletionError(ScanManagerError):
+    code = "scan_deletion_failed"
+
+
 class GuidanceObservationError(ScanManagerError):
     code = "guidance_observation_failed"
 
@@ -746,6 +750,28 @@ class ScanManager:
                     "The guided scan worker could not be started"
                 ) from None
             return record
+
+    def delete_scan(self, scan_id: UUID) -> None:
+        """Remove an inactive scan with its evidence, results, and reports."""
+
+        with self._lock:
+            record = self._records.get(scan_id)
+            if record is None and scan_id not in self._recovery_errors:
+                raise ScanNotFoundError(f"Scan '{scan_id}' was not found")
+            if record is not None and (
+                self._is_active(record) or record.state is ScanState.AWAITING_GUIDANCE
+            ):
+                raise InvalidScanStateError("Cancel the scan before deleting it")
+            try:
+                self._store.delete_scan(scan_id)
+            except OSError:
+                raise ScanDeletionError(
+                    "The scan files are in use and could not be deleted"
+                ) from None
+            if record is not None:
+                self._discard_pending_execution(record)
+            self._records.pop(scan_id, None)
+            self._recovery_errors.pop(scan_id, None)
 
     def list_scans(self) -> list[ScanRecord]:
         with self._lock:
@@ -1789,6 +1815,7 @@ class ScanManager:
         self._store.update_metadata(record.scan_id, metadata)
 
     def _load_persisted_scans(self) -> None:
+        self._store.purge_deleted_scans()
         for scan_id in self._store.list_scan_ids():
             try:
                 metadata = self._store.read_metadata(scan_id)
