@@ -51,6 +51,15 @@ OWASP_REFERENCE = "WSTG-IDNT-04"
 ATTEMPT_TIMEOUT_MS = 5000
 FORM_CHECKS = {CheckId.REGISTRATION_ENUMERATION, CheckId.RESET_REQUEST_ENUMERATION}
 LABELS = ("known_identifier_attempt", "nonexistent_identifier_attempt")
+# A client-rendered form is also exercised with a second nonexistent
+# identifier. Whatever differs between the two nonexistent attempts is
+# volatile content, not account state, and cannot support a finding.
+REPEAT_LABEL = "repeat_nonexistent_identifier_attempt"
+REPEAT_LIMITATION = (
+    "The client-rendered form was also exercised with a second nonexistent "
+    "identifier; fields that differed between the two nonexistent attempts "
+    "were treated as volatile and not used as evidence of enumeration."
+)
 LIMITATIONS = [
     "One known/nonexistent pair was submitted in separate fresh browser contexts; "
     "timing differences and repeatability beyond this pair were not tested.",
@@ -65,6 +74,15 @@ LIMITATIONS = [
 class FormEnumerationRun:
     evidence: TestRunEvidence
     events: list[EvidenceEvent]
+
+
+def _repeat_identifier(identifier: str) -> str:
+    """Derive a second nonexistent identifier shaped like the first."""
+
+    local, at, domain = identifier.rpartition("@")
+    if at:
+        return f"{local}-repeat@{domain}"
+    return f"{identifier}-repeat"
 
 
 class EnumerationCancelledError(RuntimeError):
@@ -795,8 +813,10 @@ async def run_form_enumeration_check(
     limitations = list(LIMITATIONS)
     if check_id is CheckId.REGISTRATION_ENUMERATION:
         limitations.append(
-            "Registration may create the disposable account. Use a new nonexistent "
-            "identifier or reset the evaluation application before the next scan."
+            "Registration may create the disposable account (and, for a "
+            "client-rendered form, a second one with '-repeat' added to its "
+            "identifier). Use a new nonexistent identifier or reset the "
+            "evaluation application before the next scan."
         )
     try:
         _check_cancelled(cancel_requested)
@@ -811,26 +831,36 @@ async def run_form_enumeration_check(
             raise ValueError("Distinct nonempty identifiers are required")
         if check_id is CheckId.REGISTRATION_ENUMERATION and not password:
             raise ValueError("A disposable registration password is required")
+        repeat = _repeat_identifier(unknown)
+        if repeat == known:
+            raise ValueError("Distinct nonempty identifiers are required")
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
+
+            async def attempt(label: str, identifier: str) -> None:
+                _check_cancelled(cancel_requested)
+                observations[label] = await _run_attempt(
+                    browser=browser,
+                    profile=profile,
+                    check_id=check_id,
+                    scan_id=scan_id,
+                    identifier=identifier,
+                    password=password,
+                    sensitive_values=[known, unknown, repeat, password],
+                    label=label,
+                    form_url=form_url,
+                    events=events,
+                    attempted=attempted,
+                    completed=completed,
+                    cancel_requested=cancel_requested,
+                )
+
             try:
                 for label, identifier in zip(LABELS, (known, unknown), strict=True):
-                    _check_cancelled(cancel_requested)
-                    observations[label] = await _run_attempt(
-                        browser=browser,
-                        profile=profile,
-                        check_id=check_id,
-                        scan_id=scan_id,
-                        identifier=identifier,
-                        password=password,
-                        sensitive_values=[known, unknown, password],
-                        label=label,
-                        form_url=form_url,
-                        events=events,
-                        attempted=attempted,
-                        completed=completed,
-                        cancel_requested=cancel_requested,
-                    )
+                    await attempt(label, identifier)
+                if observations[LABELS[1]].get("interaction") == "client":
+                    limitations.append(REPEAT_LIMITATION)
+                    await attempt(REPEAT_LABEL, repeat)
             finally:
                 await browser.close()
     except Exception as error:
@@ -910,9 +940,48 @@ def _client_statuses(signature: dict[str, Any]) -> list[int]:
     ]
 
 
+CLIENT_COMPARED_FIELDS = ("background_statuses", *CLIENT_STATE_FIELDS)
+
+
+def _client_state_views(state: Any) -> dict[str, Any]:
+    """The compared views of one client state.
+
+    Request outcomes (method, path, status) are also compared without their
+    bodies, so a volatile body cannot hide a status difference.
+    """
+
+    if not isinstance(state, dict):
+        return {}
+    return {
+        "background_statuses": sorted(
+            item[:3] for item in state["background_responses"]
+        ),
+        **{field: state[field] for field in CLIENT_STATE_FIELDS},
+    }
+
+
+def _client_differences(first: dict[str, Any], second: dict[str, Any]) -> list[str]:
+    differences: list[str] = []
+    for stage in ("reaction", "submission"):
+        first_views = _client_state_views(first.get(stage))
+        second_views = _client_state_views(second.get(stage))
+        differences.extend(
+            f"{stage}.{field}"
+            for field in CLIENT_COMPARED_FIELDS
+            if first_views.get(field) != second_views.get(field)
+        )
+    differences.extend(
+        field
+        for field in ("submission_observed", "safe_visible_messages")
+        if first[field] != second[field]
+    )
+    return differences
+
+
 def _analyse_client_forms(
     known: dict[str, Any],
     unknown: dict[str, Any],
+    repeat: Any,
     check_id: CheckId,
     policy: SecurityPolicy,
     name: str,
@@ -920,12 +989,19 @@ def _analyse_client_forms(
     """Compare two client-rendered form attempts.
 
     Identical observations only count as "no issue" when the procedure
-    demonstrably exercised the form; otherwise nothing was compared.
+    demonstrably exercised the form; otherwise nothing was compared. When a
+    repeat nonexistent-identifier attempt was recorded, only differences that
+    did not also appear between the two nonexistent attempts count. Evidence
+    captured before the repeat attempt existed is compared as a single pair.
     """
 
-    if any(
-        status >= 500 for sig in (known, unknown) for status in _client_statuses(sig)
-    ):
+    if repeat is not None and not _valid_client_signature(repeat):
+        return (
+            CheckOutcome.INCONCLUSIVE,
+            f"{name} evidence has an invalid repeat nonexistent-identifier attempt.",
+        )
+    attempts = [known, unknown, *([repeat] if repeat is not None else [])]
+    if any(status >= 500 for sig in attempts for status in _client_statuses(sig)):
         return (
             CheckOutcome.EXECUTION_ERROR,
             f"{name} evidence records a server error from the application.",
@@ -955,16 +1031,19 @@ def _analyse_client_forms(
             CheckOutcome.NO_ISSUE_OBSERVED,
             "The configured policy does not require account-existence privacy.",
         )
-    differences = [
-        f"{stage}.{field}"
-        for stage in ("reaction", "submission")
-        for field in CLIENT_STATE_FIELDS
-        if (known.get(stage) or {}).get(field) != (unknown.get(stage) or {}).get(field)
-    ]
-    if known["submission_observed"] != unknown["submission_observed"]:
-        differences.append("submission_observed")
-    if known["safe_visible_messages"] != unknown["safe_visible_messages"]:
-        differences.append("safe_visible_messages")
+    differences = _client_differences(known, unknown)
+    if repeat is not None:
+        volatile = set(_client_differences(unknown, repeat))
+        stable = [field for field in differences if field not in volatile]
+        if differences and not stable:
+            return (
+                CheckOutcome.INCONCLUSIVE,
+                f"{name} responses differed between the known and nonexistent "
+                "identifier only in " + ", ".join(differences) + ", which also "
+                "differed between two nonexistent identifiers, so the difference "
+                "cannot be attributed to account existence.",
+            )
+        differences = stable
     if differences:
         return (
             CheckOutcome.FINDING_CONFIRMED,
@@ -1004,6 +1083,7 @@ def analyse_form_enumeration(
     )
     known = evidence.observations.get(LABELS[0])
     unknown = evidence.observations.get(LABELS[1])
+    repeat = evidence.observations.get(REPEAT_LABEL)
 
     def valid(value: Any) -> bool:
         return (
@@ -1029,7 +1109,7 @@ def analyse_form_enumeration(
     elif _valid_client_signature(known) and _valid_client_signature(unknown):
         assert isinstance(known, dict) and isinstance(unknown, dict)
         outcome, explanation = _analyse_client_forms(
-            known, unknown, check_id, policy, name
+            known, unknown, repeat, check_id, policy, name
         )
     elif not valid(known) or not valid(unknown):
         outcome = CheckOutcome.INCONCLUSIVE

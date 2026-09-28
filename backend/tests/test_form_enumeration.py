@@ -19,6 +19,7 @@ from authflowguard import models
 from authflowguard.checks.form_enumeration import (
     CLIENT_STATE_FIELDS,
     LABELS,
+    REPEAT_LABEL,
     FormEnumerationRun,
     normalize_response,
 )
@@ -56,6 +57,7 @@ ANALYSERS = {
     CheckId.RESET_REQUEST_ENUMERATION: analyse_reset_request_enumeration,
 }
 UNKNOWN = "disposable@example.test"
+UNKNOWN_REPEAT = "disposable-repeat@example.test"
 PASSWORD = "disposable-password-123!"
 
 
@@ -501,13 +503,18 @@ def test_discovers_nonstandard_route_from_visible_link(check: CheckId) -> None:
     assert len(app.state.submissions) == 2
 
 
-def client_form_app(vulnerable: bool) -> FastAPI:
+def client_form_app(vulnerable: bool, noisy: bool = False) -> FastAPI:
     """A single-page app: no native POST form, JSON requests, a debounced
     reset lookup and a custom dropdown. Every registration returns a new
-    record id, which must not read as a difference."""
+    record id, which must not read as a difference. A noisy app also adds a
+    random reference string to every response, which normalization cannot
+    recognize."""
 
     app = FastAPI()
     registered = {KNOWN_USERNAME}
+
+    def body(values: dict[str, Any]) -> dict[str, Any]:
+        return {**values, "ref": uuid4().hex} if noisy else values
 
     @app.get("/app")
     async def page() -> HTMLResponse:
@@ -517,17 +524,19 @@ def client_form_app(vulnerable: bool) -> FastAPI:
     async def register(request: Request) -> JSONResponse:
         email = (await request.json())["email"]
         if vulnerable and email in registered:
-            return JSONResponse({"error": "email must be unique"}, status_code=400)
+            return JSONResponse(
+                body({"error": "email must be unique"}), status_code=400
+            )
         registered.add(email)
         return JSONResponse(
-            {"id": len(registered) * 7, "status": "ok"}, status_code=201
+            body({"id": len(registered) * 7, "status": "ok"}), status_code=201
         )
 
     @app.get("/api/question")
     async def question(email: str) -> JSONResponse:
         if vulnerable and email in registered:
-            return JSONResponse({"question": "Pet?"})
-        return JSONResponse({})
+            return JSONResponse(body({"question": "Pet?"}))
+        return JSONResponse(body({}))
 
     return app
 
@@ -588,24 +597,36 @@ render();
 
 
 @pytest.mark.parametrize("check", CHECKS)
-@pytest.mark.parametrize("vulnerable", [True, False])
-def test_client_rendered_forms_are_compared(check: CheckId, vulnerable: bool) -> None:
+@pytest.mark.parametrize(
+    ("vulnerable", "noisy", "expected"),
+    [
+        (True, False, CheckOutcome.FINDING_CONFIRMED),
+        (False, False, CheckOutcome.NO_ISSUE_OBSERVED),
+        # Account state still shows through the volatile content.
+        (True, True, CheckOutcome.FINDING_CONFIRMED),
+        # Volatile content alone must not read as enumeration.
+        (False, True, CheckOutcome.INCONCLUSIVE),
+    ],
+)
+def test_client_rendered_forms_are_compared(
+    check: CheckId, vulnerable: bool, noisy: bool, expected: CheckOutcome
+) -> None:
     route = (
         "register" if check is CheckId.REGISTRATION_ENUMERATION else "forgot-password"
     )
-    with serve(client_form_app(vulnerable)) as origin:
+    with serve(client_form_app(vulnerable, noisy)) as origin:
         profile = profile_for(origin)
         run = asyncio.run(run_check(check, profile, form_url=f"{origin}/app#/{route}"))
 
     assert run.evidence.errors == []
-    assert run.evidence.observations[LABELS[0]]["interaction"] == "client"
+    observations = run.evidence.observations
+    assert observations[LABELS[0]]["interaction"] == "client"
+    assert observations[REPEAT_LABEL]["interaction"] == "client"
     saved = run.evidence.model_dump_json()
     assert KNOWN_USERNAME not in saved
     assert UNKNOWN not in saved
+    assert UNKNOWN_REPEAT not in saved
     assert PASSWORD not in saved
-    expected = (
-        CheckOutcome.FINDING_CONFIRMED if vulnerable else CheckOutcome.NO_ISSUE_OBSERVED
-    )
     assert ANALYSERS[check](run.evidence, profile, SecurityPolicy()).outcome is expected
 
 
@@ -679,6 +700,59 @@ def test_client_form_analysis_requires_an_exercised_form(
         check_id=check,
         profile_version="1.0",
         observations={LABELS[0]: known, LABELS[1]: unknown},
+        coverage={"limitations": ["Fixture evidence."]},
+    )
+    result = ANALYSERS[check](evidence, profile_for("http://app"), SecurityPolicy())
+    assert result.outcome is expected
+
+
+REGISTERED = ["POST", "b" * 64, 201, "c" * 64]
+
+
+@pytest.mark.parametrize(
+    ("known", "repeat", "expected"),
+    [
+        # Only the body differs, and it differs between nonexistent
+        # identifiers too: volatile content, not account state.
+        (
+            client_signature([], [["POST", "b" * 64, 201, "d" * 64]]),
+            client_signature([], [["POST", "b" * 64, 201, "e" * 64]]),
+            CheckOutcome.INCONCLUSIVE,
+        ),
+        # The body is volatile, but the status differs only for the known
+        # identifier.
+        (
+            client_signature([], [["POST", "b" * 64, 400, "d" * 64]]),
+            client_signature([], [["POST", "b" * 64, 201, "e" * 64]]),
+            CheckOutcome.FINDING_CONFIRMED,
+        ),
+        # The nonexistent attempts agree, so the known difference is stable.
+        (
+            client_signature([], [["POST", "b" * 64, 201, "d" * 64]]),
+            client_signature([], [REGISTERED]),
+            CheckOutcome.FINDING_CONFIRMED,
+        ),
+        (
+            client_signature([], [REGISTERED]),
+            {"interaction": "client"},
+            CheckOutcome.INCONCLUSIVE,
+        ),
+    ],
+)
+def test_client_form_analysis_ignores_volatile_differences(
+    known: dict[str, Any], repeat: dict[str, Any], expected: CheckOutcome
+) -> None:
+    check = CheckId.REGISTRATION_ENUMERATION
+    evidence = models.TestRunEvidence(
+        evidence_id=uuid4(),
+        scan_id=uuid4(),
+        check_id=check,
+        profile_version="1.0",
+        observations={
+            LABELS[0]: known,
+            LABELS[1]: client_signature([], [REGISTERED]),
+            REPEAT_LABEL: repeat,
+        },
         coverage={"limitations": ["Fixture evidence."]},
     )
     result = ANALYSERS[check](evidence, profile_for("http://app"), SecurityPolicy())
