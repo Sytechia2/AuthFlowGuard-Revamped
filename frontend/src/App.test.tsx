@@ -711,6 +711,70 @@ describe("setup workflow", () => {
     ).not.toBeInTheDocument();
     expect(screen.getByLabelText("Username or email field")).toHaveValue("");
     expect(screen.getByLabelText("Password field")).toHaveValue("");
+    expect(screen.getByLabelText("Registration link")).toHaveValue("");
+    expect(screen.getByLabelText("Password reset link")).toHaveValue("");
+  });
+
+  test("pre-fills the registration and reset links and sends the choices", async () => {
+    const fetchMock = await openDiscoveryWithObservation({
+      url: "https://shop.example.test/",
+      title: "Shop",
+      controls: [
+        ...juiceShopLikeControls,
+        suggestedControl("control-9", "a", null, "Not yet a customer?"),
+        suggestedControl("control-10", "a", null, "Forgot your password?"),
+      ],
+      suggested_controls: {
+        username: "control-5",
+        password: "control-6",
+        submit: "control-7",
+        source: "rules",
+        status: "rules_detected",
+        rejected: [],
+        registration_link: "control-9",
+        // Not a link or button, so it is not an option of the dropdown.
+        reset_link: "control-2",
+        link_sources: { registration_link: "ai", reset_link: "rules" },
+      },
+    });
+
+    expect(screen.getByLabelText("Registration link")).toHaveValue("control-9");
+    expect(screen.getByLabelText("Password reset link")).toHaveValue("");
+    expect(
+      screen.getByText("Suggested by AI — check before continuing."),
+    ).toBeInTheDocument();
+
+    // The developer changes the reset answer, then says there is no
+    // registration link.
+    fireEvent.change(screen.getByLabelText("Password reset link"), {
+      target: { value: "control-10" },
+    });
+    fireEvent.change(screen.getByLabelText("Registration link"), {
+      target: { value: "" },
+    });
+    expect(
+      screen.queryByText("Suggested by AI — check before continuing."),
+    ).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: /save and verify guided flow/i }),
+    );
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/scans/suggested-scan/guidance",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+    const call = fetchMock.mock.calls.find(
+      ([input]) => input === "/api/scans/suggested-scan/guidance",
+    ) as [string, RequestInit];
+    const body = JSON.parse(String(call[1].body)) as {
+      feature_links?: unknown;
+    };
+    expect(body.feature_links).toEqual({
+      registration_link: null,
+      reset_link: "control-10",
+    });
   });
 
   test("navigation switches between testing and results views", () => {

@@ -123,7 +123,12 @@ type SuggestedControls = {
   submit: string | null;
   source: SuggestionSource | null;
   status?: string;
+  registration_link?: string | null;
+  reset_link?: string | null;
+  link_sources?: Partial<Record<LinkRole, SuggestionSource>>;
 };
+
+type LinkRole = "registration_link" | "reset_link";
 
 type GuidanceActionType = "navigate" | "fill" | "click";
 
@@ -174,6 +179,50 @@ function isSubmitOption(control: SafeControl): boolean {
         ["submit", "button", "image"].includes(control.type ?? "")))
   );
 }
+
+// A link or button that may open the registration or reset form. The
+// backend decides whether the choice is usable before saving it.
+function isLinkOption(control: SafeControl): boolean {
+  return control.visible && (control.tag === "a" || isSubmitOption(control));
+}
+
+type LinkChoice = { controlId: string; source: SuggestionSource | null };
+
+// Pre-select a suggested link only when it is one of the dropdown's options.
+function suggestedLinkChoices(
+  observation: GuidanceObservation,
+): Record<LinkRole, LinkChoice> {
+  const suggested = observation.suggested_controls;
+  const choice = (role: LinkRole): LinkChoice => {
+    const controlId = suggested?.[role] ?? null;
+    const control = observation.controls.find(
+      (candidate) => candidate.observed_control_id === controlId,
+    );
+    return control && isLinkOption(control)
+      ? {
+          controlId: control.observed_control_id,
+          source: suggested?.link_sources?.[role] ?? null,
+        }
+      : { controlId: "", source: null };
+  };
+  return {
+    registration_link: choice("registration_link"),
+    reset_link: choice("reset_link"),
+  };
+}
+
+const linkQuestions: { role: LinkRole; question: string; label: string }[] = [
+  {
+    role: "registration_link",
+    question: "Which link opens registration?",
+    label: "Registration link",
+  },
+  {
+    role: "reset_link",
+    question: "Which link opens password reset?",
+    label: "Password reset link",
+  },
+];
 
 const suggestionNotes: Record<SuggestionSource, string> = {
   ai: "Suggested by AI — check before continuing.",
@@ -1090,6 +1139,12 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
   const [error, setError] = useState<string | null>(null);
   const [suggestionSource, setSuggestionSource] =
     useState<SuggestionSource | null>(null);
+  // The developer's answers about the page's other links: a control id, or
+  // "" for none, and where a pre-filled answer came from.
+  const [linkChoices, setLinkChoices] = useState<Record<LinkRole, LinkChoice>>({
+    registration_link: { controlId: "", source: null },
+    reset_link: { controlId: "", source: null },
+  });
 
   useEffect(() => {
     if (!scanId) return;
@@ -1156,6 +1211,7 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
           ? (observed.suggested_controls?.source ?? null)
           : null,
       );
+      setLinkChoices(suggestedLinkChoices(observed));
     } catch (observeError) {
       setError(
         observeError instanceof Error
@@ -1217,6 +1273,15 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
               : {}),
             ...(markerDescription.trim()
               ? { account_marker_description: markerDescription.trim() }
+              : {}),
+            ...(observation
+              ? {
+                  feature_links: {
+                    registration_link:
+                      linkChoices.registration_link.controlId || null,
+                    reset_link: linkChoices.reset_link.controlId || null,
+                  },
+                }
               : {}),
           }),
         },
@@ -1425,6 +1490,42 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
                 ))}
             </select>
           </label>
+          {linkQuestions.map(({ role, question, label }) => {
+            const source = linkChoices[role].source;
+            return (
+              <label className="field" key={role}>
+                <span>{question}</span>
+                <select
+                  aria-label={label}
+                  onChange={(event) => {
+                    const controlId = event.target.value;
+                    setLinkChoices((current) => ({
+                      ...current,
+                      [role]: { controlId, source: null },
+                    }));
+                  }}
+                  value={linkChoices[role].controlId}
+                >
+                  <option value="">None</option>
+                  {(observation?.controls ?? [])
+                    .filter(isLinkOption)
+                    .map((control) => (
+                      <option
+                        key={control.observed_control_id}
+                        value={control.observed_control_id}
+                      >
+                        {controlLabel(control)}
+                      </option>
+                    ))}
+                </select>
+                {source && (
+                  <small className="suggestion-note">
+                    {suggestionNotes[source]}
+                  </small>
+                )}
+              </label>
+            );
+          })}
         </div>
       </section>
 
