@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 from playwright.async_api import Page
 
 from authflowguard.action_executor import BrowserActionExecutor
+from authflowguard.control_safety import flow_step
 from authflowguard.models import (
     AuthFeature,
     AuthProfile,
@@ -75,10 +76,13 @@ async def execute_login_steps(
         scan_id,
         password_references=frozenset({password_reference}),
     )
-    for step in steps:
+    for step_number, step in enumerate(steps, start=1):
         if cancel_requested():
             raise RuntimeError("Session check execution cancelled")
-        result = await executor.execute(step.model_copy(update={"action_id": uuid4()}))
+        with flow_step(step_number):
+            result = await executor.execute(
+                step.model_copy(update={"action_id": uuid4()})
+            )
         for event in result.events:
             events.append(event.model_copy(update={"check_id": check_id}))
 

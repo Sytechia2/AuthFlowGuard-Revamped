@@ -66,6 +66,7 @@ from authflowguard.config import (
     validate_bedrock_configuration,
     worker_timeout_seconds,
 )
+from authflowguard.control_safety import SafeMessageError
 from authflowguard.evaluation.cost_tracking import (
     CostLedger,
     CostLedgerStore,
@@ -223,6 +224,19 @@ class ScanWorkerUnavailableError(ScanManagerError):
 
 class GuidanceObservationError(ScanManagerError):
     code = "guidance_observation_failed"
+
+
+def public_failure_message(error: BaseException) -> str:
+    """Describe a failed scan without exposing exception text.
+
+    An exception message may contain secrets, so only a ``SafeMessageError``,
+    whose message is built from fixed wording, is shown. Any other error shows
+    its type alone, which is safe and still makes the failure diagnosable.
+    """
+
+    if isinstance(error, SafeMessageError):
+        return f"Scan execution failed: {error.safe_message}"
+    return f"Scan execution failed ({type(error).__name__})"
 
 
 class ScanExecutionInput(BaseModel):
@@ -1735,9 +1749,7 @@ class ScanManager:
                 error_code = "scan_cancelled"
             else:
                 next_state = ScanState.FAILED
-                # The exception message may contain secrets, but its type is
-                # safe and is what makes a failed scan diagnosable.
-                public_error = f"Scan execution failed ({type(error).__name__})"
+                public_error = public_failure_message(error)
                 error_code = "scan_execution_failed"
             self._discard_pending_execution(record)
             record.active_check = None

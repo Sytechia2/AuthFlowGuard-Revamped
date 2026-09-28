@@ -22,7 +22,8 @@ from authflowguard.models import (
     TargetScope,
 )
 from authflowguard.secrets import RuntimeSecrets, SecretReferenceNotFoundError
-from playwright.async_api import Page, Route, async_playwright
+from playwright.async_api import Locator, Page, Route, async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import ValidationError
 
 LIVE_USERNAME = "developer@example.test"
@@ -667,6 +668,62 @@ def test_a_field_revealed_later_is_still_filled() -> None:
                 </script></body>""",
             RuntimeSecrets(LOGIN_SECRETS),
             frozenset({"password"}),
+            check,
+        )
+    )
+
+
+def test_a_fill_timeout_becomes_a_safe_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Playwright's own timeout message quotes the value it was typing.
+    async def time_out(_locator: Locator, value: str, **_kwargs: object) -> None:
+        raise PlaywrightTimeoutError(
+            f'Locator.fill: Timeout 2000ms exceeded. "{value}"'
+        )
+
+    monkeypatch.setattr(Locator, "fill", time_out)
+
+    async def check(page: Page, executor: BrowserActionExecutor) -> None:
+        with pytest.raises(UnsafeControlError) as caught:
+            await executor.execute(fill("control-1", "password"))
+
+        assert str(caught.value) == (
+            "control-1 did not become editable within the time limit, so the "
+            "password was not typed into it."
+        )
+        assert LIVE_PASSWORD not in str(caught.value)
+        # The original stays chained for debugging but is never the message.
+        assert isinstance(caught.value.__cause__, PlaywrightTimeoutError)
+
+    asyncio.run(
+        run_on_page(
+            '<body><input id="password" type="password"></body>',
+            RuntimeSecrets(LOGIN_SECRETS),
+            frozenset({"password"}),
+            check,
+        )
+    )
+
+
+def test_a_click_timeout_becomes_a_safe_error() -> None:
+    # A control covered by an overlay never receives the click.
+    async def check(page: Page, executor: BrowserActionExecutor) -> None:
+        with pytest.raises(UnsafeControlError) as caught:
+            await executor.execute(click("control-1"))
+
+        assert str(caught.value) == (
+            "control-1 did not become clickable within the time limit, so it "
+            "was not clicked."
+        )
+        assert await page.evaluate("document.body.dataset.clicked") is None
+
+    asyncio.run(
+        run_on_page(
+            """<body>
+                <button onclick="document.body.dataset.clicked = 'yes'">Go</button>
+                <div style="position: fixed; inset: 0; background: white"></div>
+            </body>""",
+            RuntimeSecrets({}),
+            frozenset(),
             check,
         )
     )

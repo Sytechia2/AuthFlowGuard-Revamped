@@ -13,6 +13,7 @@ from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from authflowguard.action_executor import CONTROL_SELECTOR, BrowserActionExecutor
+from authflowguard.control_safety import describe_error, flow_step
 from authflowguard.models import (
     AuthFeature,
     AuthProfile,
@@ -172,7 +173,7 @@ async def _run_failed_login_attempt(
         )
         action_events: list[EvidenceEvent] = []
         steps_completed = 0
-        for step in steps:
+        for step_number, step in enumerate(steps, start=1):
             if cancel_requested():
                 raise asyncio.CancelledError("Login enumeration cancelled")
             if steps_completed and not await _step_target_available(page, step):
@@ -184,7 +185,8 @@ async def _run_failed_login_attempt(
                 if label == "nonexistent":
                     break
                 raise ValueError("The known-identifier attempt could not continue")
-            result = await executor.execute(_new_attempt_action(step))
+            with flow_step(step_number):
+                result = await executor.execute(_new_attempt_action(step))
             steps_completed += 1
             action_events.extend(_event_for_check(event) for event in result.events)
             events.extend(_event_for_check(event) for event in result.events)
@@ -292,7 +294,7 @@ async def run_login_enumeration_check(
                         )
                         completed_steps.append(step_label)
                     except Exception as error:
-                        errors.append(f"{step_label}: {type(error).__name__}")
+                        errors.append(f"{step_label}: {describe_error(error)}")
                         events.append(
                             EvidenceEvent(
                                 event_id=uuid4(),

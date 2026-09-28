@@ -8,8 +8,11 @@ the facts and enforces the result before the browser acts.
 """
 
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
+from typing import Self
 
 # Words that name an irreversible account action wherever they appear in a
 # control's label.
@@ -111,6 +114,18 @@ class ControlRefusal(Enum):
     IRREVERSIBLE_ACTION = (
         "{control} is labelled as an irreversible account action, so {outcome}."
     )
+    # The browser gave up on an action that passed the checks above. Its own
+    # message is never shown: it can quote the value being typed.
+    NOT_EDITABLE_IN_TIME = (
+        "{control} did not become editable within the time limit, so {outcome}."
+    )
+    NOT_CLICKABLE_IN_TIME = (
+        "{control} did not become clickable within the time limit, so {outcome}."
+    )
+    NO_KEY_RESPONSE_IN_TIME = (
+        "{control} did not accept the key within the time limit, so {outcome}."
+    )
+    FILL_FAILED = "The browser could not fill {control}, so {outcome}."
 
 
 class ControlOutcome(Enum):
@@ -147,19 +162,59 @@ class UnsafeControlError(SafeMessageError):
         control_id: str,
         refusal: ControlRefusal,
         outcome: ControlOutcome,
-        element: str = "a control",
+        facts: ControlFacts | None = None,
     ) -> None:
         if not _CONTROL_ID.fullmatch(control_id):
-            control_id = "The control"
+            control_id = "the control"
         self.control_id = control_id
         self.refusal = refusal
         self.outcome = outcome
-        self.element = element
-        super().__init__(
-            refusal.value.format(
-                control=control_id, element=element, outcome=outcome.value
-            )
+        # Only the fixed description is kept, never the facts' label.
+        self.element = describe_element(facts) if facts is not None else "a control"
+        self.step: int | None = None
+        super().__init__(self._render())
+
+    def at_step(self, step: int) -> Self:
+        """Record the 1-based position of the refused action in its flow."""
+
+        self.step = step
+        self.args = (self._render(),)
+        return self
+
+    def _render(self) -> str:
+        message = self.refusal.value.format(
+            control=self.control_id,
+            element=self.element,
+            outcome=self.outcome.value,
         )
+        if message.startswith("the control"):
+            message = "T" + message[1:]
+        if self.step is not None:
+            return f"Step {self.step}: {message}"
+        return message
+
+
+@contextmanager
+def flow_step(step: int) -> Iterator[None]:
+    """Name the 1-based step of a saved flow in any control refusal inside."""
+
+    try:
+        yield
+    except UnsafeControlError as error:
+        error.at_step(step)
+        raise
+
+
+def describe_error(error: BaseException) -> str:
+    """Name an error for a user-facing list without exposing unsafe text.
+
+    Only a ``SafeMessageError`` contributes its message; any other exception
+    contributes its type name alone, because its message may hold secrets.
+    """
+
+    if isinstance(error, SafeMessageError):
+        return f"{type(error).__name__}: {error.safe_message}"
+    return type(error).__name__
 
 
 def describe_element(facts: ControlFacts) -> str:

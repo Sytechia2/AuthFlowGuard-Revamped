@@ -10,6 +10,7 @@ from authflowguard.control_safety import (
     UnsafeControlError,
     activation_refusal,
     describe_element,
+    describe_error,
     fill_refusal,
     names_irreversible_action,
 )
@@ -192,7 +193,7 @@ def test_refusal_message_uses_only_fixed_wording() -> None:
         "control-16",
         ControlRefusal.NOT_TEXT_FIELD,
         ControlOutcome.VALUE_NOT_TYPED,
-        describe_element(facts("button", None, label="Add to Basket")),
+        facts("button", None, label="Add to Basket"),
     )
 
     assert isinstance(error, SafeMessageError)
@@ -200,6 +201,20 @@ def test_refusal_message_uses_only_fixed_wording() -> None:
         "control-16 is a button, not a text field, so the value was not typed into it."
     )
     assert "Basket" not in error.safe_message
+
+
+def test_refusal_message_names_the_step() -> None:
+    error = UnsafeControlError(
+        "control-16",
+        ControlRefusal.NOT_PASSWORD_FIELD,
+        ControlOutcome.PASSWORD_NOT_TYPED,
+        facts("input", "search"),
+    ).at_step(2)
+
+    assert str(error) == (
+        "Step 2: control-16 is a search input, not a password field, so the "
+        "password was not typed into it."
+    )
 
 
 def test_refusal_message_rejects_an_unexpected_control_reference() -> None:
@@ -211,3 +226,24 @@ def test_refusal_message_rejects_an_unexpected_control_reference() -> None:
 
     assert "user@example.test" not in str(error)
     assert str(error) == "The control is disabled, so it was not clicked."
+    failed = UnsafeControlError(
+        "user@example.test", ControlRefusal.FILL_FAILED, ControlOutcome.VALUE_NOT_TYPED
+    )
+    assert str(failed) == (
+        "The browser could not fill the control, so the value was not typed into it."
+    )
+
+
+def test_only_safe_errors_contribute_their_message() -> None:
+    secret = "hunter2@example.test"
+    safe = UnsafeControlError(
+        "control-3", ControlRefusal.READ_ONLY, ControlOutcome.VALUE_NOT_TYPED
+    )
+
+    assert describe_error(safe) == (
+        "UnsafeControlError: control-3 is read-only, so the value was not typed "
+        "into it."
+    )
+    assert describe_error(TimeoutError(f"fill('{secret}') timed out")) == (
+        "TimeoutError"
+    )

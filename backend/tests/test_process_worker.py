@@ -24,6 +24,8 @@ from authflowguard.evaluation_targets.controlled_app import (
     KNOWN_USERNAME,
 )
 from authflowguard.models import (
+    BrowserAction,
+    BrowserActionType,
     CheckId,
     DiscoveryMode,
     DiscoveryProvenance,
@@ -557,6 +559,51 @@ def test_guidance_observation_and_replay_use_spawned_workers(tmp_path: Path) -> 
             assert record.profile is not None
             assert record.evidence
             assert record.results
+        finally:
+            manager.shutdown()
+
+
+def test_unsafe_control_reason_crosses_the_worker_boundary(tmp_path: Path) -> None:
+    # A guided flow whose second step points the username at the submit
+    # button, as a replay against the wrong page would.
+    with run_controlled_server() as origin:
+        manager = ScanManager(tmp_path)
+        record = manager.create_scan(
+            ScanRequest(
+                target={
+                    "target_url": f"{origin}/login",
+                    "permitted_origins": [origin],
+                },
+                selected_checks=[CheckId.LOGIN_ENUMERATION],
+            )
+        )
+        record.state = ScanState.AWAITING_GUIDANCE
+        record.pending_execution = _controlled_execution(origin)
+        manager._persist_state(record)
+        navigate, _username, _password, submit = guided_login_actions(origin)
+        wrong_control = BrowserAction(
+            action_type=BrowserActionType.FILL,
+            observed_control_id=submit.observed_control_id,
+            value_reference="login-username",
+            description="Fill the username",
+        )
+        try:
+            manager.submit_guidance(
+                record.scan_id,
+                GuidanceSubmission(actions=[navigate, wrong_control]),
+            )
+            assert record.future is not None
+            record.future.result(timeout=90)
+
+            assert record.state is ScanState.FAILED
+            assert record.error == (
+                f"Scan execution failed: Step 2: {submit.observed_control_id} "
+                "is a button, not a text field, so the value was not typed into it."
+            )
+            metadata = (tmp_path / str(record.scan_id) / "metadata.json").read_text(
+                encoding="utf-8"
+            )
+            assert KNOWN_USERNAME not in metadata
         finally:
             manager.shutdown()
 

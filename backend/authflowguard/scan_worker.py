@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from authflowguard.authentication import observe_guidance_page
+from authflowguard.control_safety import SafeMessageError
 from authflowguard.evidence import redact_persisted_data, transient_secret_redaction
 from authflowguard.models import AuthProfile, EvidenceEvent
 from authflowguard.scan_manager import (
@@ -16,6 +17,7 @@ from authflowguard.scan_manager import (
     ScanManager,
     ScanRecord,
     ScanState,
+    public_failure_message,
 )
 from authflowguard.worker_protocol import (
     WorkerCommand,
@@ -308,7 +310,7 @@ def execute_worker_command(
 
     try:
         asyncio.run(execute_and_publish())
-    except BaseException:
+    except BaseException as error:
         if published:
             return
         message = WorkerMessage(
@@ -318,7 +320,12 @@ def execute_worker_command(
             sequence=2,
             message_type=WorkerMessageType.FAILED,
             error_code="scan_worker_failed",
-            error="The isolated scan worker failed",
+            # Only a safe-message error may cross the process boundary as text.
+            error=(
+                public_failure_message(error)
+                if isinstance(error, SafeMessageError)
+                else "The isolated scan worker failed"
+            ),
             cleanup_confirmed=True,
         )
         output.put(message.model_dump(mode="json"), block=True, timeout=5)

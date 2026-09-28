@@ -20,7 +20,7 @@ from authflowguard.checks.session_common import (
     replay_rejected,
     replay_server_error,
 )
-from authflowguard.control_safety import STRICT_DESTRUCTIVE_LABEL
+from authflowguard.control_safety import STRICT_DESTRUCTIVE_LABEL, describe_error
 from authflowguard.models import (
     AuthProfile,
     CheckId,
@@ -304,7 +304,7 @@ async def run_logout_invalidation_check(
             finally:
                 await browser.close()
     except Exception as error:
-        errors.append(type(error).__name__)
+        errors.append(describe_error(error))
         events.append(
             check_event(
                 scan_id,

@@ -27,7 +27,6 @@ from authflowguard.control_safety import (
     ControlRefusal,
     UnsafeControlError,
     activation_refusal,
-    describe_element,
     fill_refusal,
 )
 from authflowguard.evidence import publish_completed_events
@@ -447,11 +446,20 @@ class BrowserActionExecutor:
 
     async def _click(self, action: BrowserAction) -> None:
         control = await self._find_control(action.observed_control_id)
-        await self._require_activatable(
-            control, action.observed_control_id, ControlOutcome.NOT_CLICKED
+        control_id = action.observed_control_id or ""
+        facts = await self._require_activatable(
+            control, control_id, ControlOutcome.NOT_CLICKED
         )
         async with background_requests_settled(self._page):
-            await control.click()
+            try:
+                await control.click()
+            except PlaywrightTimeoutError as error:
+                raise UnsafeControlError(
+                    control_id,
+                    ControlRefusal.NOT_CLICKABLE_IN_TIME,
+                    ControlOutcome.NOT_CLICKED,
+                    facts,
+                ) from error
         try:
             await self._page.wait_for_load_state(
                 "domcontentloaded",
@@ -481,14 +489,22 @@ class BrowserActionExecutor:
             facts = await self._read_control_facts(control)
             refusal = fill_refusal(facts, password_value=password_value)
         if refusal is not None:
-            raise UnsafeControlError(
-                control_id, refusal, outcome, describe_element(facts)
-            )
+            raise UnsafeControlError(control_id, refusal, outcome, facts)
 
         # Resolve only after every check passed, so a refused action never
         # holds the live value.
         live_value = self._secrets.resolve(action.value_reference)
-        await control.fill(live_value)
+        try:
+            await control.fill(live_value)
+        except PlaywrightError as error:
+            # Playwright's message can quote the value being typed, so it is
+            # replaced by fixed wording and kept only as the chained cause.
+            refusal = (
+                ControlRefusal.NOT_EDITABLE_IN_TIME
+                if isinstance(error, PlaywrightTimeoutError)
+                else ControlRefusal.FILL_FAILED
+            )
+            raise UnsafeControlError(control_id, refusal, outcome, facts) from error
 
     async def _select(self, action: BrowserAction) -> None:
         control = await self._find_control(action.observed_control_id)
@@ -504,10 +520,19 @@ class BrowserActionExecutor:
                 return
 
             control = await self._find_control(action.observed_control_id)
-            await self._require_activatable(
-                control, action.observed_control_id, ControlOutcome.KEY_NOT_PRESSED
+            control_id = action.observed_control_id
+            facts = await self._require_activatable(
+                control, control_id, ControlOutcome.KEY_NOT_PRESSED
             )
-            await control.press(action.key)
+            try:
+                await control.press(action.key)
+            except PlaywrightTimeoutError as error:
+                raise UnsafeControlError(
+                    control_id,
+                    ControlRefusal.NO_KEY_RESPONSE_IN_TIME,
+                    ControlOutcome.KEY_NOT_PRESSED,
+                    facts,
+                ) from error
 
     async def _wait(self, action: BrowserAction) -> None:
         if action.wait_for is None:
@@ -556,21 +581,17 @@ class BrowserActionExecutor:
             await control.wait_for(state="visible")
         except PlaywrightTimeoutError as error:
             raise UnsafeControlError(
-                control_id,
-                ControlRefusal.NOT_VISIBLE,
-                outcome,
-                describe_element(facts),
+                control_id, ControlRefusal.NOT_VISIBLE, outcome, facts
             ) from error
 
     async def _require_activatable(
         self,
         control: Locator,
-        observed_control_id: str | None,
+        control_id: str,
         outcome: ControlOutcome,
-    ) -> None:
+    ) -> ControlFacts:
         """Refuse to click or send keys to a hidden or destructive control."""
 
-        control_id = observed_control_id or ""
         facts = await self._read_control_facts(control)
         refusal = activation_refusal(facts)
         if refusal is ControlRefusal.NOT_VISIBLE:
@@ -578,9 +599,8 @@ class BrowserActionExecutor:
             facts = await self._read_control_facts(control)
             refusal = activation_refusal(facts)
         if refusal is not None:
-            raise UnsafeControlError(
-                control_id, refusal, outcome, describe_element(facts)
-            )
+            raise UnsafeControlError(control_id, refusal, outcome, facts)
+        return facts
 
     async def _find_control(self, observed_control_id: str | None) -> Locator:
         control_number = self._parse_control_number(observed_control_id)

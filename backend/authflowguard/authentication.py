@@ -29,6 +29,7 @@ from authflowguard.automatic_actions import (
     ProgressCallback,
 )
 from authflowguard.cancellation import close_resources
+from authflowguard.control_safety import flow_step
 from authflowguard.evaluation.cost_tracking import (
     CostLedger,
     CostLedgerStore,
@@ -414,7 +415,8 @@ async def _execute_steps(
                     f"The recorded control '{action.observed_control_id}' "
                     "changed signature during replay"
                 )
-        _collect_result(await executor.execute(action), events, traffic)
+        with flow_step(step_idx + 1):
+            _collect_result(await executor.execute(action), events, traffic)
         await _capture_control_signatures(page, control_signatures)
     return events, traffic, control_signatures
 
@@ -707,7 +709,8 @@ async def revalidate_auth_profile(
                         and runtime_secrets is None
                     ):
                         break
-                    await executor.execute(action)
+                    with flow_step(step_idx + 1):
+                        await executor.execute(action)
             finally:
                 await close_resources(context, browser)
         return

@@ -22,6 +22,7 @@ from authflowguard.bedrock import (
     PageObservationForModel,
 )
 from authflowguard.cancellation import cancellation_checkpoint
+from authflowguard.control_safety import SafeMessageError
 from authflowguard.evaluation.cost_tracking import (
     CostEntry,
     CostLedger,
@@ -558,6 +559,8 @@ class AutomaticBrowserController:
                 }
                 if isinstance(error, BedrockResponseError):
                     error_details["safe_reason"] = str(error)
+                elif isinstance(error, SafeMessageError):
+                    error_details["safe_reason"] = error.safe_message
                 if decision is not None:
                     error_details["action_type"] = decision.action.action_type.value
                     error_details["observed_control_id"] = (

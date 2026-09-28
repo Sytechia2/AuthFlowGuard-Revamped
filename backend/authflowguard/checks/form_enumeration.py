@@ -21,6 +21,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from authflowguard.action_executor import CONTROL_SELECTOR, BrowserActionExecutor
+from authflowguard.control_safety import describe_error
 from authflowguard.models import (
     AuthFeature,
     AuthProfile,
@@ -870,8 +871,9 @@ async def run_form_enumeration_check(
             finally:
                 await browser.close()
     except Exception as error:
-        # Exception messages may embed submitted values, token-bearing URLs or HTML.
-        errors.append(type(error).__name__)
+        # Exception messages may embed submitted values, token-bearing URLs or
+        # HTML, so only a safe-message error contributes more than its type.
+        errors.append(describe_error(error))
         events.append(
             EvidenceEvent(
                 event_id=uuid4(),
