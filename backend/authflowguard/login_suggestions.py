@@ -7,6 +7,11 @@ username, password and submit. Both answers pass through the same gate,
 decides what is allowed, the developer confirms it once, and the verified
 login that follows proves it worked.
 
+The same observation also suggests the links that open the registration and
+password-reset forms: the rules first, and the model only as extra roles in
+the classification request that is made anyway, never in a request of its
+own.
+
 A model failure never blocks the observation: the developer gets the page's
 controls without suggestions and a status saying why.
 """
@@ -28,8 +33,12 @@ from authflowguard.bedrock import (
     PageObservationForModel,
 )
 from authflowguard.control_roles import (
+    LINK_ROLES,
     LOGIN_ROLES,
+    ControlRole,
+    RoleContext,
     ValidatedRoles,
+    rules_link_suggestions,
     rules_role_suggestions,
     validate_role_suggestions,
 )
@@ -48,6 +57,9 @@ Redact = Callable[[str], str]
 # cluttered page's request inside the per-request cost limit.
 MAXIMUM_CONTROLS_FOR_CLASSIFICATION = 80
 CLASSIFICATION_WORKFLOW = "login_discovery"
+LOGIN_OBJECTIVE = (
+    "Identify the username, password and submit controls of the login form."
+)
 
 
 class SuggestionSource(StrEnum):
@@ -72,7 +84,13 @@ class SuggestionStatus(StrEnum):
 
 @dataclass(frozen=True)
 class SuggestedControls:
-    """Validated suggestions, and the model usage spent finding them."""
+    """Validated suggestions, and the model usage spent finding them.
+
+    ``roles`` holds the accepted roles that were asked for. ``links`` holds
+    the registration and reset links suggested for the same page, each with
+    where it came from, since the rules may find a link when the model
+    suggested the login controls, and the other way round.
+    """
 
     status: SuggestionStatus
     source: SuggestionSource | None = None
@@ -81,9 +99,12 @@ class SuggestedControls:
     answered: bool = False
     input_tokens: int = 0
     output_tokens: int = 0
+    links: Mapping[ControlRole, tuple[str, SuggestionSource]] = field(
+        default_factory=dict
+    )
 
     def as_response(self) -> dict[str, object]:
-        """The API shape: one control id or None per login role."""
+        """The API shape: one control id or None per login and link role."""
 
         response: dict[str, object] = {
             role.value: self.roles.control_for(role) for role in LOGIN_ROLES
@@ -93,6 +114,14 @@ class SuggestedControls:
         response["rejected"] = [
             rejection.as_dict() for rejection in self.roles.rejected
         ]
+        for role in LINK_ROLES:
+            link = self.links.get(role)
+            response[role.value] = link[0] if link else None
+        response["link_sources"] = {
+            role.value: link[1].value
+            for role in LINK_ROLES
+            if (link := self.links.get(role)) is not None
+        }
         return response
 
 
@@ -123,16 +152,78 @@ class ClassificationBudget:
     model_id: str
 
 
-def _login_roles_only(roles: ValidatedRoles) -> ValidatedRoles:
-    """Keep the accepted login roles; other roles are not offered yet."""
+def _requested_roles_only(
+    roles: ValidatedRoles, requested: Sequence[ControlRole]
+) -> ValidatedRoles:
+    """Keep the accepted and rejected roles that were asked for."""
 
     return ValidatedRoles(
         accepted={
             role: control_id
             for role, control_id in roles.accepted.items()
-            if role in LOGIN_ROLES
+            if role in requested
         },
-        rejected=roles.rejected,
+        rejected=tuple(
+            rejection for rejection in roles.rejected if rejection.role in requested
+        ),
+    )
+
+
+def classification_objective(roles: Sequence[ControlRole]) -> str:
+    """Tell the model which roles, from the fixed list, to look for."""
+
+    if tuple(roles) == LOGIN_ROLES:
+        return LOGIN_OBJECTIVE
+    return "Assign only these roles: " + ", ".join(role.value for role in roles) + "."
+
+
+def rules_link_roles(
+    controls: Sequence[Control], context: RoleContext | None
+) -> ValidatedRoles:
+    """The registration and reset links the rules find and the gate accepts."""
+
+    return _requested_roles_only(
+        validate_role_suggestions(
+            controls, rules_link_suggestions(controls), context=context
+        ),
+        LINK_ROLES,
+    )
+
+
+def with_link_suggestions(
+    suggested: SuggestedControls, rules_links: ValidatedRoles
+) -> SuggestedControls:
+    """Split a suggestion into its login controls and its links.
+
+    The rules' link wins; a model's link for the same role is used only when
+    the rules found none. The status and source describe the login controls.
+    """
+
+    links: dict[ControlRole, tuple[str, SuggestionSource]] = {}
+    for role in LINK_ROLES:
+        rules_id = rules_links.control_for(role)
+        # The rules' login suggestion holds login roles only, so a link role
+        # in ``suggested`` came from a model's answer.
+        model_id = suggested.roles.control_for(role)
+        if rules_id is not None:
+            links[role] = (rules_id, SuggestionSource.RULES)
+        elif model_id is not None:
+            links[role] = (model_id, SuggestionSource.AI)
+    login = _requested_roles_only(suggested.roles, LOGIN_ROLES)
+    status = suggested.status
+    source = suggested.source
+    if status is SuggestionStatus.AI_SUGGESTED and not login.accepted:
+        status = SuggestionStatus.AI_NO_VALID_ROLES
+        source = None
+    return SuggestedControls(
+        status=status,
+        source=source,
+        roles=login,
+        model_requests=suggested.model_requests,
+        answered=suggested.answered,
+        input_tokens=suggested.input_tokens,
+        output_tokens=suggested.output_tokens,
+        links=links,
     )
 
 
@@ -162,6 +253,7 @@ def observation_for_classification(
     page_title: str,
     controls: Sequence[Control],
     redact: Redact,
+    objective: str = LOGIN_OBJECTIVE,
 ) -> PageObservationForModel:
     """Describe the visible controls for a model, without any field values."""
 
@@ -198,9 +290,7 @@ def observation_for_classification(
     return PageObservationForModel(
         page_url=redact(page_url) or "about:blank",
         page_title=redact(page_title),
-        objective=(
-            "Identify the username, password and submit controls of the login form."
-        ),
+        objective=objective,
         controls=model_controls,
     )
 
@@ -224,6 +314,9 @@ def classify_within_budget(
     controls: Sequence[Control],
     budget: ClassificationBudget,
     lock: threading.Lock | None = None,
+    *,
+    roles: Sequence[ControlRole] = LOGIN_ROLES,
+    context: RoleContext | None = None,
 ) -> SuggestedControls:
     """Reserve, send and reconcile one classification request, then validate.
 
@@ -231,6 +324,10 @@ def classify_within_budget(
     request, so a crash cannot spend the same budget twice. A request that
     fails without reporting its usage keeps its reservation, because it may
     still have been charged.
+
+    Every role the model answered passes the gate, with ``context`` for the
+    roles that lead elsewhere; only the ``roles`` that were asked for are
+    kept.
     """
 
     with lock if lock is not None else nullcontext():
@@ -298,8 +395,9 @@ def classify_within_budget(
 
         reconcile(decision.input_tokens, decision.output_tokens)
 
-    validated = _login_roles_only(
-        validate_role_suggestions(controls, decision.suggestions)
+    validated = _requested_roles_only(
+        validate_role_suggestions(controls, decision.suggestions, context=context),
+        roles,
     )
     return SuggestedControls(
         status=(

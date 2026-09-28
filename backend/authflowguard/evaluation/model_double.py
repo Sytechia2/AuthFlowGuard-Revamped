@@ -19,6 +19,10 @@ from authflowguard.models import ActionWaitCondition, BrowserAction, BrowserActi
 _USERNAME_HINTS = ("user", "login", "email", "e-mail", "member")
 _SUBMIT_HINTS = ("sign in", "log in", "login", "submit")
 _TEXT_INPUT_TYPES = (None, "text", "email", "tel")
+_REGISTRATION_HINTS = ("register", "sign up", "create account", "not yet a customer")
+_RESET_HINTS = ("forgot", "reset password", "recover")
+_LOGOUT_HINTS = ("log out", "logout", "sign out")
+_ACCOUNT_MENU_HINTS = ("account", "profile", "user menu")
 
 
 def _describes(control: ObservedControlForModel, hints: Sequence[str]) -> bool:
@@ -168,13 +172,49 @@ class DeterministicModelDouble:
                 )
 
         return BedrockClassificationDecision(
-            suggestions=tuple(suggestions),
+            suggestions=tuple(
+                suggestion
+                for suggestion in (*suggestions, *self._other_roles(controls))
+                if suggestion.role.value in observation.objective
+            ),
             discarded_count=0,
             input_tokens=self.input_tokens,
             output_tokens=self.output_tokens,
             actual_cost_usd=self.actual_cost_usd,
             reserved_cost_usd=self.reserved_cost_usd,
         )
+
+    @staticmethod
+    def _other_roles(
+        controls: Sequence[ObservedControlForModel],
+    ) -> list[RoleSuggestion]:
+        """The first link or button named for each non-login role, if any.
+
+        Only the roles the observation's objective names are returned.
+        """
+
+        suggestions: list[RoleSuggestion] = []
+        for role, hints, kinds in (
+            (ControlRole.REGISTRATION_LINK, _REGISTRATION_HINTS, ("a", "button")),
+            (ControlRole.RESET_LINK, _RESET_HINTS, ("a", "button")),
+            (ControlRole.LOGOUT, _LOGOUT_HINTS, ("a", "button")),
+            (ControlRole.ACCOUNT_MENU, _ACCOUNT_MENU_HINTS, ("button",)),
+        ):
+            match = next(
+                (
+                    control
+                    for control in controls
+                    if control.tag in kinds
+                    and _describes(control, hints)
+                    and not names_irreversible_action(
+                        f"{control.text or ''} {control.aria_label or ''}"
+                    )
+                ),
+                None,
+            )
+            if match is not None:
+                suggestions.append(RoleSuggestion(match.observed_control_id, role))
+        return suggestions
 
     def _decide_heuristically(
         self, observation: PageObservationForModel

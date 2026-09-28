@@ -10,11 +10,12 @@ from decimal import ROUND_CEILING, Decimal
 from enum import StrEnum
 from pathlib import Path
 from threading import Lock, RLock
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
+from authflowguard.auth_profiles import login_discovery_source
 from authflowguard.authentication import (
     GuidedPageObservation,
     LoginFormDiscoveryError,
@@ -67,6 +68,13 @@ from authflowguard.config import (
     validate_bedrock_configuration,
     worker_timeout_seconds,
 )
+from authflowguard.control_roles import (
+    LINK_ROLES,
+    LOGIN_ROLES,
+    ControlRole,
+    RoleContext,
+    ValidatedRoles,
+)
 from authflowguard.control_safety import SafeMessageError
 from authflowguard.evaluation.cost_tracking import (
     CostLedger,
@@ -79,16 +87,25 @@ from authflowguard.evidence import (
     redact_persisted_data,
     transient_secret_redaction,
 )
+from authflowguard.feature_discovery import (
+    FeatureDiscoveryRequest,
+    ObservedControls,
+    RoleClassifier,
+)
 from authflowguard.login_suggestions import (
     ClassificationBudget,
     ControlClassificationClient,
     SuggestedControls,
     SuggestionStatus,
+    classification_objective,
     classify_within_budget,
     observation_for_classification,
+    rules_link_roles,
     rules_suggestion,
+    with_link_suggestions,
 )
 from authflowguard.models import (
+    AuthFeature,
     AuthProfile,
     BrowserAction,
     CheckId,
@@ -310,6 +327,28 @@ class ScanExecutionInput(BaseModel):
         self.runtime_secrets.clear()
 
 
+ObservedControlId = Annotated[str, Field(pattern=r"^control-[1-9][0-9]{0,5}$")]
+
+
+class GuidedFeatureLinks(BaseModel):
+    """The developer's answers about the login page's other links.
+
+    Each is an observed control id, or None for "no such link". They pass
+    the same gate as suggested roles before anything is saved.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    registration_link: ObservedControlId | None = None
+    reset_link: ObservedControlId | None = None
+
+    def chosen(self) -> dict[ControlRole, str | None]:
+        return {
+            ControlRole.REGISTRATION_LINK: self.registration_link,
+            ControlRole.RESET_LINK: self.reset_link,
+        }
+
+
 class GuidanceSubmission(BaseModel):
     """Transient guided-flow input; actions are sanitized before they are saved."""
 
@@ -319,6 +358,8 @@ class GuidanceSubmission(BaseModel):
     protected_resource: HttpUrl | None = None
     account_marker_selector: str | None = None
     account_marker_description: str | None = None
+    # Absent from older clients: the links are then looked for by the rules.
+    feature_links: GuidedFeatureLinks | None = None
 
 
 class GuidanceObservationRequest(BaseModel):
@@ -668,31 +709,51 @@ class ScanManager:
     ) -> SuggestedControls:
         """Suggest the login controls: the rules first, then a model if allowed.
 
+        The registration and reset links are suggested too: by the rules,
+        and by the model only as extra roles in the request made for the
+        login controls, never in a request of their own.
+
         Never raises: a model failure returns the observation without
         suggestions and a status that says why.
         """
 
+        rules_links = ValidatedRoles()
         try:
+            context = RoleContext(record.request.target, page_url) if page_url else None
+            rules_links = rules_link_roles(controls, context)
             rules = rules_suggestion(controls)
             if rules is not None:
-                return rules
+                return with_link_suggestions(rules, rules_links)
             if record.request.discovery_mode != DiscoveryMode.BEDROCK:
-                return SuggestedControls(status=SuggestionStatus.NOT_DETECTED)
+                return with_link_suggestions(
+                    SuggestedControls(status=SuggestionStatus.NOT_DETECTED),
+                    rules_links,
+                )
             if record.cancel_requested:
-                return SuggestedControls(status=SuggestionStatus.AI_UNAVAILABLE)
+                return with_link_suggestions(
+                    SuggestedControls(status=SuggestionStatus.AI_UNAVAILABLE),
+                    rules_links,
+                )
             prepared = self._prepare_classification(record)
             if isinstance(prepared, SuggestedControls):
-                return prepared
+                return with_link_suggestions(prepared, rules_links)
             client, budget = prepared
+            roles = (
+                *LOGIN_ROLES,
+                *(role for role in LINK_ROLES if rules_links.control_for(role) is None),
+            )
             execution = record.pending_execution
             observation = observation_for_classification(
                 page_url=page_url,
                 page_title=page_title,
                 controls=controls,
                 redact=execution.redact_text if execution is not None else str,
+                objective=classification_objective(roles),
             )
         except Exception:
-            return SuggestedControls(status=SuggestionStatus.AI_FAILED)
+            return with_link_suggestions(
+                SuggestedControls(status=SuggestionStatus.AI_FAILED), rules_links
+            )
 
         try:
             suggestions = await asyncio.wait_for(
@@ -703,6 +764,8 @@ class ScanManager:
                     controls,
                     budget,
                     self._classification_lock,
+                    roles=roles,
+                    context=context,
                 ),
                 timeout=self._suggestion_timeout,
             )
@@ -713,7 +776,99 @@ class ScanManager:
         except Exception:
             suggestions = SuggestedControls(status=SuggestionStatus.AI_FAILED)
         self._record_classification_usage(record, budget, suggestions)
-        return suggestions
+        return with_link_suggestions(suggestions, rules_links)
+
+    def _role_classifier(
+        self, record: ScanRecord, execution: ScanExecutionInput
+    ) -> RoleClassifier | None:
+        """Ask a model for roles during a scan, within its limits and ledger.
+
+        Only a scan using Bedrock discovery gets a classifier. Each request
+        is prepared, reserved and reconciled exactly like the observation's
+        suggestion request; any limit, failure or timeout answers None.
+        """
+
+        if record.request.discovery_mode != DiscoveryMode.BEDROCK:
+            return None
+
+        async def classify(
+            observed: ObservedControls,
+            roles: tuple[ControlRole, ...],
+            context: RoleContext,
+        ) -> ValidatedRoles | None:
+            if record.cancel_requested:
+                return None
+            try:
+                prepared = self._prepare_classification(record)
+                if isinstance(prepared, SuggestedControls):
+                    return None
+                client, budget = prepared
+                observation = observation_for_classification(
+                    page_url=observed.page_url,
+                    page_title=observed.page_title,
+                    controls=observed.controls,
+                    redact=execution.redact_text,
+                    objective=classification_objective(roles),
+                )
+            except Exception:
+                return None
+            try:
+                suggestions = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        classify_within_budget,
+                        client,
+                        observation,
+                        observed.controls,
+                        budget,
+                        self._classification_lock,
+                        roles=roles,
+                        context=context,
+                    ),
+                    timeout=self._suggestion_timeout,
+                )
+            except TimeoutError:
+                suggestions = SuggestedControls(
+                    status=SuggestionStatus.AI_TIMED_OUT, model_requests=1
+                )
+            except Exception:
+                suggestions = SuggestedControls(status=SuggestionStatus.AI_FAILED)
+            self._record_classification_usage(record, budget, suggestions)
+            return suggestions.roles
+
+        return classify
+
+    def _feature_discovery(
+        self,
+        record: ScanRecord,
+        execution: ScanExecutionInput,
+        guidance: GuidanceSubmission | None = None,
+    ) -> FeatureDiscoveryRequest:
+        """What to look for after the login, from the checks this scan runs.
+
+        A developer's guided answer about a link is saved whichever checks
+        run, and replaces the rules' search for that link.
+        """
+
+        selected = set(record.request.selected_checks)
+        features: set[AuthFeature] = set()
+        if CheckId.REGISTRATION_ENUMERATION in selected:
+            features.add(AuthFeature.REGISTRATION)
+        if CheckId.RESET_REQUEST_ENUMERATION in selected:
+            features.add(AuthFeature.RESET_REQUEST)
+        if CheckId.LOGOUT_INVALIDATION in selected:
+            features.add(AuthFeature.LOGOUT)
+        chosen: dict[ControlRole, str | None] | None = None
+        if guidance is not None and guidance.feature_links is not None:
+            chosen = guidance.feature_links.chosen()
+            if chosen[ControlRole.REGISTRATION_LINK]:
+                features.add(AuthFeature.REGISTRATION)
+            if chosen[ControlRole.RESET_LINK]:
+                features.add(AuthFeature.RESET_REQUEST)
+        return FeatureDiscoveryRequest(
+            features=frozenset(features),
+            classify=self._role_classifier(record, execution),
+            chosen_links=chosen,
+        )
 
     def _prepare_classification(
         self, record: ScanRecord
@@ -1391,6 +1546,7 @@ class ScanManager:
             saved_profile: AuthProfile | None = None
             if record.request.reuse_saved_profile:
                 saved_profile = self._find_saved_profile(record, execution)
+            feature_discovery = self._feature_discovery(record, execution)
 
             try:
                 if saved_profile is not None:
@@ -1411,6 +1567,7 @@ class ScanManager:
                         runtime_secrets=runtime_secrets,
                         password_references=execution.password_references(),
                         account_marker_selector=execution.account_marker_selector,
+                        feature_discovery=feature_discovery,
                     )
                 elif record.request.discovery_mode == DiscoveryMode.BEDROCK:
                     record.phase = "discovering"
@@ -1484,6 +1641,7 @@ class ScanManager:
                         cost_ledger=record.cost_ledger,
                         usage_source=source,
                         model_id=model_id,
+                        feature_discovery=feature_discovery,
                     )
                     if record.cost_ledger:
                         record.estimated_cost_usd = float(
@@ -1507,6 +1665,7 @@ class ScanManager:
                         protected_resource=str(execution.protected_resource),
                         account_marker_selector=execution.account_marker_selector,
                         account_marker_description=execution.account_marker_description,
+                        feature_discovery=feature_discovery,
                     )
             except (LoginFormDiscoveryError, ValueError) as error:
                 with self._lock:
@@ -1576,6 +1735,7 @@ class ScanManager:
                 protected_resource=str(execution.protected_resource),
                 account_marker_selector=execution.account_marker_selector,
                 account_marker_description=execution.account_marker_description,
+                feature_discovery=self._feature_discovery(record, execution, guidance),
             )
             await self._complete_profile_execution(
                 record,
@@ -2230,8 +2390,9 @@ class ScanManager:
             "error": record.error,
             "error_code": record.error_code,
             "profile_source": (
-                record.profile.discovery_history[-1].source.value
-                if record.profile and record.profile.discovery_history
+                source.value
+                if record.profile
+                and (source := login_discovery_source(record.profile)) is not None
                 else None
             ),
             "guidance_required": record.state is ScanState.AWAITING_GUIDANCE,

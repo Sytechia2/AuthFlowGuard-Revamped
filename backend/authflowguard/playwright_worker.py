@@ -65,6 +65,10 @@ READ_CONTROLS_SCRIPT = r"""selector => [...document.querySelectorAll(selector)]
             : -1;
         const rect = element.getBoundingClientRect();
         const style = getComputedStyle(element);
+        // Whether the control says it opens a menu or expandable region.
+        const popup = element.getAttribute('aria-haspopup');
+        const hasPopup = (popup !== null && !['', 'false'].includes(popup))
+            || element.hasAttribute('aria-expanded');
         return {
             observed_control_id: `control-${index + 1}`,
             tag,
@@ -80,6 +84,9 @@ READ_CONTROLS_SCRIPT = r"""selector => [...document.querySelectorAll(selector)]
             visible: rect.width > 0 && rect.height > 0
                 && style.visibility !== 'hidden',
             form_index: formPosition >= 0 ? formPosition : null,
+            // A link's resolved address; the query is removed afterwards.
+            href: tag === 'a' ? element.href : null,
+            has_popup: hasPopup,
         };
     })"""
 
@@ -111,6 +118,11 @@ class SafeControlDescription(TypedDict):
     # The control's form as its position among the page's forms; None when
     # it is in no form. Absent from observations saved before it existed.
     form_index: NotRequired[int | None]
+    # A link's address without its query, keeping a client-side route; None
+    # for other controls. Absent from observations saved before it existed.
+    href: NotRequired[str | None]
+    # Whether the control declares a popup (aria-haspopup or aria-expanded).
+    has_popup: NotRequired[bool]
 
 
 class PlaywrightWorker:
@@ -248,6 +260,11 @@ class PlaywrightWorker:
                 controls: list[SafeControlDescription] = await page.evaluate(
                     READ_CONTROLS_SCRIPT, CONTROL_SELECTOR
                 )
+                for control in controls:
+                    href = control.get("href")
+                    if href:
+                        # A query can carry a token; a route is kept.
+                        control["href"] = url_without_query_keeping_route(href)
                 return controls
             except PlaywrightError as error:
                 if attempt or "Execution context was destroyed" not in str(error):

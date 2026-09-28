@@ -501,6 +501,7 @@ def test_discovers_nonstandard_route_from_visible_link(check: CheckId) -> None:
         run = asyncio.run(run_check(check, profile_for(origin)))
     assert not run.evidence.errors
     assert len(app.state.submissions) == 2
+    assert run.evidence.observations["form_url_source"] == "keyword_search"
 
 
 def client_form_app(vulnerable: bool, noisy: bool = False) -> FastAPI:

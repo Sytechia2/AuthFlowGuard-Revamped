@@ -22,6 +22,8 @@ from authflowguard.action_executor import ActionExecutionResult, BrowserActionEx
 from authflowguard.auth_profiles import (
     ProtectedResourceObservation,
     build_verified_login_profile,
+    login_discovery_source,
+    with_features_of,
 )
 from authflowguard.automatic_actions import (
     ActionSelectionClient,
@@ -43,6 +45,10 @@ from authflowguard.evaluation.cost_tracking import (
     CostLedger,
     CostLedgerStore,
     UsageSource,
+)
+from authflowguard.feature_discovery import (
+    FeatureDiscoveryRequest,
+    discover_features,
 )
 from authflowguard.models import (
     ActionWaitCondition,
@@ -377,6 +383,15 @@ async def discover_login_form_actions(
     ]
 
 
+def _login_page_url(steps: list[BrowserAction], target: TargetScope) -> str:
+    """The page a login flow opens first: where its form links are looked for."""
+
+    for action in steps:
+        if action.action_type is BrowserActionType.NAVIGATE and action.url:
+            return str(action.url)
+    return str(target.target_url)
+
+
 def _collect_result(
     result: ActionExecutionResult,
     events: list[EvidenceEvent],
@@ -566,10 +581,13 @@ async def execute_guided_verified_login_flow(
     protected_resource: str,
     account_marker_selector: str,
     account_marker_description: str,
+    feature_discovery: FeatureDiscoveryRequest | None = None,
 ) -> VerifiedLoginExecution:
     """Record a guided login and verify it against an isolated anonymous context.
 
-    ``password_references`` names the references that hold passwords.
+    ``password_references`` names the references that hold passwords. After
+    the login is verified, the features ``feature_discovery`` asks for are
+    looked for and saved in the profile when found.
     """
 
     if not url_is_in_scope(protected_resource, target):
@@ -678,6 +696,21 @@ async def execute_guided_verified_login_flow(
                     control_signatures.copy() for _ in recorded_actions
                 ],
             )
+            discovered = await discover_features(
+                request=feature_discovery,
+                browser=browser,
+                authenticated_page=authenticated_page,
+                scan_id=scan_id,
+                target=target,
+                runtime_secrets=runtime_secrets,
+                password_references=password_references,
+                login_steps=recorded_actions,
+                login_page_url=_login_page_url(recorded_actions, target),
+                protected_resource=protected_resource,
+                account_marker_selector=account_marker_selector,
+            )
+            events.extend(discovered.events)
+            profile = discovered.apply_to(profile)
             return VerifiedLoginExecution(
                 profile=profile,
                 events=events,
@@ -868,10 +901,14 @@ async def replay_verified_auth_profile(
     runtime_secrets: RuntimeSecrets,
     password_references: frozenset[str],
     account_marker_selector: str,
+    feature_discovery: FeatureDiscoveryRequest | None = None,
 ) -> VerifiedLoginExecution:
     """Replay a saved login flow in fresh authenticated and anonymous contexts.
 
-    ``password_references`` names the references that hold passwords.
+    ``password_references`` names the references that hold passwords. The
+    registration, reset and logout features the saved profile holds are
+    kept; the ones ``feature_discovery`` asks for that it lacks are looked
+    for.
     """
 
     login_steps = profile.authentication_steps.get(AuthFeature.LOGIN, [])
@@ -969,9 +1006,7 @@ async def replay_verified_auth_profile(
             )
             events.append(anonymous_observation.evidence)
 
-            source = DiscoverySource.GUIDED
-            if profile.discovery_history:
-                source = profile.discovery_history[-1].source
+            source = login_discovery_source(profile) or DiscoverySource.GUIDED
             # A flow saved before fingerprints gains them here, from the
             # controls its position-checked steps just used.
             replayed_profile = build_verified_login_profile(
@@ -989,6 +1024,26 @@ async def replay_verified_auth_profile(
                 control_signatures=profile.control_signatures,
                 step_control_signatures=profile.step_control_signatures,
             )
+            replayed_profile = with_features_of(replayed_profile, profile)
+            discovered = await discover_features(
+                request=(
+                    feature_discovery.without(frozenset(replayed_profile.features))
+                    if feature_discovery is not None
+                    else None
+                ),
+                browser=browser,
+                authenticated_page=authenticated_page,
+                scan_id=scan_id,
+                target=target,
+                runtime_secrets=runtime_secrets,
+                password_references=password_references,
+                login_steps=recorded_steps,
+                login_page_url=_login_page_url(recorded_steps, target),
+                protected_resource=protected_resource,
+                account_marker_selector=account_marker_selector,
+            )
+            events.extend(discovered.events)
+            replayed_profile = discovered.apply_to(replayed_profile)
             return VerifiedLoginExecution(
                 profile=replayed_profile,
                 events=events,
@@ -1010,6 +1065,7 @@ async def execute_verified_login_flow(
     account_marker_selector: str,
     account_marker_description: str,
     discovery_source: DiscoverySource = DiscoverySource.AUTOMATIC,
+    feature_discovery: FeatureDiscoveryRequest | None = None,
 ) -> VerifiedLoginExecution:
     """Discover, execute, and prove a login in isolated browser contexts."""
 
@@ -1127,6 +1183,21 @@ async def execute_verified_login_flow(
                     control_signatures.copy() for _ in login_steps
                 ],
             )
+            discovered = await discover_features(
+                request=feature_discovery,
+                browser=browser,
+                authenticated_page=authenticated_page,
+                scan_id=scan_id,
+                target=target,
+                runtime_secrets=runtime_secrets,
+                password_references=frozenset({password_reference}),
+                login_steps=login_steps,
+                login_page_url=_login_page_url(login_steps, target),
+                protected_resource=protected_resource,
+                account_marker_selector=account_marker_selector,
+            )
+            events.extend(discovered.events)
+            profile = discovered.apply_to(profile)
             return VerifiedLoginExecution(
                 profile=profile,
                 events=events,
@@ -1157,6 +1228,7 @@ async def execute_ai_verified_login_flow(
     cost_ledger: CostLedger | None = None,
     usage_source: UsageSource | str = UsageSource.NONE,
     model_id: str | None = None,
+    feature_discovery: FeatureDiscoveryRequest | None = None,
 ) -> VerifiedLoginExecution:
     """Discover, execute, and prove a login using Bedrock browser orchestration."""
 
@@ -1341,6 +1413,22 @@ async def execute_ai_verified_login_flow(
                 control_signatures=control_signatures,
                 step_control_signatures=result.step_control_signatures,
             )
+            check_cancelled()
+            discovered = await discover_features(
+                request=feature_discovery,
+                browser=browser,
+                authenticated_page=authenticated_page,
+                scan_id=scan_id,
+                target=target,
+                runtime_secrets=runtime_secrets,
+                password_references=frozenset({password_reference}),
+                login_steps=login_steps,
+                login_page_url=_login_page_url(login_steps, target),
+                protected_resource=protected_resource,
+                account_marker_selector=account_marker_selector,
+            )
+            events.extend(discovered.events)
+            profile = discovered.apply_to(profile)
             return VerifiedLoginExecution(
                 profile=profile,
                 events=events,

@@ -5,11 +5,14 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from playwright.async_api import async_playwright
 
+from authflowguard.action_executor import BrowserActionExecutor
+from authflowguard.auth_profiles import saved_logout_steps
 from authflowguard.checks.session_common import (
     adapt_login_steps,
     check_event,
@@ -20,9 +23,16 @@ from authflowguard.checks.session_common import (
     replay_rejected,
     replay_server_error,
 )
-from authflowguard.control_safety import STRICT_DESTRUCTIVE_LABEL, describe_error
+from authflowguard.control_roles import LOGOUT_LABEL, MAX_MENU_TOGGLES, MENU_LABEL
+from authflowguard.control_safety import (
+    STRICT_DESTRUCTIVE_LABEL,
+    RecordedControlNotFoundError,
+    describe_error,
+    flow_step,
+)
 from authflowguard.models import (
     AuthProfile,
+    BrowserAction,
     CheckId,
     CheckOutcome,
     CheckResult,
@@ -45,9 +55,7 @@ class LogoutInvalidationRun:
         self.events = events
 
 
-LOGOUT_LABEL = re.compile(r"\b(log|sign)\s*-?\s*(out|off)\b", re.IGNORECASE)
 LOGOUT_URL = re.compile(r"(log|sign)[-_]?(out|off)", re.IGNORECASE)
-MENU_LABEL = re.compile(r"account|user|profile|menu", re.IGNORECASE)
 # The search runs signed in, often on an account page. A control named for an
 # irreversible account action is never clicked, whatever else it matches. It
 # uses the strict rule, not the executor's narrower one: here the scanner picks
@@ -60,7 +68,15 @@ MENU_TOGGLE = (
     ':is(button, [role="button"])'
     ':is([aria-haspopup="true"], [aria-haspopup="menu"], [aria-expanded])'
 )
-MAX_MENU_TOGGLES = 3
+
+
+class LogoutSource(StrEnum):
+    """How the logout control was found, recorded in the evidence."""
+
+    # The verified logout flow saved in the auth profile was replayed.
+    SAVED_PROFILE = "saved_profile"
+    # The check searched the signed-in page by keyword, as it always did.
+    KEYWORD_SEARCH = "keyword_search"
 
 
 @dataclass
@@ -149,6 +165,33 @@ async def _find_logout_control(page: Any) -> Any:
     return None
 
 
+class _LogoutResponses:
+    """Statuses of the responses a logout sends: any non-GET or logout URL."""
+
+    def __init__(self, page: Any) -> None:
+        self._page = page
+        self.statuses: list[int] = []
+
+    def _record(self, response: Any) -> None:
+        request = response.request
+        if request.method.upper() != "GET" or LOGOUT_URL.search(request.url):
+            self.statuses.append(response.status)
+
+    def __enter__(self) -> "_LogoutResponses":
+        self._page.on("response", self._record)
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self._page.remove_listener("response", self._record)
+
+    def attempt(self) -> LogoutAttempt:
+        return LogoutAttempt(
+            method="control",
+            status=self.statuses[-1] if self.statuses else None,
+            request_observed=bool(self.statuses),
+        )
+
+
 async def _click_logout_control(page: Any, app_url: str) -> LogoutAttempt | None:
     control = await _find_logout_control(page)
     if control is None and page.url.split("#", 1)[0] != app_url.split("#", 1)[0]:
@@ -158,24 +201,44 @@ async def _click_logout_control(page: Any, app_url: str) -> LogoutAttempt | None
     if control is None:
         return None
 
-    statuses: list[int] = []
-
-    def record(response: Any) -> None:
-        request = response.request
-        if request.method.upper() != "GET" or LOGOUT_URL.search(request.url):
-            statuses.append(response.status)
-
-    page.on("response", record)
-    try:
+    with _LogoutResponses(page) as responses:
         async with background_requests_settled(page):
             await control.click()
-    finally:
-        page.remove_listener("response", record)
-    return LogoutAttempt(
-        method="control",
-        status=statuses[-1] if statuses else None,
-        request_observed=bool(statuses),
+    return responses.attempt()
+
+
+async def _replay_saved_logout(
+    page: Any,
+    profile: AuthProfile,
+    scan_id: UUID,
+    steps: list[BrowserAction],
+    events: list[EvidenceEvent],
+) -> LogoutAttempt:
+    """Replay the verified logout flow saved in the profile.
+
+    Each control is found by its fingerprint and checked by the executor
+    before it is clicked. A control that no longer resolves raises
+    ``RecordedControlNotFoundError``; nothing else is clicked in its place.
+    """
+
+    executor = BrowserActionExecutor(
+        page,
+        profile.target,
+        RuntimeSecrets({}),
+        scan_id,
+        password_references=frozenset(),
     )
+    with _LogoutResponses(page) as responses:
+        for number, step in enumerate(steps, start=1):
+            with flow_step(number):
+                result = await executor.execute(
+                    step.model_copy(update={"action_id": uuid4()})
+                )
+            events.extend(
+                event.model_copy(update={"check_id": CheckId.LOGOUT_INVALIDATION})
+                for event in result.events
+            )
+    return responses.attempt()
 
 
 async def _submit_logout(page: Any, app_url: str) -> LogoutAttempt:
@@ -203,6 +266,9 @@ async def run_logout_invalidation_check(
     )
     if not protected_resource or not account_marker_selector:
         raise ValueError("Logout invalidation requires a protected resource and marker")
+    # A verified logout flow saved with the profile is replayed; without one
+    # the check searches the signed-in page, as it always did.
+    saved_logout = saved_logout_steps(profile)
     events: list[EvidenceEvent] = []
     attempted_steps = ["complete_login", "capture_session", "submit_logout"]
     completed_steps: list[str] = []
@@ -234,7 +300,23 @@ async def run_logout_invalidation_check(
                     old_cookies = await context.cookies()
                     observations["active_session"] = cookie_snapshot(old_cookies)
                     completed_steps.append("capture_session")
-                    logout = await _submit_logout(page, str(profile.target.target_url))
+                    logout_source = LogoutSource.KEYWORD_SEARCH
+                    logout: LogoutAttempt | None = None
+                    if saved_logout:
+                        try:
+                            logout = await _replay_saved_logout(
+                                page, profile, scan_id, saved_logout, events
+                            )
+                            logout_source = LogoutSource.SAVED_PROFILE
+                        except RecordedControlNotFoundError:
+                            # The page changed since the flow was saved: the
+                            # search below looks for logout as it always did.
+                            observations["saved_logout_flow_stale"] = True
+                    if logout is None:
+                        logout = await _submit_logout(
+                            page, str(profile.target.target_url)
+                        )
+                    observations["logout_source"] = logout_source.value
                     logout_status = logout.status
                     observations["logout_status"] = logout_status
                     observations["logout_method"] = logout.method

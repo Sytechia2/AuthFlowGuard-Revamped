@@ -273,6 +273,9 @@ def test_rules_suggestion_makes_no_model_request(
         "source": "rules",
         "status": "rules_detected",
         "rejected": [],
+        "registration_link": None,
+        "reset_link": None,
+        "link_sources": {},
     }
     assert double.classify_calls == 0
     assert ledger_entries(tmp_path, record) == []
@@ -295,6 +298,9 @@ def test_ai_suggestion_is_validated_and_counted_in_the_scan_ledger(
         "source": "ai",
         "status": "ai_suggested",
         "rejected": [],
+        "registration_link": None,
+        "reset_link": None,
+        "link_sources": {},
     }
     assert len(observed["controls"]) == len(JUICE_SHOP_LIKE)
     assert double.classify_calls == 1
@@ -335,6 +341,9 @@ def test_rules_mode_never_asks_a_model(
         "source": None,
         "status": "not_detected",
         "rejected": [],
+        "registration_link": None,
+        "reset_link": None,
+        "link_sources": {},
     }
     assert double.classify_calls == 0
     assert ledger_entries(tmp_path, record) == []
@@ -705,6 +714,9 @@ def test_real_browser_juice_shop_like_page_gets_the_right_suggestions(
         "source": "ai",
         "status": "ai_suggested",
         "rejected": [],
+        "registration_link": None,
+        "reset_link": None,
+        "link_sources": {},
     }
     assert double.classify_calls == 1
     # Form membership and a button input's label are read from the page.
@@ -762,3 +774,101 @@ def test_real_browser_juice_shop_like_page_rejects_a_malicious_answer(
         "not_password_field",
         "irreversible_action",
     ]
+
+
+# --- Registration and reset links in the observation -------------------------
+
+WITH_LINKS = [
+    *JUICE_SHOP_LIKE,
+    control(
+        "control-8",
+        "a",
+        text="Not yet a customer?",
+        href="https://app.example/#/register",
+    ),
+    control(
+        "control-9",
+        "a",
+        text="Forgot your password?",
+        href="https://app.example/#/forgot-password",
+    ),
+    control(
+        "control-10",
+        "a",
+        text="Partner sign-up",
+        href="https://evil.example/register",
+    ),
+]
+
+
+def test_links_come_from_the_rules_first_and_the_same_model_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    double = DeterministicModelDouble()
+    manager = make_manager(tmp_path, lambda: double)
+    record = awaiting_scan(manager, DiscoveryMode.BEDROCK)
+    patch_observation(monkeypatch, WITH_LINKS)
+
+    suggested = observe(manager, record)["suggested_controls"]
+
+    # The rules name the reset link; only the registration link, which says
+    # nothing the rules recognise, is asked of the model, in the one request
+    # made for the login controls.
+    assert suggested["reset_link"] == "control-9"
+    assert suggested["registration_link"] == "control-8"
+    assert suggested["link_sources"] == {
+        "registration_link": "ai",
+        "reset_link": "rules",
+    }
+    assert suggested["source"] == "ai"
+    assert double.classify_calls == 1
+    objective = double.observations[-1].objective
+    assert "registration_link" in objective
+    assert "reset_link" not in objective
+    assert [entry.is_reservation for entry in ledger_entries(tmp_path, record)] == [
+        True,
+        False,
+    ]
+
+
+def test_a_model_link_to_another_site_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    classifier = ScriptedClassifier(
+        [
+            RoleSuggestion("control-5", ControlRole.USERNAME),
+            RoleSuggestion("control-6", ControlRole.PASSWORD),
+            RoleSuggestion("control-7", ControlRole.SUBMIT),
+            RoleSuggestion("control-10", ControlRole.REGISTRATION_LINK),
+            # "Delete account" as the reset link.
+            RoleSuggestion("control-4", ControlRole.RESET_LINK),
+        ]
+    )
+    manager = make_manager(tmp_path, lambda: classifier)
+    record = awaiting_scan(manager, DiscoveryMode.BEDROCK)
+    patch_observation(monkeypatch, WITH_LINKS)
+
+    suggested = observe(manager, record)["suggested_controls"]
+
+    assert suggested["username"] == "control-5"
+    # The rules' reset link stands; the model's links are both dropped.
+    assert suggested["reset_link"] == "control-9"
+    assert suggested["registration_link"] is None
+    assert suggested["link_sources"] == {"reset_link": "rules"}
+
+
+def test_rules_mode_suggests_links_without_a_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    double = DeterministicModelDouble()
+    manager = make_manager(tmp_path, lambda: double)
+    record = awaiting_scan(manager, DiscoveryMode.RULES)
+    patch_observation(monkeypatch, WITH_LINKS)
+
+    suggested = observe(manager, record)["suggested_controls"]
+
+    assert suggested["reset_link"] == "control-9"
+    assert suggested["registration_link"] is None
+    assert suggested["link_sources"] == {"reset_link": "rules"}
+    assert double.classify_calls == 0
+    assert ledger_entries(tmp_path, record) == []

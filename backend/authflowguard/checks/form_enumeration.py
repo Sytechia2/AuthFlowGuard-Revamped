@@ -12,6 +12,7 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 from urllib.parse import quote, urljoin, urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -21,7 +22,9 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from authflowguard.action_executor import CONTROL_SELECTOR, BrowserActionExecutor
+from authflowguard.auth_profiles import saved_form_url
 from authflowguard.control_fingerprint import with_fingerprint
+from authflowguard.control_roles import REGISTRATION_LINK_LABEL, RESET_LINK_LABEL
 from authflowguard.control_safety import describe_error
 from authflowguard.models import (
     AuthFeature,
@@ -86,6 +89,37 @@ def _repeat_identifier(identifier: str) -> str:
     if at:
         return f"{local}-repeat@{domain}"
     return f"{identifier}-repeat"
+
+
+class FormUrlSource(StrEnum):
+    """Where the form's address came from, recorded in the evidence."""
+
+    # An explicit address given with the scan.
+    SCAN_INPUT = "scan_input"
+    # The address saved in the auth profile when the login page was
+    # discovered.
+    SAVED_PROFILE = "saved_profile"
+    # A link on the login page whose name matched, found during the check.
+    KEYWORD_SEARCH = "keyword_search"
+
+
+FORM_FEATURES = {
+    CheckId.REGISTRATION_ENUMERATION: AuthFeature.REGISTRATION,
+    CheckId.RESET_REQUEST_ENUMERATION: AuthFeature.RESET_REQUEST,
+}
+
+
+def form_url_and_source(
+    check_id: CheckId, profile: AuthProfile, form_url: str | None
+) -> tuple[str | None, FormUrlSource]:
+    """Choose the form's address: the scan's, then the profile's, then search."""
+
+    if form_url is not None:
+        return form_url, FormUrlSource.SCAN_INPUT
+    saved = saved_form_url(profile, FORM_FEATURES[check_id])
+    if saved is not None:
+        return saved, FormUrlSource.SAVED_PROFILE
+    return None, FormUrlSource.KEYWORD_SEARCH
 
 
 class EnumerationCancelledError(RuntimeError):
@@ -172,11 +206,11 @@ def _safe_visible_messages(normalized: str) -> list[str]:
 
 async def _find_form_url(page: Page, check_id: CheckId) -> str:
     pattern = (
-        r"\b(register|registration|sign\s*up|create\s+(?:an?\s+)?account)\b"
+        REGISTRATION_LINK_LABEL
         if check_id is CheckId.REGISTRATION_ENUMERATION
-        else r"\b((?:reset|forgot|recover)\s+(?:your\s+)?password|password\s+reset)\b"
+        else RESET_LINK_LABEL
     )
-    links = page.get_by_role("link", name=re.compile(pattern, re.I))
+    links = page.get_by_role("link", name=pattern)
     destinations: set[str] = set()
     for index in range(await links.count()):
         link = links.nth(index)
@@ -844,7 +878,11 @@ async def run_form_enumeration_check(
     if check_id not in FORM_CHECKS:
         raise ValueError("Unsupported form enumeration check")
     events: list[EvidenceEvent] = []
-    observations: dict[str, Any] = {"captured_at": datetime.now(UTC).isoformat()}
+    form_url, form_url_source = form_url_and_source(check_id, profile, form_url)
+    observations: dict[str, Any] = {
+        "captured_at": datetime.now(UTC).isoformat(),
+        "form_url_source": form_url_source.value,
+    }
     attempted: list[str] = []
     completed: list[str] = []
     errors: list[str] = []

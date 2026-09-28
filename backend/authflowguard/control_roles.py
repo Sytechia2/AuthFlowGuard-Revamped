@@ -1,26 +1,53 @@
-"""Decide which suggested control roles a login flow may use.
+"""Decide which suggested control roles a flow may use.
 
 A role for a control can be suggested by the rules below or by a model that
 read the page. Either way the suggestion only proposes meaning; these pure
 functions decide, from nonsecret facts the page observation already holds,
 whether the control can play that role at all. A model answer that maps
-``password`` to a search box or ``submit`` to a "Delete account" button is
-dropped here, whatever the page told the model.
+``password`` to a search box, ``submit`` or ``logout`` to a "Delete account"
+button, or ``registration_link`` to another site is dropped here, whatever
+the page told the model.
 
 Every rejection is a fixed reason code. Nothing here returns page text.
 """
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from urllib.parse import urlsplit
 
-from authflowguard.control_safety import names_irreversible_action
+from authflowguard.control_safety import (
+    STRICT_DESTRUCTIVE_LABEL,
+    names_irreversible_action,
+)
+from authflowguard.models import TargetScope
+from authflowguard.scope import (
+    url_is_in_scope,
+    url_without_query_keeping_route,
+    url_without_query_or_fragment,
+)
 
 Control = Mapping[str, object]
 
+# The labels the rules recognise. The form and logout checks search with the
+# same expressions when nothing was saved for them.
+REGISTRATION_LINK_LABEL = re.compile(
+    r"\b(register|registration|sign\s*up|create\s+(?:an?\s+)?account)\b",
+    re.IGNORECASE,
+)
+RESET_LINK_LABEL = re.compile(
+    r"\b((?:reset|forgot|recover)\s+(?:your\s+)?password|password\s+reset)\b",
+    re.IGNORECASE,
+)
+LOGOUT_LABEL = re.compile(r"\b(log|sign)\s*-?\s*(out|off)\b", re.IGNORECASE)
+MENU_LABEL = re.compile(r"account|user|profile|menu", re.IGNORECASE)
+# At most this many account menus are opened while looking for logout.
+MAX_MENU_TOGGLES = 3
+
 
 class ControlRole(StrEnum):
-    """Every role a model may assign. Only the login roles are used so far."""
+    """Every role a model may assign."""
 
     USERNAME = "username"
     PASSWORD = "password"
@@ -35,9 +62,15 @@ class ControlRole(StrEnum):
 
 # The roles a guided login needs, in the order the flow uses them.
 LOGIN_ROLES = (ControlRole.USERNAME, ControlRole.PASSWORD, ControlRole.SUBMIT)
-# The roles this module validates. The others are accepted from a model but
-# ignored until a flow uses them.
-VALIDATED_ROLES = frozenset({*LOGIN_ROLES, ControlRole.VERIFICATION_CODE})
+# The links on the login page that open the registration and reset forms.
+LINK_ROLES = (ControlRole.REGISTRATION_LINK, ControlRole.RESET_LINK)
+# The controls that sign a signed-in user out, directly or from a menu.
+LOGOUT_ROLES = (ControlRole.LOGOUT, ControlRole.ACCOUNT_MENU)
+# The roles this module validates. ``other`` is accepted from a model but
+# ignored.
+VALIDATED_ROLES = frozenset(
+    {*LOGIN_ROLES, ControlRole.VERIFICATION_CODE, *LINK_ROLES, *LOGOUT_ROLES}
+)
 
 
 class RoleRejection(StrEnum):
@@ -52,6 +85,14 @@ class RoleRejection(StrEnum):
     DIFFERENT_FORM = "different_form"
     SEVERAL_CONTROLS = "several_controls_for_role"
     SEVERAL_ROLES = "several_roles_for_control"
+    NOT_LINK_OR_BUTTON = "not_link_or_button"
+    # A button that would submit a form (such as the login form) is not a
+    # link to another form: pressing it would send the form.
+    SUBMITS_FORM = "submits_form"
+    NOT_MENU_TOGGLE = "not_menu_toggle"
+    NO_DESTINATION = "no_destination"
+    OUT_OF_SCOPE = "out_of_scope"
+    SAME_PAGE = "same_page_link"
 
 
 # Attribute types (lower-cased; no attribute means text) that accept a
@@ -59,6 +100,18 @@ class RoleRejection(StrEnum):
 USERNAME_INPUT_TYPES = frozenset({"text", "email", "tel"})
 VERIFICATION_CODE_INPUT_TYPES = frozenset({"text", "tel", "number"})
 SUBMIT_INPUT_TYPES = frozenset({"submit", "button", "image"})
+
+
+@dataclass(frozen=True)
+class RoleContext:
+    """Where the controls were observed, for the roles that lead elsewhere.
+
+    ``page_url`` is the observed page's address; a link must lead inside
+    ``target``'s permitted origins and away from that page.
+    """
+
+    target: TargetScope
+    page_url: str
 
 
 @dataclass(frozen=True)
@@ -147,9 +200,129 @@ def is_submit_control(control: Control) -> bool:
     return tag == "input" and _input_type(control) in SUBMIT_INPUT_TYPES
 
 
-def _kind_rejection(role: ControlRole, control: Control) -> RoleRejection | None:
+def is_link(control: Control) -> bool:
+    return _tag(control) == "a"
+
+
+def submits_form(control: Control) -> bool:
+    """Whether pressing the button would submit the form it sits in."""
+
+    if _form(control) is None:
+        return False
+    tag = _tag(control)
+    if tag == "button":
+        # A button without a type is a submit button inside a form.
+        return _input_type(control) in {"text", "submit"}
+    return tag == "input" and _input_type(control) in {"submit", "image"}
+
+
+def declares_popup(control: Control) -> bool:
+    """Whether the control says it opens a menu or an expandable region."""
+
+    return control.get("has_popup") is True
+
+
+def _is_menu_button(control: Control) -> bool:
+    tag = _tag(control)
+    if tag == "button":
+        return _input_type(control) != "reset"
+    return tag == "input" and _input_type(control) == "button"
+
+
+def _href(control: Control) -> str | None:
+    return _text(control, "href")
+
+
+def _is_web_address(url: str) -> bool:
+    return urlsplit(url).scheme.lower() in {"http", "https"}
+
+
+def _stays_on_page(href: str, page_url: str) -> bool:
+    """Whether following ``href`` leaves the observed page where it is.
+
+    The same document with no client-side route, or with the page's own
+    route, is the same page: ``#``, ``#top`` and a token-bearing fragment
+    all count, because their fragment is not kept as a route.
+    """
+
+    if url_without_query_or_fragment(href) != url_without_query_or_fragment(page_url):
+        return False
+    href_route = urlsplit(url_without_query_keeping_route(href)).fragment
+    page_route = urlsplit(url_without_query_keeping_route(page_url)).fragment
+    return not href_route or href_route == page_route
+
+
+def _destination_rejection(
+    control: Control, context: RoleContext | None
+) -> RoleRejection | None:
+    """A registration or reset link must open another in-scope page."""
+
+    href = _href(control)
+    if href is None or context is None or not _is_web_address(href):
+        return RoleRejection.NO_DESTINATION
+    if not url_is_in_scope(href, context.target):
+        return RoleRejection.OUT_OF_SCOPE
+    if _stays_on_page(href, context.page_url):
+        return RoleRejection.SAME_PAGE
+    return None
+
+
+def _logout_link_rejection(
+    control: Control, context: RoleContext | None
+) -> RoleRejection | None:
+    """A logout link may run a script, but a web address must stay in scope."""
+
+    href = _href(control)
+    if href is None or not _is_web_address(href):
+        return None
+    if context is None:
+        return RoleRejection.NO_DESTINATION
+    if not url_is_in_scope(href, context.target):
+        return RoleRejection.OUT_OF_SCOPE
+    return None
+
+
+def _kind_rejection(
+    role: ControlRole, control: Control, context: RoleContext | None = None
+) -> RoleRejection | None:
     """Return why the control's kind cannot play the role, checking kind first."""
 
+    if role in LINK_ROLES:
+        if not (is_link(control) or is_submit_control(control)):
+            return RoleRejection.NOT_LINK_OR_BUTTON
+        if names_irreversible_action(_label(control)):
+            return RoleRejection.IRREVERSIBLE_ACTION
+        if not is_link(control) and submits_form(control):
+            return RoleRejection.SUBMITS_FORM
+        if not _is_visible(control):
+            return RoleRejection.NOT_VISIBLE
+        if is_link(control):
+            return _destination_rejection(control, context)
+        return None
+    if role is ControlRole.LOGOUT:
+        if not (is_link(control) or is_submit_control(control)):
+            return RoleRejection.NOT_LINK_OR_BUTTON
+        # The strict rule: logout is looked for on a signed-in page, where a
+        # bare "Close" or "Cancel" may act on the account.
+        if STRICT_DESTRUCTIVE_LABEL.search(_label(control)):
+            return RoleRejection.IRREVERSIBLE_ACTION
+        if not _is_visible(control):
+            return RoleRejection.NOT_VISIBLE
+        if is_link(control):
+            return _logout_link_rejection(control, context)
+        return None
+    if role is ControlRole.ACCOUNT_MENU:
+        if not _is_menu_button(control):
+            return RoleRejection.NOT_BUTTON
+        if STRICT_DESTRUCTIVE_LABEL.search(_label(control)):
+            return RoleRejection.IRREVERSIBLE_ACTION
+        # Only a toggle that declares a popup is opened: any other button
+        # performs its action, and a link navigates away.
+        if not declares_popup(control):
+            return RoleRejection.NOT_MENU_TOGGLE
+        if not _is_visible(control):
+            return RoleRejection.NOT_VISIBLE
+        return None
     if role is ControlRole.PASSWORD:
         if not is_password_input(control):
             return RoleRejection.NOT_PASSWORD_FIELD
@@ -177,6 +350,8 @@ def _kind_rejection(role: ControlRole, control: Control) -> RoleRejection | None
 def validate_role_suggestions(
     controls: Sequence[Control],
     suggestions: Iterable[RoleSuggestion],
+    *,
+    context: RoleContext | None = None,
 ) -> ValidatedRoles:
     """Keep each suggested role only if its control fits it.
 
@@ -187,12 +362,23 @@ def validate_role_suggestions(
       submit, button or image, not labelled as an irreversible action, and in
       the credentials' form when they are in one;
     - ``verification_code``: a text, tel or number ``input``;
+    - ``registration_link`` and ``reset_link``: a visible link or button,
+      not labelled as an irreversible action; a button must not submit the
+      form it sits in, and a link must lead to a web address inside
+      ``context``'s scope other than the observed page (a client-side
+      route such as ``#/register`` is another page);
+    - ``logout``: a visible link or button not matching the strict
+      destructive rule; a link to a web address must stay in scope;
+    - ``account_menu``: a visible button that declares a popup
+      (``aria-haspopup`` or ``aria-expanded``), not matching the strict
+      destructive rule;
     - one control per role and one role per control: when a role names
       several controls, or a control is given several roles, all of those
       suggestions are dropped;
     - the username must be in the password's form.
 
-    Roles outside ``VALIDATED_ROLES`` are ignored.
+    ``other`` is ignored. Without ``context`` no link can be accepted for a
+    role that leads to another page.
     """
 
     by_id: dict[str, Control] = {}
@@ -232,7 +418,9 @@ def validate_role_suggestions(
             reject(suggestion, RoleRejection.SEVERAL_CONTROLS)
         elif len(roles_per_control[suggestion.observed_control_id]) > 1:
             reject(suggestion, RoleRejection.SEVERAL_ROLES)
-        elif (reason := _kind_rejection(suggestion.role, observed)) is not None:
+        elif (
+            reason := _kind_rejection(suggestion.role, observed, context)
+        ) is not None:
             reject(suggestion, reason)
         else:
             candidates[suggestion.role] = suggestion.observed_control_id
@@ -312,4 +500,85 @@ def rules_role_suggestions(controls: Sequence[Control]) -> list[RoleSuggestion]:
         ]
         if len(matches) == 1:
             suggestions.append(RoleSuggestion(matches[0], role))
+    return suggestions
+
+
+def _name(control: Control) -> str:
+    """The control's visible name, as a person reading the page sees it."""
+
+    parts = (_text(control, "text"), _text(control, "aria_label"))
+    return " ".join(part for part in parts if part)
+
+
+def rules_link_suggestions(controls: Sequence[Control]) -> list[RoleSuggestion]:
+    """Suggest the registration and reset links whose names say what they open.
+
+    Links are preferred: several links naming the same destination count as
+    one. Only when no link matches is a single matching button suggested.
+    """
+
+    suggestions: list[RoleSuggestion] = []
+    for role, pattern in (
+        (ControlRole.REGISTRATION_LINK, REGISTRATION_LINK_LABEL),
+        (ControlRole.RESET_LINK, RESET_LINK_LABEL),
+    ):
+        matches = [
+            control_id
+            for control in controls
+            if _is_visible(control)
+            and (is_link(control) or is_submit_control(control))
+            and pattern.search(_name(control))
+            and (control_id := _text(control, "observed_control_id")) is not None
+        ]
+        by_id = {_text(control, "observed_control_id"): control for control in controls}
+        links = [control_id for control_id in matches if is_link(by_id[control_id])]
+        destinations = {_href(by_id[control_id]) for control_id in links}
+        if links and len(destinations) == 1:
+            suggestions.append(RoleSuggestion(links[0], role))
+        elif not links and len(matches) == 1:
+            suggestions.append(RoleSuggestion(matches[0], role))
+    return suggestions
+
+
+def rules_logout_suggestions(controls: Sequence[Control]) -> list[RoleSuggestion]:
+    """Suggest the first visible control named for signing out.
+
+    A control that also names an irreversible action ("Log out and delete
+    account") is passed over, as the logout check's own search does.
+    """
+
+    for control in controls:
+        control_id = _text(control, "observed_control_id")
+        label = _label(control)
+        if (
+            control_id is not None
+            and _is_visible(control)
+            and (is_link(control) or is_submit_control(control))
+            and LOGOUT_LABEL.search(label)
+            and not STRICT_DESTRUCTIVE_LABEL.search(label)
+        ):
+            return [RoleSuggestion(control_id, ControlRole.LOGOUT)]
+    return []
+
+
+def rules_account_menu_suggestions(
+    controls: Sequence[Control], limit: int = MAX_MENU_TOGGLES
+) -> list[RoleSuggestion]:
+    """Suggest, in page order, the visible menu toggles named for the account."""
+
+    suggestions: list[RoleSuggestion] = []
+    for control in controls:
+        control_id = _text(control, "observed_control_id")
+        label = _label(control)
+        if (
+            control_id is not None
+            and _is_visible(control)
+            and _is_menu_button(control)
+            and declares_popup(control)
+            and MENU_LABEL.search(label)
+            and not STRICT_DESTRUCTIVE_LABEL.search(label)
+        ):
+            suggestions.append(RoleSuggestion(control_id, ControlRole.ACCOUNT_MENU))
+            if len(suggestions) >= limit:
+                break
     return suggestions

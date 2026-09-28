@@ -488,6 +488,8 @@ def test_client_side_menu_logout_is_found_and_reported() -> None:
 
     observations = run.evidence.observations
     assert run.evidence.errors == []
+    # Nothing was saved with this profile, so the check searched as before.
+    assert observations["logout_source"] == "keyword_search"
     assert observations["logout_method"] == "control"
     assert observations["logout_request_observed"] is False
     assert observations["post_logout_control"]["marker_present"] is False
