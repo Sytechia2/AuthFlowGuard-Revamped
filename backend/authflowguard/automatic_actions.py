@@ -22,6 +22,7 @@ from authflowguard.bedrock import (
     PageObservationForModel,
 )
 from authflowguard.cancellation import cancellation_checkpoint
+from authflowguard.control_safety import SafeMessageError
 from authflowguard.evaluation.cost_tracking import (
     CostEntry,
     CostLedger,
@@ -98,6 +99,7 @@ class AutomaticBrowserController:
         action_client: ActionSelectionClient,
         limits: ExecutionLimits,
         credential_references: list[str],
+        password_references: frozenset[str],
         progress_callback: ProgressCallback | None = None,
         usage_callback: UsageCallback | None = None,
         event_sink: Callable[[list[EvidenceEvent]], None] | None = None,
@@ -131,6 +133,7 @@ class AutomaticBrowserController:
             target,
             runtime_secrets,
             scan_id,
+            password_references=password_references,
         )
         self._recorder = PlaywrightWorker()
 
@@ -452,7 +455,9 @@ class AutomaticBrowserController:
                 )
                 events.extend(execution.events)
                 traffic.extend(execution.traffic)
-                self._executed_actions.append(decision.action)
+                # Saved with the fingerprint of the control it acted on, so a
+                # replay finds that control even if the page shifts.
+                self._executed_actions.append(execution.recorded(decision.action))
                 self._executed_signatures.append(current_step_sigs)
                 if (
                     decision.action.action_type is BrowserActionType.FILL
@@ -556,6 +561,8 @@ class AutomaticBrowserController:
                 }
                 if isinstance(error, BedrockResponseError):
                     error_details["safe_reason"] = str(error)
+                elif isinstance(error, SafeMessageError):
+                    error_details["safe_reason"] = error.safe_message
                 if decision is not None:
                     error_details["action_type"] = decision.action.action_type.value
                     error_details["observed_control_id"] = (
@@ -690,6 +697,7 @@ class AutomaticBrowserController:
                             if isinstance(control.get("form_action"), str)
                             else None
                         ),
+                        form_index=control.get("form_index"),
                         value_present=control.get("value_present"),
                         visible=control["visible"],
                         allowed_actions=self._allowed_actions(control),

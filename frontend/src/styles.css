@@ -374,6 +374,17 @@ h3 {
   font-size: 0.84rem;
 }
 
+.suggestion-note {
+  margin: 0 0 1.2rem;
+  padding: 0.55rem 0.8rem;
+  border-left: 3px solid var(--blue);
+  border-radius: 4px;
+  background: var(--blue-soft);
+  color: var(--blue-dark);
+  font-size: 0.84rem;
+  font-weight: 600;
+}
+
 .credential-fields {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -994,6 +1005,7 @@ code {
 .result-actions {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 0.8rem;
   margin: 1.25rem 0;
 }

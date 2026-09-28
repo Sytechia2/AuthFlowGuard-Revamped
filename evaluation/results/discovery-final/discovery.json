@@ -1,0 +1,112 @@
+{
+  "attempts": [
+    {
+      "application": "A",
+      "attempt": 1,
+      "detail": "No observable page, title, URL, or control-state difference was found across the three paired comparisons.",
+      "discovery": "automatic",
+      "duration_seconds": 6.78
+    },
+    {
+      "application": "A",
+      "attempt": 2,
+      "detail": "No observable page, title, URL, or control-state difference was found across the three paired comparisons.",
+      "discovery": "automatic",
+      "duration_seconds": 6.89
+    },
+    {
+      "application": "A",
+      "attempt": 3,
+      "detail": "The scan raised before finishing: TimeoutError()",
+      "discovery": "failed",
+      "duration_seconds": 180.05
+    },
+    {
+      "application": "A",
+      "attempt": 4,
+      "detail": "No observable page, title, URL, or control-state difference was found across the three paired comparisons.",
+      "discovery": "automatic",
+      "duration_seconds": 6.95
+    },
+    {
+      "application": "A",
+      "attempt": 5,
+      "detail": "No observable page, title, URL, or control-state difference was found across the three paired comparisons.",
+      "discovery": "automatic",
+      "duration_seconds": 6.92
+    },
+    {
+      "application": "B",
+      "attempt": 1,
+      "detail": "No observable page, title, URL, or control-state difference was found across the three paired comparisons.",
+      "discovery": "automatic",
+      "duration_seconds": 8.84
+    },
+    {
+      "application": "B",
+      "attempt": 2,
+      "detail": "No observable page, title, URL, or control-state difference was found across the three paired comparisons.",
+      "discovery": "automatic",
+      "duration_seconds": 8.59
+    },
+    {
+      "application": "B",
+      "attempt": 3,
+      "detail": "No observable page, title, URL, or control-state difference was found across the three paired comparisons.",
+      "discovery": "automatic",
+      "duration_seconds": 8.78
+    },
+    {
+      "application": "B",
+      "attempt": 4,
+      "detail": "No observable page, title, URL, or control-state difference was found across the three paired comparisons.",
+      "discovery": "automatic",
+      "duration_seconds": 8.81
+    },
+    {
+      "application": "B",
+      "attempt": 5,
+      "detail": "No observable page, title, URL, or control-state difference was found across the three paired comparisons.",
+      "discovery": "automatic",
+      "duration_seconds": 8.93
+    },
+    {
+      "application": "C",
+      "attempt": 1,
+      "detail": "Automatic discovery paused; completed through the guided fallback. No observable page, title, URL, or control-state difference was found across the three paired",
+      "discovery": "guided",
+      "duration_seconds": 10.33
+    },
+    {
+      "application": "C",
+      "attempt": 2,
+      "detail": "Automatic discovery paused; completed through the guided fallback. No observable page, title, URL, or control-state difference was found across the three paired",
+      "discovery": "guided",
+      "duration_seconds": 10.42
+    },
+    {
+      "application": "C",
+      "attempt": 3,
+      "detail": "Automatic discovery paused; completed through the guided fallback. No observable page, title, URL, or control-state difference was found across the three paired",
+      "discovery": "guided",
+      "duration_seconds": 10.61
+    },
+    {
+      "application": "C",
+      "attempt": 4,
+      "detail": "Automatic discovery paused; completed through the guided fallback. No observable page, title, URL, or control-state difference was found across the three paired",
+      "discovery": "guided",
+      "duration_seconds": 10.07
+    },
+    {
+      "application": "C",
+      "attempt": 5,
+      "detail": "Automatic discovery paused; completed through the guided fallback. No observable page, title, URL, or control-state difference was found across the three paired",
+      "discovery": "guided",
+      "duration_seconds": 10.76
+    }
+  ],
+  "attempts_per_application": 5,
+  "discovery_mode": "rules",
+  "run_id": "discovery-final"
+}

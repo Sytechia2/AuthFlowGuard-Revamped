@@ -108,9 +108,27 @@ type SafeControl = {
   placeholder: string | null;
   autocomplete: string | null;
   aria_label: string | null;
+  text?: string | null;
   value_present: boolean | null;
   visible: boolean;
 };
+
+type SuggestionSource = "rules" | "ai";
+
+// Controls the backend suggests for each sign-in question. The backend has
+// already checked that each one fits its role; the developer still confirms.
+type SuggestedControls = {
+  username: string | null;
+  password: string | null;
+  submit: string | null;
+  source: SuggestionSource | null;
+  status?: string;
+  registration_link?: string | null;
+  reset_link?: string | null;
+  link_sources?: Partial<Record<LinkRole, SuggestionSource>>;
+};
+
+type LinkRole = "registration_link" | "reset_link";
 
 type GuidanceActionType = "navigate" | "fill" | "click";
 
@@ -126,6 +144,7 @@ type GuidanceObservation = {
   url?: string;
   title?: string;
   controls: SafeControl[];
+  suggested_controls?: SuggestedControls | null;
 };
 
 function controlLabel(control: SafeControl): string {
@@ -134,9 +153,110 @@ function controlLabel(control: SafeControl): string {
     control.name ??
     control.id ??
     control.placeholder ??
+    control.text ??
     (control.type === "password" ? "Password field" : "Unnamed control");
   const kind = control.type ? ` (${control.type})` : "";
   return `${label}${kind}`;
+}
+
+function isUsernameOption(control: SafeControl): boolean {
+  return (
+    control.visible && control.tag === "input" && control.type !== "password"
+  );
+}
+
+function isPasswordOption(control: SafeControl): boolean {
+  return (
+    control.visible && control.tag === "input" && control.type === "password"
+  );
+}
+
+function isSubmitOption(control: SafeControl): boolean {
+  return (
+    control.visible &&
+    (control.tag === "button" ||
+      (control.tag === "input" &&
+        ["submit", "button", "image"].includes(control.type ?? "")))
+  );
+}
+
+// A link or button that may open the registration or reset form. The
+// backend decides whether the choice is usable before saving it.
+function isLinkOption(control: SafeControl): boolean {
+  return control.visible && (control.tag === "a" || isSubmitOption(control));
+}
+
+type LinkChoice = { controlId: string; source: SuggestionSource | null };
+
+// Pre-select a suggested link only when it is one of the dropdown's options.
+function suggestedLinkChoices(
+  observation: GuidanceObservation,
+): Record<LinkRole, LinkChoice> {
+  const suggested = observation.suggested_controls;
+  const choice = (role: LinkRole): LinkChoice => {
+    const controlId = suggested?.[role] ?? null;
+    const control = observation.controls.find(
+      (candidate) => candidate.observed_control_id === controlId,
+    );
+    return control && isLinkOption(control)
+      ? {
+          controlId: control.observed_control_id,
+          source: suggested?.link_sources?.[role] ?? null,
+        }
+      : { controlId: "", source: null };
+  };
+  return {
+    registration_link: choice("registration_link"),
+    reset_link: choice("reset_link"),
+  };
+}
+
+const linkQuestions: { role: LinkRole; question: string; label: string }[] = [
+  {
+    role: "registration_link",
+    question: "Which link opens registration?",
+    label: "Registration link",
+  },
+  {
+    role: "reset_link",
+    question: "Which link opens password reset?",
+    label: "Password reset link",
+  },
+];
+
+const suggestionNotes: Record<SuggestionSource, string> = {
+  ai: "Suggested by AI — check before continuing.",
+  rules: "Detected from the page's labels — check before continuing.",
+};
+
+// The step index of each sign-in question in the guided flow.
+const suggestedSteps: {
+  step: number;
+  role: "username" | "password" | "submit";
+  isOption: (control: SafeControl) => boolean;
+}[] = [
+  { step: 1, role: "username", isOption: isUsernameOption },
+  { step: 2, role: "password", isOption: isPasswordOption },
+  { step: 3, role: "submit", isOption: isSubmitOption },
+];
+
+// Pre-select only a suggestion that is one of the dropdown's own options.
+function suggestedControlIds(
+  observation: GuidanceObservation,
+): Map<number, string> {
+  const suggested = observation.suggested_controls;
+  const chosen = new Map<number, string>();
+  if (!suggested?.source) return chosen;
+  for (const { step, role, isOption } of suggestedSteps) {
+    const controlId = suggested[role];
+    const control = observation.controls.find(
+      (candidate) => candidate.observed_control_id === controlId,
+    );
+    if (control && isOption(control)) {
+      chosen.set(step, control.observed_control_id);
+    }
+  }
+  return chosen;
 }
 
 const workflowViews: WorkflowView[] = [
@@ -1017,6 +1137,14 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
   const [isObserving, setIsObserving] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [suggestionSource, setSuggestionSource] =
+    useState<SuggestionSource | null>(null);
+  // The developer's answers about the page's other links: a control id, or
+  // "" for none, and where a pre-filled answer came from.
+  const [linkChoices, setLinkChoices] = useState<Record<LinkRole, LinkChoice>>({
+    registration_link: { controlId: "", source: null },
+    reset_link: { controlId: "", source: null },
+  });
 
   useEffect(() => {
     if (!scanId) return;
@@ -1049,6 +1177,7 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
   }, [scanId]);
 
   async function observePage() {
+    const requestedUrl = observationUrl.trim();
     setIsObserving(true);
     setError(null);
     try {
@@ -1057,20 +1186,32 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: observationUrl.trim() }),
+          body: JSON.stringify({ url: requestedUrl }),
         },
       );
       if (!response.ok)
         throw new Error("The target page could not be observed.");
       const observed = (await response.json()) as GuidanceObservation;
       setObservation(observed);
+      // Navigate to the address the user typed: the observed URL can lose a
+      // hash route such as #/login and replay would open the app's home page.
+      const navigateUrl = requestedUrl || (observed.url ?? "");
+      // Pre-select the suggested controls. The developer can change any of
+      // them and must still submit the flow themselves.
+      const suggestedIds = suggestedControlIds(observed);
       setActions((currentActions) =>
         currentActions.map((action, index) =>
           index === 0
-            ? { ...action, url: observed.url ?? "" }
-            : { ...action, controlId: "" },
+            ? { ...action, url: navigateUrl }
+            : { ...action, controlId: suggestedIds.get(index) ?? "" },
         ),
       );
+      setSuggestionSource(
+        suggestedIds.size > 0
+          ? (observed.suggested_controls?.source ?? null)
+          : null,
+      );
+      setLinkChoices(suggestedLinkChoices(observed));
     } catch (observeError) {
       setError(
         observeError instanceof Error
@@ -1132,6 +1273,15 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
               : {}),
             ...(markerDescription.trim()
               ? { account_marker_description: markerDescription.trim() }
+              : {}),
+            ...(observation
+              ? {
+                  feature_links: {
+                    registration_link:
+                      linkChoices.registration_link.controlId || null,
+                    reset_link: linkChoices.reset_link.controlId || null,
+                  },
+                }
               : {}),
           }),
         },
@@ -1265,6 +1415,11 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
           Choose the recognizable controls below. The selected values are saved
           as safe references; live usernames and passwords never enter the flow.
         </p>
+        {suggestionSource && (
+          <p className="suggestion-note" role="status">
+            {suggestionNotes[suggestionSource]}
+          </p>
+        )}
         <div className="guided-questions">
           <label className="field">
             <span>Which field is your username or email?</span>
@@ -1278,12 +1433,7 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
             >
               <option value="">Choose a field</option>
               {(observation?.controls ?? [])
-                .filter(
-                  (control) =>
-                    control.visible &&
-                    control.tag === "input" &&
-                    control.type !== "password",
-                )
+                .filter(isUsernameOption)
                 .map((control) => (
                   <option
                     key={control.observed_control_id}
@@ -1306,12 +1456,7 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
             >
               <option value="">Choose a field</option>
               {(observation?.controls ?? [])
-                .filter(
-                  (control) =>
-                    control.visible &&
-                    control.tag === "input" &&
-                    control.type === "password",
-                )
+                .filter(isPasswordOption)
                 .map((control) => (
                   <option
                     key={control.observed_control_id}
@@ -1334,13 +1479,7 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
             >
               <option value="">Choose a button</option>
               {(observation?.controls ?? [])
-                .filter(
-                  (control) =>
-                    control.visible &&
-                    (control.tag === "button" ||
-                      (control.tag === "input" &&
-                        ["submit", "button"].includes(control.type ?? ""))),
-                )
+                .filter(isSubmitOption)
                 .map((control) => (
                   <option
                     key={control.observed_control_id}
@@ -1351,6 +1490,42 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
                 ))}
             </select>
           </label>
+          {linkQuestions.map(({ role, question, label }) => {
+            const source = linkChoices[role].source;
+            return (
+              <label className="field" key={role}>
+                <span>{question}</span>
+                <select
+                  aria-label={label}
+                  onChange={(event) => {
+                    const controlId = event.target.value;
+                    setLinkChoices((current) => ({
+                      ...current,
+                      [role]: { controlId, source: null },
+                    }));
+                  }}
+                  value={linkChoices[role].controlId}
+                >
+                  <option value="">None</option>
+                  {(observation?.controls ?? [])
+                    .filter(isLinkOption)
+                    .map((control) => (
+                      <option
+                        key={control.observed_control_id}
+                        value={control.observed_control_id}
+                      >
+                        {controlLabel(control)}
+                      </option>
+                    ))}
+                </select>
+                {source && (
+                  <small className="suggestion-note">
+                    {suggestionNotes[source]}
+                  </small>
+                )}
+              </label>
+            );
+          })}
         </div>
       </section>
 
@@ -1634,6 +1809,7 @@ function ResultsView({ scanId, onScanIdChange }: ResultsViewProps) {
   const [scan, setScan] = useState<ScanStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
   const [pastScans, setPastScans] = useState<ScanStatus[]>([]);
   const [isHistoryLoading, setIsHistoryLoading] = useState(true);
   const [historyError, setHistoryError] = useState<string | null>(null);
@@ -1691,6 +1867,45 @@ function ResultsView({ scanId, onScanIdChange }: ResultsViewProps) {
       );
     } finally {
       setIsLoading(false);
+    }
+  }
+
+  async function deleteScan(target: ScanStatus) {
+    const confirmed = window.confirm(
+      `Delete scan ${target.scan_id}? Its evidence, results, and reports will be permanently removed.`,
+    );
+    if (!confirmed) return;
+    setIsDeleting(true);
+    setError(null);
+    try {
+      const response = await fetch(
+        `/api/scans/${encodeURIComponent(target.scan_id)}`,
+        { method: "DELETE" },
+      );
+      if (!response.ok) {
+        const body: unknown = await response.json().catch(() => null);
+        const detail =
+          body !== null &&
+          typeof body === "object" &&
+          "detail" in body &&
+          typeof body.detail === "string"
+            ? body.detail
+            : "The scan could not be deleted.";
+        throw new Error(detail);
+      }
+      setPastScans((current) =>
+        current.filter((pastScan) => pastScan.scan_id !== target.scan_id),
+      );
+      setScan(null);
+      onScanIdChange("");
+    } catch (deleteError) {
+      setError(
+        deleteError instanceof Error
+          ? deleteError.message
+          : "Unable to delete scan.",
+      );
+    } finally {
+      setIsDeleting(false);
     }
   }
 
@@ -1816,6 +2031,23 @@ function ResultsView({ scanId, onScanIdChange }: ResultsViewProps) {
             >
               Open HTML report
             </a>
+            <button
+              className="danger-button"
+              disabled={
+                isDeleting ||
+                scan.state === "running" ||
+                scan.state === "awaiting_guidance"
+              }
+              onClick={() => void deleteScan(scan)}
+              title={
+                scan.state === "running" || scan.state === "awaiting_guidance"
+                  ? "Cancel the scan before deleting it"
+                  : undefined
+              }
+              type="button"
+            >
+              {isDeleting ? "Deleting..." : "Delete scan"}
+            </button>
           </div>
 
           <div className="provenance-panel">

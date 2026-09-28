@@ -1,7 +1,8 @@
 """Browser-level tests for validated structured action execution."""
 
 import asyncio
-from collections.abc import Iterator
+import time
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
@@ -12,6 +13,10 @@ from authflowguard.action_executor import (
     BrowserActionExecutor,
     InvalidControlReferenceError,
 )
+from authflowguard.control_safety import (
+    RecordedControlNotFoundError,
+    UnsafeControlError,
+)
 from authflowguard.models import (
     ActionWaitCondition,
     BrowserAction,
@@ -20,7 +25,8 @@ from authflowguard.models import (
     TargetScope,
 )
 from authflowguard.secrets import RuntimeSecrets, SecretReferenceNotFoundError
-from playwright.async_api import async_playwright
+from playwright.async_api import Locator, Page, Route, async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import ValidationError
 
 LIVE_USERNAME = "developer@example.test"
@@ -28,12 +34,26 @@ LIVE_USERNAME = "developer@example.test"
 
 class ActionPageHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        if self.path.startswith("/api/"):
+            self._background_response()
+            return
         encoded_page = self._page_for_path().encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded_page)))
         self.end_headers()
         self.wfile.write(encoded_page)
+
+    def _background_response(self) -> None:
+        # Slow enough that an action returning early would miss the result.
+        time.sleep(0.4)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "2")
+        if self.path.startswith("/api/login"):
+            self.send_header("Set-Cookie", "session=client-rendered; Path=/")
+        self.end_headers()
+        self.wfile.write(b"{}")
 
     def _page_for_path(self) -> str:
         if self.path.startswith("/controls"):
@@ -53,6 +73,26 @@ class ActionPageHandler(BaseHTTPRequestHandler):
                         <option value="developer">Developer</option>
                         <option value="administrator">Administrator</option>
                     </select>
+                </body>
+            </html>"""
+
+        if self.path.startswith("/spa"):
+            # Like a hash-routed single-page app: the form exists only after
+            # the app has fetched its configuration, and signing in is a
+            # background request whose response sets the session cookie.
+            return """<!doctype html>
+            <html>
+                <head><title>Client Rendered</title></head>
+                <body>
+                    <script>
+                        fetch('/api/config').then(() => {
+                            document.body.innerHTML = `
+                                <button id="sign-in" type="button"
+                                        onclick="fetch('/api/login')">
+                                    Sign in
+                                </button>`;
+                        });
+                    </script>
                 </body>
             </html>"""
 
@@ -87,7 +127,9 @@ async def execute_all_action_types(origin: str) -> None:
         browser = await playwright.chromium.launch(headless=True)
         context = await browser.new_context()
         page = await context.new_page()
-        executor = BrowserActionExecutor(page, target, secrets, scan_id=uuid4())
+        executor = BrowserActionExecutor(
+            page, target, secrets, scan_id=uuid4(), password_references=frozenset()
+        )
 
         try:
             navigate_result = await executor.execute(
@@ -271,6 +313,7 @@ async def verify_executor_rejects_stale_references(origin: str) -> None:
             target,
             RuntimeSecrets({}),
             scan_id=uuid4(),
+            password_references=frozenset(),
         )
 
         try:
@@ -336,6 +379,7 @@ def test_snapshot_remains_consistent_while_page_replaces_its_controls() -> None:
                     ),
                     RuntimeSecrets({}),
                     uuid4(),
+                    password_references=frozenset(),
                 )
                 for _ in range(20):
                     snapshot = await executor._take_page_snapshot()
@@ -349,3 +393,624 @@ def test_snapshot_remains_consistent_while_page_replaces_its_controls() -> None:
                 await browser.close()
 
     asyncio.run(snapshot_changing_page())
+
+
+async def sign_in_to_client_rendered_page(origin: str) -> None:
+    route = f"{origin}/spa#/login"
+    target = TargetScope(target_url=route, permitted_origins=[origin])
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
+        executor = BrowserActionExecutor(
+            page, target, RuntimeSecrets({}), uuid4(), password_references=frozenset()
+        )
+        try:
+            await executor.execute(
+                BrowserAction(
+                    action_type=BrowserActionType.NAVIGATE,
+                    url=route,
+                    description="Open the client-rendered sign-in route",
+                )
+            )
+            assert await page.locator("#sign-in").count() == 1
+
+            await executor.execute(
+                BrowserAction(
+                    action_type=BrowserActionType.CLICK,
+                    observed_control_id="control-1",
+                    description="Sign in",
+                )
+            )
+            cookie_names = [cookie["name"] for cookie in await context.cookies()]
+            assert cookie_names == ["session"]
+        finally:
+            await browser.close()
+
+
+def test_executor_waits_for_client_rendering_and_background_sign_in() -> None:
+    with run_action_server() as origin:
+        asyncio.run(sign_in_to_client_rendered_page(origin))
+
+
+SAFETY_ORIGIN = "https://app.example"
+LIVE_PASSWORD = "correct-horse-battery"
+WRONG_PASSWORD = "not-the-password"
+LOGIN_SECRETS = {"username": LIVE_USERNAME, "password": LIVE_PASSWORD}
+# Records every key and input event, so a test can prove nothing was typed.
+KEY_RECORDER = """<script>
+    window.typed = '';
+    document.addEventListener('keydown', event => { window.typed += event.key; });
+    document.addEventListener('input', () => { window.typed += '[input]'; });
+</script>"""
+
+
+async def run_on_page(
+    body: str,
+    secrets: RuntimeSecrets,
+    password_references: frozenset[str],
+    check: Callable[[Page, BrowserActionExecutor], Awaitable[None]],
+) -> None:
+    """Serve one page on a fake origin and hand an executor to ``check``."""
+
+    html = f"<!doctype html><html><head><title>Safety</title></head>{body}</html>"
+    target = TargetScope(
+        target_url=f"{SAFETY_ORIGIN}/page", permitted_origins=[SAFETY_ORIGIN]
+    )
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            page.set_default_timeout(2000)
+
+            async def serve(route: Route) -> None:
+                await route.fulfill(status=200, content_type="text/html", body=html)
+
+            await page.route(f"{SAFETY_ORIGIN}/**", serve)
+            executor = BrowserActionExecutor(
+                page,
+                target,
+                secrets,
+                uuid4(),
+                password_references=password_references,
+            )
+            await executor.execute(
+                BrowserAction(
+                    action_type=BrowserActionType.NAVIGATE,
+                    url=f"{SAFETY_ORIGIN}/page",
+                    description="Open the page",
+                )
+            )
+            await check(page, executor)
+        finally:
+            await browser.close()
+
+
+def fill(control_id: str, reference: str) -> BrowserAction:
+    return BrowserAction(
+        action_type=BrowserActionType.FILL,
+        observed_control_id=control_id,
+        value_reference=reference,
+        description="Fill a control",
+    )
+
+
+def click(control_id: str) -> BrowserAction:
+    return BrowserAction(
+        action_type=BrowserActionType.CLICK,
+        observed_control_id=control_id,
+        description="Click a control",
+    )
+
+
+def test_username_is_not_typed_into_a_button() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor) -> None:
+        with pytest.raises(UnsafeControlError) as caught:
+            await executor.execute(fill("control-1", "username"))
+
+        message = str(caught.value)
+        assert message == (
+            "control-1 is a button, not a text field, so the value was not "
+            "typed into it."
+        )
+        assert LIVE_USERNAME not in message
+        assert "Basket" not in message
+        assert await page.evaluate("window.typed") == ""
+        assert await page.evaluate("document.body.dataset.added") is None
+
+    asyncio.run(
+        run_on_page(
+            f"""<body>{KEY_RECORDER}
+                <button onclick="document.body.dataset.added = 'yes'">
+                    Add to Basket
+                </button></body>""",
+            RuntimeSecrets(LOGIN_SECRETS),
+            frozenset({"password"}),
+            check,
+        )
+    )
+
+
+def test_password_is_not_typed_into_a_text_field() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor) -> None:
+        with pytest.raises(UnsafeControlError, match="not a password field"):
+            await executor.execute(fill("control-1", "password"))
+        assert await page.locator("#search").input_value() == ""
+        assert await page.evaluate("window.typed") == ""
+
+    asyncio.run(
+        run_on_page(
+            f'<body>{KEY_RECORDER}<input id="search" type="search"></body>',
+            RuntimeSecrets(LOGIN_SECRETS),
+            frozenset({"password"}),
+            check,
+        )
+    )
+
+
+def test_non_password_is_not_typed_into_a_password_field() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor) -> None:
+        with pytest.raises(
+            UnsafeControlError, match="password field but the value is not"
+        ):
+            await executor.execute(fill("control-1", "username"))
+        assert await page.locator("#password").input_value() == ""
+
+    asyncio.run(
+        run_on_page(
+            '<body><input id="password" type="password"></body>',
+            RuntimeSecrets(LOGIN_SECRETS),
+            frozenset({"password"}),
+            check,
+        )
+    )
+
+
+def test_wrong_password_is_still_typed_into_the_password_field() -> None:
+    # Login enumeration's failed attempts type a wrong password on purpose.
+    async def check(page: Page, executor: BrowserActionExecutor) -> None:
+        await executor.execute(fill("control-1", "username"))
+        await executor.execute(fill("control-2", "password"))
+        assert await page.locator("#username").input_value() == LIVE_USERNAME
+        assert await page.locator("#password").input_value() == WRONG_PASSWORD
+
+    asyncio.run(
+        run_on_page(
+            """<body><input id="username" type="email">
+                <input id="password" type="password"></body>""",
+            RuntimeSecrets({"username": LIVE_USERNAME, "password": WRONG_PASSWORD}),
+            frozenset({"password"}),
+            check,
+        )
+    )
+
+
+def test_destructive_controls_are_never_clicked() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor) -> None:
+        for control_id in ("control-1", "control-2", "control-3"):
+            with pytest.raises(UnsafeControlError, match="irreversible account"):
+                await executor.execute(click(control_id))
+        with pytest.raises(UnsafeControlError, match="irreversible account"):
+            await executor.execute(
+                BrowserAction(
+                    action_type=BrowserActionType.PRESS_KEY,
+                    observed_control_id="control-1",
+                    key="Enter",
+                    description="Press Enter on a control",
+                )
+            )
+        assert await page.evaluate("document.body.dataset.destroyed") is None
+
+    asyncio.run(
+        run_on_page(
+            """<body>
+                <button onclick="document.body.dataset.destroyed = 'yes'">
+                    Delete account
+                </button>
+                <button aria-label="Remove item"
+                        onclick="document.body.dataset.destroyed = 'yes'">x</button>
+                <input type="submit" value="Close my account"
+                       onclick="document.body.dataset.destroyed = 'yes'">
+            </body>""",
+            RuntimeSecrets({}),
+            frozenset(),
+            check,
+        )
+    )
+
+
+def test_a_cookie_banner_close_button_is_still_clickable() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor) -> None:
+        await executor.execute(click("control-1"))
+        assert await page.locator("#banner").count() == 0
+
+    asyncio.run(
+        run_on_page(
+            """<body><div id="banner">We use cookies to run your account.
+                <button onclick="document.getElementById('banner').remove()">
+                    Close
+                </button></div></body>""",
+            RuntimeSecrets({}),
+            frozenset(),
+            check,
+        )
+    )
+
+
+def test_a_control_that_never_appears_is_not_clicked() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor) -> None:
+        with pytest.raises(UnsafeControlError, match="did not become visible"):
+            await executor.execute(click("control-1"))
+        assert await page.evaluate("document.body.dataset.clicked") is None
+
+    asyncio.run(
+        run_on_page(
+            """<body><button hidden
+                onclick="document.body.dataset.clicked = 'yes'">Continue</button>
+            </body>""",
+            RuntimeSecrets({}),
+            frozenset(),
+            check,
+        )
+    )
+
+
+def test_a_field_revealed_later_is_still_filled() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor) -> None:
+        await executor.execute(fill("control-1", "username"))
+        assert await page.locator("#code").input_value() == LIVE_USERNAME
+
+    asyncio.run(
+        run_on_page(
+            """<body><input id="code" hidden>
+                <script>
+                    setTimeout(() => {
+                        document.getElementById('code').hidden = false;
+                    }, 300);
+                </script></body>""",
+            RuntimeSecrets(LOGIN_SECRETS),
+            frozenset({"password"}),
+            check,
+        )
+    )
+
+
+def test_a_fill_timeout_becomes_a_safe_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Playwright's own timeout message quotes the value it was typing.
+    async def time_out(_locator: Locator, value: str, **_kwargs: object) -> None:
+        raise PlaywrightTimeoutError(
+            f'Locator.fill: Timeout 2000ms exceeded. "{value}"'
+        )
+
+    monkeypatch.setattr(Locator, "fill", time_out)
+
+    async def check(page: Page, executor: BrowserActionExecutor) -> None:
+        with pytest.raises(UnsafeControlError) as caught:
+            await executor.execute(fill("control-1", "password"))
+
+        assert str(caught.value) == (
+            "control-1 did not become editable within the time limit, so the "
+            "password was not typed into it."
+        )
+        assert LIVE_PASSWORD not in str(caught.value)
+        # The original stays chained for debugging but is never the message.
+        assert isinstance(caught.value.__cause__, PlaywrightTimeoutError)
+
+    asyncio.run(
+        run_on_page(
+            '<body><input id="password" type="password"></body>',
+            RuntimeSecrets(LOGIN_SECRETS),
+            frozenset({"password"}),
+            check,
+        )
+    )
+
+
+def test_a_click_timeout_becomes_a_safe_error() -> None:
+    # A control covered by an overlay never receives the click.
+    async def check(page: Page, executor: BrowserActionExecutor) -> None:
+        with pytest.raises(UnsafeControlError) as caught:
+            await executor.execute(click("control-1"))
+
+        assert str(caught.value) == (
+            "control-1 did not become clickable within the time limit, so it "
+            "was not clicked."
+        )
+        assert await page.evaluate("document.body.dataset.clicked") is None
+
+    asyncio.run(
+        run_on_page(
+            """<body>
+                <button onclick="document.body.dataset.clicked = 'yes'">Go</button>
+                <div style="position: fixed; inset: 0; background: white"></div>
+            </body>""",
+            RuntimeSecrets({}),
+            frozenset(),
+            check,
+        )
+    )
+
+
+Load = Callable[[str], Awaitable[None]]
+
+
+async def run_on_pages(
+    secrets: RuntimeSecrets,
+    password_references: frozenset[str],
+    check: Callable[[Page, BrowserActionExecutor, Load], Awaitable[None]],
+) -> None:
+    """Like ``run_on_page``, but ``load(body)`` serves and opens a new page.
+
+    One executor sees every load, as when a flow recorded on one visit is
+    replayed on a later one.
+    """
+
+    served = {"body": "<body></body>"}
+    target = TargetScope(
+        target_url=f"{SAFETY_ORIGIN}/page", permitted_origins=[SAFETY_ORIGIN]
+    )
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            page.set_default_timeout(2000)
+
+            async def serve(route: Route) -> None:
+                html = (
+                    "<!doctype html><html><head><title>Replay</title></head>"
+                    f"{served['body']}</html>"
+                )
+                await route.fulfill(status=200, content_type="text/html", body=html)
+
+            await page.route(f"{SAFETY_ORIGIN}/**", serve)
+            executor = BrowserActionExecutor(
+                page,
+                target,
+                secrets,
+                uuid4(),
+                password_references=password_references,
+            )
+
+            async def load(body: str) -> None:
+                served["body"] = body
+                await executor.execute(
+                    BrowserAction(
+                        action_type=BrowserActionType.NAVIGATE,
+                        url=f"{SAFETY_ORIGIN}/page",
+                        description="Open the page",
+                    )
+                )
+
+            await check(page, executor, load)
+        finally:
+            await browser.close()
+
+
+LOGIN_FORM = """<form id="login" action="/session" onsubmit="return false">
+    <input id="username" type="email" name="email" autocomplete="username">
+    <input id="password" type="password" name="password">
+    <button id="sign-in" type="submit"
+            onclick="document.body.dataset.signedIn = 'yes'">Sign in</button>
+</form>"""
+# A consent banner and a newsletter box inserted before the login form: the
+# newsletter's email field is the same kind of control as the username field.
+BANNER = """<div id="banner">
+    <input id="analytics" type="checkbox" name="analytics">
+    <button type="button" onclick="document.body.dataset.accepted = 'yes'">
+        Accept
+    </button>
+    <a href="/privacy">Privacy</a>
+</div>
+<form id="newsletter" action="/newsletter" onsubmit="return false">
+    <input id="newsletter-email" type="email" name="email">
+    <button type="submit" onclick="document.body.dataset.subscribed = 'yes'">
+        Subscribe
+    </button>
+</form>"""
+
+
+async def record(
+    executor: BrowserActionExecutor, action: BrowserAction
+) -> BrowserAction:
+    """Execute ``action`` and return it as a recorder would save it."""
+
+    return (await executor.execute(action)).recorded(action)
+
+
+def test_a_recorded_control_is_still_used_after_a_banner_moves_it() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor, load: Load) -> None:
+        await load(f"<body>{LOGIN_FORM}</body>")
+        flow = [
+            await record(executor, fill("control-1", "username")),
+            await record(executor, fill("control-2", "password")),
+            await record(executor, click("control-3")),
+        ]
+        assert all(action.control_fingerprint is not None for action in flow)
+        assert flow[0].control_fingerprint is not None
+        assert flow[0].control_fingerprint.form == "id=login action=/session"
+
+        await load(f"<body>{KEY_RECORDER}{BANNER}{LOGIN_FORM}</body>")
+        results = [await executor.execute(action) for action in flow]
+
+        assert await page.locator("#username").input_value() == LIVE_USERNAME
+        assert await page.locator("#password").input_value() == LIVE_PASSWORD
+        assert await page.locator("#newsletter-email").input_value() == ""
+        assert await page.evaluate("document.body.dataset.signedIn") == "yes"
+        assert await page.evaluate("document.body.dataset.accepted") is None
+        assert await page.evaluate("document.body.dataset.subscribed") is None
+        # The same controls, found further down the page.
+        assert [
+            result.control_fingerprint == action.control_fingerprint
+            for result, action in zip(results, flow, strict=True)
+        ] == [True, True, True]
+
+    asyncio.run(
+        run_on_pages(RuntimeSecrets(LOGIN_SECRETS), frozenset({"password"}), check)
+    )
+
+
+def test_a_removed_control_is_refused_without_using_the_old_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(BrowserActionExecutor, "CONTROL_LOOKUP_TIMEOUT_SECONDS", 0.3)
+
+    async def check(page: Page, executor: BrowserActionExecutor, load: Load) -> None:
+        await load(f"<body>{LOGIN_FORM}</body>")
+        username = await record(executor, fill("control-1", "username"))
+
+        # control-1 is now a search box: the same kind of control, so only
+        # the fingerprint stops the username being sent as a search.
+        await load(
+            f"""<body>{KEY_RECORDER}
+                <input id="search" type="search" name="q">
+                <input id="password" type="password" name="password"></body>"""
+        )
+        with pytest.raises(RecordedControlNotFoundError) as caught:
+            await executor.execute(username)
+
+        assert str(caught.value) == (
+            "The email input recorded for this flow as control-1 is not on the "
+            "page, so the value was not typed into it."
+        )
+        assert LIVE_USERNAME not in str(caught.value)
+        assert await page.locator("#search").input_value() == ""
+        assert await page.evaluate("window.typed") == ""
+
+    asyncio.run(
+        run_on_pages(RuntimeSecrets(LOGIN_SECRETS), frozenset({"password"}), check)
+    )
+
+
+def test_the_recorded_one_of_two_identical_controls_is_chosen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(BrowserActionExecutor, "CONTROL_LOOKUP_TIMEOUT_SECONDS", 0.3)
+    # A layout rendered twice, as a desktop and a mobile copy.
+    copies = """<input class="copy" type="text" name="code">
+        <input class="copy" type="text" name="code">"""
+
+    async def check(page: Page, executor: BrowserActionExecutor, load: Load) -> None:
+        await load(f"<body>{copies}</body>")
+        second = await record(executor, fill("control-2", "username"))
+        assert second.control_fingerprint is not None
+        assert second.control_fingerprint.ordinal == 2
+        assert second.control_fingerprint.duplicates == 2
+
+        # A banner shifts both: control-2 is now the first copy.
+        await load(f"<body>{BANNER}{copies}</body>")
+        await executor.execute(second)
+        values = await page.locator(".copy").evaluate_all(
+            "elements => elements.map(element => element.value)"
+        )
+        assert values == ["", LIVE_USERNAME]
+
+        # A third copy leaves the recorded ordinal ambiguous.
+        await load(f'<body>{KEY_RECORDER}{copies}<input type="text" name="code">')
+        with pytest.raises(RecordedControlNotFoundError, match="several controls"):
+            await executor.execute(second)
+        assert await page.evaluate("window.typed") == ""
+
+    asyncio.run(
+        run_on_pages(RuntimeSecrets(LOGIN_SECRETS), frozenset({"password"}), check)
+    )
+
+
+def test_a_generated_id_that_changes_between_loads_is_still_resolved() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor, load: Load) -> None:
+        await load('<body><input id="mat-input-0" type="email" name="email"></body>')
+        username = await record(executor, fill("control-1", "username"))
+
+        # The framework numbered a new search box first this time.
+        await load(
+            """<body>
+                <input id="mat-input-0" type="search" name="q">
+                <input id="mat-input-1" type="email" name="email"></body>"""
+        )
+        await executor.execute(username)
+
+        assert await page.locator("#mat-input-1").input_value() == LIVE_USERNAME
+        assert await page.locator("#mat-input-0").input_value() == ""
+
+    asyncio.run(
+        run_on_pages(RuntimeSecrets(LOGIN_SECRETS), frozenset({"password"}), check)
+    )
+
+
+def test_an_action_saved_without_a_fingerprint_is_resolved_by_position() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor, load: Load) -> None:
+        await load(f"<body>{LOGIN_FORM}</body>")
+        old_action = fill("control-2", "password")
+        assert old_action.control_fingerprint is None
+
+        result = await executor.execute(old_action)
+
+        assert await page.locator("#password").input_value() == LIVE_PASSWORD
+        # The control it used is fingerprinted, so a recorder can upgrade it.
+        assert result.control_fingerprint is not None
+        assert result.control_fingerprint.name == "password"
+        assert result.recorded(old_action).control_fingerprint == (
+            result.control_fingerprint
+        )
+
+    asyncio.run(
+        run_on_pages(RuntimeSecrets(LOGIN_SECRETS), frozenset({"password"}), check)
+    )
+
+
+def test_fingerprints_never_hold_what_a_field_contains() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor, load: Load) -> None:
+        await load(f"<body>{LOGIN_FORM}</body>")
+        await page.locator("#username").fill(LIVE_USERNAME)
+        await page.locator("#password").fill(LIVE_PASSWORD)
+
+        fingerprints = await executor.control_fingerprints()
+
+        saved = "".join(
+            fingerprint.model_dump_json() for fingerprint in fingerprints.values()
+        )
+        assert LIVE_USERNAME not in saved
+        assert LIVE_PASSWORD not in saved
+        assert fingerprints["control-3"].text == "Sign in"
+
+    # No runtime secrets, so redaction is not what keeps the values out.
+    asyncio.run(run_on_pages(RuntimeSecrets({}), frozenset(), check))
+
+
+def test_a_briefly_disabled_field_is_filled_once_it_is_enabled() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor) -> None:
+        await executor.execute(fill("control-1", "username"))
+        assert await page.locator("#username").input_value() == LIVE_USERNAME
+
+    asyncio.run(
+        run_on_page(
+            """<body><input id="username" type="email" disabled>
+                <script>
+                    setTimeout(() => {
+                        document.getElementById('username').disabled = false;
+                    }, 300);
+                </script></body>""",
+            RuntimeSecrets(LOGIN_SECRETS),
+            frozenset({"password"}),
+            check,
+        )
+    )
+
+
+def test_a_field_that_stays_disabled_is_refused() -> None:
+    async def check(page: Page, executor: BrowserActionExecutor) -> None:
+        with pytest.raises(UnsafeControlError) as caught:
+            await executor.execute(fill("control-1", "username"))
+        assert str(caught.value) == (
+            "control-1 is disabled, so the value was not typed into it."
+        )
+        assert await page.locator("#username").input_value() == ""
+
+    asyncio.run(
+        run_on_page(
+            '<body><input id="username" type="email" disabled></body>',
+            RuntimeSecrets(LOGIN_SECRETS),
+            frozenset({"password"}),
+            check,
+        )
+    )

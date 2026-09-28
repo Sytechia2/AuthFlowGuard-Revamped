@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 from uuid import UUID, uuid4
 
 from playwright.async_api import (
@@ -13,6 +13,9 @@ from playwright.async_api import (
     Route,
     async_playwright,
 )
+from playwright.async_api import (
+    Error as PlaywrightError,
+)
 
 from authflowguard.cancellation import close_resources
 from authflowguard.models import (
@@ -22,7 +25,70 @@ from authflowguard.models import (
     TargetScope,
     TrafficReference,
 )
-from authflowguard.scope import url_is_in_scope, url_without_query_or_fragment
+from authflowguard.page_settling import goto_and_settle
+from authflowguard.scope import (
+    url_is_in_scope,
+    url_without_query_keeping_route,
+    url_without_query_or_fragment,
+)
+
+CONTROL_SELECTOR = "input, button, select, textarea, a[href]"
+READ_CONTROLS_SCRIPT = r"""selector => [...document.querySelectorAll(selector)]
+    .map((element, index) => {
+        const tag = element.tagName.toLowerCase();
+        const type = element.getAttribute('type');
+        let value_present = null;
+        if ((tag === 'input' || tag === 'textarea')
+            && !['button', 'checkbox', 'file', 'radio', 'reset', 'submit']
+                .includes(type)) {
+            value_present = element.value !== '';
+        }
+        const inputKind = tag === 'input' ? (type || '').toLowerCase() : null;
+        let raw = null;
+        if (['button', 'submit', 'reset'].includes(inputKind)) {
+            // A button-like input shows its value as its label; no other
+            // field's value is read, because it may be a credential.
+            raw = element.getAttribute('value');
+        } else if (inputKind === 'image') {
+            raw = element.getAttribute('alt');
+        } else if (tag === 'button' || tag === 'a'
+            || type === 'button' || type === 'submit') {
+            raw = element.innerText;
+        }
+        raw = (raw || '').split(/\s+/).join(' ').trim();
+        const text = raw ? raw.slice(0, 60) : null;
+        // Which form the control belongs to, as its position among the
+        // page's forms, so controls can be grouped without reading them.
+        const owner = element.form || element.closest('form');
+        const formPosition = owner
+            ? Array.prototype.indexOf.call(document.forms, owner)
+            : -1;
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        // Whether the control says it opens a menu or expandable region.
+        const popup = element.getAttribute('aria-haspopup');
+        const hasPopup = (popup !== null && !['', 'false'].includes(popup))
+            || element.hasAttribute('aria-expanded');
+        return {
+            observed_control_id: `control-${index + 1}`,
+            tag,
+            id: element.getAttribute('id'),
+            name: element.getAttribute('name'),
+            type,
+            placeholder: element.getAttribute('placeholder'),
+            autocomplete: element.getAttribute('autocomplete'),
+            aria_label: element.getAttribute('aria-label'),
+            text,
+            role: element.getAttribute('role'),
+            value_present,
+            visible: rect.width > 0 && rect.height > 0
+                && style.visibility !== 'hidden',
+            form_index: formPosition >= 0 ? formPosition : null,
+            // A link's resolved address; the query is removed afterwards.
+            href: tag === 'a' ? element.href : null,
+            has_popup: hasPopup,
+        };
+    })"""
 
 
 @dataclass(frozen=True)
@@ -49,6 +115,14 @@ class SafeControlDescription(TypedDict):
     role: str | None
     value_present: bool | None
     visible: bool
+    # The control's form as its position among the page's forms; None when
+    # it is in no form. Absent from observations saved before it existed.
+    form_index: NotRequired[int | None]
+    # A link's address without its query, keeping a client-side route; None
+    # for other controls. Absent from observations saved before it existed.
+    href: NotRequired[str | None]
+    # Whether the control declares a popup (aria-haspopup or aria-expanded).
+    has_popup: NotRequired[bool]
 
 
 class PlaywrightWorker:
@@ -136,8 +210,7 @@ class PlaywrightWorker:
         page.on("request", record_request)
         page.on("response", record_response)
 
-        await page.goto(str(target.target_url), wait_until="domcontentloaded")
-        await page.wait_for_timeout(50)
+        await goto_and_settle(page, str(target.target_url))
 
         page_event = await self.record_page_state(scan_id, page)
         events.append(page_event)
@@ -168,56 +241,36 @@ class PlaywrightWorker:
             kind=EvidenceKind.PAGE_STATE,
             summary="The browser recorded the visible page controls.",
             redacted_details={
-                "url": url_without_query_or_fragment(page.url),
+                "url": url_without_query_keeping_route(page.url),
                 "title": await page.title(),
                 "controls": controls,
             },
         )
 
     async def read_controls(self, page: Page) -> list[SafeControlDescription]:
-        """Describe controls without reading their live values."""
-        locator = page.locator("input, button, select, textarea, a[href]")
-        controls: list[SafeControlDescription] = []
+        """Describe controls without reading their live values.
 
-        for index in range(await locator.count()):
-            control = locator.nth(index)
-            tag = await control.evaluate("element => element.tagName.toLowerCase()")
-            control_type = await control.get_attribute("type")
-            value_present: bool | None = None
-            if tag in {"input", "textarea"} and control_type not in {
-                "button",
-                "checkbox",
-                "file",
-                "radio",
-                "reset",
-                "submit",
-            }:
-                value_present = bool(await control.input_value())
-            text: str | None = None
-            if tag in {"button", "a"} or control_type in {"button", "submit"}:
-                try:
-                    raw_text = await control.inner_text(timeout=500)
-                    text = " ".join(raw_text.split())[:60] if raw_text else None
-                except Exception:
-                    text = None
-            controls.append(
-                {
-                    "observed_control_id": f"control-{index + 1}",
-                    "tag": tag,
-                    "id": await control.get_attribute("id"),
-                    "name": await control.get_attribute("name"),
-                    "type": control_type,
-                    "placeholder": await control.get_attribute("placeholder"),
-                    "autocomplete": await control.get_attribute("autocomplete"),
-                    "aria_label": await control.get_attribute("aria-label"),
-                    "text": text,
-                    "role": await control.get_attribute("role"),
-                    "value_present": value_present,
-                    "visible": await control.is_visible(),
-                }
-            )
-
-        return controls
+        The page is read in one DOM revision. Reading each control with its
+        own call races client-side rendering: a control counted first can be
+        gone by the time it is read, and Playwright then waits its full
+        timeout for it.
+        """
+        for attempt in range(2):
+            try:
+                controls: list[SafeControlDescription] = await page.evaluate(
+                    READ_CONTROLS_SCRIPT, CONTROL_SELECTOR
+                )
+                for control in controls:
+                    href = control.get("href")
+                    if href:
+                        # A query can carry a token; a route is kept.
+                        control["href"] = url_without_query_keeping_route(href)
+                return controls
+            except PlaywrightError as error:
+                if attempt or "Execution context was destroyed" not in str(error):
+                    raise
+                await page.wait_for_load_state("domcontentloaded", timeout=3000)
+        raise AssertionError("unreachable")
 
     async def record_session_state(
         self,

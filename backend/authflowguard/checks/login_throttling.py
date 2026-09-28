@@ -17,6 +17,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from playwright.async_api import Browser, BrowserContext, async_playwright
 
 from authflowguard.action_executor import BrowserActionExecutor
+from authflowguard.control_safety import describe_error, flow_step
 from authflowguard.models import (
     AuthFeature,
     AuthProfile,
@@ -120,13 +121,20 @@ async def _attempt(
     try:
         context = await browser.new_context(service_workers="block")
         page = await context.new_page()
-        executor = BrowserActionExecutor(page, profile.target, attempt_secrets, scan_id)
-        for step in steps:
+        executor = BrowserActionExecutor(
+            page,
+            profile.target,
+            attempt_secrets,
+            scan_id,
+            password_references=frozenset({password_reference}),
+        )
+        for step_number, step in enumerate(steps, start=1):
             if cancel_requested():
                 raise RuntimeError("Login throttling execution cancelled")
-            result = await executor.execute(
-                step.model_copy(update={"action_id": uuid4()})
-            )
+            with flow_step(step_number):
+                result = await executor.execute(
+                    step.model_copy(update={"action_id": uuid4()})
+                )
             for event in result.events:
                 safe_details = {
                     key: value
@@ -254,7 +262,7 @@ async def run_login_throttling_check(
                         )
                         completed_steps.append(label)
                     except Exception as error:
-                        errors.append(type(error).__name__)
+                        errors.append(describe_error(error))
                         break
                 if not errors:
                     label = "valid_login_control"
@@ -280,7 +288,7 @@ async def run_login_throttling_check(
             finally:
                 await browser.close()
     except Exception as error:
-        errors.append(type(error).__name__)
+        errors.append(describe_error(error))
     if errors:
         events.append(
             EvidenceEvent(

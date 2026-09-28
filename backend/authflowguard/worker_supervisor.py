@@ -23,6 +23,8 @@ from authflowguard.worker_protocol import (
 )
 
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 60.0
+# How long a worker may keep running after reporting its terminal result.
+DEFAULT_EXIT_GRACE_SECONDS = 10.0
 
 # (message, exit_code, forced, timed_out). PROGRESS messages arrive with
 # exit_code None; the final call carries the last terminal message, if any.
@@ -61,6 +63,7 @@ class WorkerHandle:
     forced: bool = False
     timed_out: bool = False
     cleanup_confirmed: bool = False
+    lingered: bool = False
 
 
 class WorkerSupervisor:
@@ -71,11 +74,13 @@ class WorkerSupervisor:
         cancellation_grace_seconds: float = 3.0,
         entrypoint: WorkerEntrypoint = _worker_entry,
         startup_timeout_seconds: float = DEFAULT_STARTUP_TIMEOUT_SECONDS,
+        exit_grace_seconds: float = DEFAULT_EXIT_GRACE_SECONDS,
     ) -> None:
         self._context: SpawnContext = multiprocessing.get_context("spawn")
         self._grace_seconds = cancellation_grace_seconds
         self._entrypoint = entrypoint
         self._startup_timeout_seconds = startup_timeout_seconds
+        self._exit_grace_seconds = exit_grace_seconds
         self._lock = threading.Lock()
         self._handles: dict[tuple[UUID, int], WorkerHandle] = {}
 
@@ -196,6 +201,7 @@ class WorkerSupervisor:
 
     def _watch(self, handle: WorkerHandle, callback: WorkerCallback) -> None:
         final_message: WorkerMessage | None = None
+        terminal_at: float | None = None
         last_sequence = 0
         while True:
             self._enforce_deadlines(handle)
@@ -203,6 +209,18 @@ class WorkerSupervisor:
                 raw_message = handle.output.get(timeout=0.1)
             except queue.Empty:
                 if not handle.process.is_alive():
+                    break
+                if (
+                    terminal_at is not None
+                    and time.monotonic() - terminal_at > self._exit_grace_seconds
+                ):
+                    # The worker already reported its result but its process
+                    # did not exit, for example a hang in interpreter
+                    # teardown. Waiting would hold a finished scan open until
+                    # the runtime limit and then report it as hung.
+                    handle.lingered = True
+                    self._terminate_owned_tree(handle)
+                    handle.process.join(timeout=1)
                     break
                 continue
             try:
@@ -225,8 +243,16 @@ class WorkerSupervisor:
             if message.cleanup_confirmed:
                 handle.cleanup_confirmed = True
             final_message = message
+            if (
+                terminal_at is None
+                and message.message_type is not WorkerMessageType.READY
+            ):
+                terminal_at = time.monotonic()
         handle.process.join(timeout=0.5)
-        exit_code = handle.process.exitcode
+        # A worker stopped only for lingering after its terminal result exited
+        # on our signal, not on its own; its exit code says nothing about the
+        # scan, so the terminal message decides the outcome.
+        exit_code = None if handle.lingered else handle.process.exitcode
         with self._lock:
             self._handles.pop(
                 (handle.command.scan_id, handle.command.worker_generation), None

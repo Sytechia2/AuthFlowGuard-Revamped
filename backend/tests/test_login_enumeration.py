@@ -23,6 +23,15 @@ from authflowguard.evaluation_targets.controlled_app import (
     EvaluationMode,
     create_controlled_app,
 )
+from authflowguard.evaluation_targets.react_json_app import (
+    KNOWN_USERNAME as REACT_KNOWN_USERNAME,
+)
+from authflowguard.evaluation_targets.react_json_app import (
+    EvaluationMode as ReactJsonMode,
+)
+from authflowguard.evaluation_targets.react_json_app import (
+    create_react_json_app,
+)
 from authflowguard.models import (
     AuthFeature,
     AuthProfile,
@@ -34,6 +43,7 @@ from authflowguard.models import (
     TargetScope,
 )
 from authflowguard.secrets import RuntimeSecrets
+from test_form_enumeration import serve
 
 
 @contextmanager
@@ -184,6 +194,7 @@ async def run_check(profile: AuthProfile) -> LoginEnumerationRun:
         known_identifier_reference="known-identifier",
         nonexistent_identifier_reference="nonexistent-identifier",
         failure_password_reference="failure-password",
+        password_references=frozenset({"login-password"}),
     )
 
 
@@ -312,5 +323,94 @@ def test_runner_rejects_a_profile_without_verified_login() -> None:
                 known_identifier_reference="known",
                 nonexistent_identifier_reference="missing",
                 failure_password_reference="wrong",
+                password_references=frozenset(),
             )
         )
+
+
+def two_step_profile(origin: str) -> AuthProfile:
+    """Email, Continue, then a verification code that appears only on success."""
+
+    def step(action: BrowserActionType, **fields: str) -> BrowserAction:
+        return BrowserAction(action_type=action, description="Two-step login", **fields)
+
+    return AuthProfile(
+        target=TargetScope(target_url=f"{origin}/login", permitted_origins=[origin]),
+        features={AuthFeature.LOGIN: "verified"},
+        authentication_steps={
+            AuthFeature.LOGIN: [
+                step(BrowserActionType.NAVIGATE, url=f"{origin}/login"),
+                step(
+                    BrowserActionType.FILL,
+                    observed_control_id="control-1",
+                    value_reference="login-username",
+                ),
+                step(BrowserActionType.CLICK, observed_control_id="control-2"),
+                step(
+                    BrowserActionType.FILL,
+                    observed_control_id="control-3",
+                    value_reference="login-code",
+                ),
+                step(BrowserActionType.CLICK, observed_control_id="control-4"),
+            ]
+        },
+    )
+
+
+def run_two_step_check(
+    mode: ReactJsonMode, known_identifier: str = REACT_KNOWN_USERNAME
+) -> tuple[AuthProfile, LoginEnumerationRun]:
+    with serve(create_react_json_app(mode)) as origin:
+        profile = two_step_profile(origin)
+        run = asyncio.run(
+            run_login_enumeration_check(
+                profile=profile,
+                scan_id=uuid4(),
+                runtime_secrets=RuntimeSecrets(
+                    {
+                        "known-identifier": known_identifier,
+                        "nonexistent-identifier": "missing@example.test",
+                        "failure-password": "000000",
+                    }
+                ),
+                known_identifier_reference="known-identifier",
+                nonexistent_identifier_reference="nonexistent-identifier",
+                failure_password_reference="failure-password",
+                # The scan's password reference; this flow has no password step.
+                password_references=frozenset({"login-password"}),
+                username_action_reference="login-username",
+                password_action_reference="login-code",
+            )
+        )
+    return profile, run
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_outcome"),
+    [
+        # The unknown email is rejected before the code field appears; that
+        # early end is recorded as the response rather than waited on.
+        (ReactJsonMode.VULNERABLE, CheckOutcome.FINDING_CONFIRMED),
+        (ReactJsonMode.SECURE, CheckOutcome.NO_ISSUE_OBSERVED),
+    ],
+)
+def test_two_step_login_records_an_early_rejection(
+    mode: ReactJsonMode, expected_outcome: CheckOutcome
+) -> None:
+    profile, run = run_two_step_check(mode)
+
+    assert run.evidence.errors == []
+    result = analyse_login_enumeration(run.evidence, profile, SecurityPolicy())
+    assert result.outcome is expected_outcome
+
+
+def test_known_identifier_attempt_must_complete_every_step() -> None:
+    # An identifier the app rejects at the first step, used as the known one:
+    # the flow cannot be completed, which must be an error, never "no issue".
+    profile, run = run_two_step_check(
+        ReactJsonMode.VULNERABLE, known_identifier="also-missing@example.test"
+    )
+
+    assert run.evidence.errors
+    result = analyse_login_enumeration(run.evidence, profile, SecurityPolicy())
+    assert result.outcome is CheckOutcome.EXECUTION_ERROR

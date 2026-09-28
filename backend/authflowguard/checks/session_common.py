@@ -3,12 +3,13 @@
 import hashlib
 import json
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from playwright.async_api import Page
 
 from authflowguard.action_executor import BrowserActionExecutor
+from authflowguard.control_safety import flow_step
 from authflowguard.models import (
     AuthFeature,
     AuthProfile,
@@ -18,6 +19,7 @@ from authflowguard.models import (
     EvidenceEvent,
     EvidenceKind,
 )
+from authflowguard.page_settling import goto_and_settle
 from authflowguard.secrets import RuntimeSecrets
 
 
@@ -62,15 +64,25 @@ async def execute_login_steps(
     scan_id: UUID,
     steps: list[BrowserAction],
     secrets: RuntimeSecrets,
+    password_reference: str,
     events: list[EvidenceEvent],
     check_id: CheckId,
     cancel_requested: Callable[[], bool],
 ) -> None:
-    executor = BrowserActionExecutor(page, profile.target, secrets, scan_id)
-    for step in steps:
+    executor = BrowserActionExecutor(
+        page,
+        profile.target,
+        secrets,
+        scan_id,
+        password_references=frozenset({password_reference}),
+    )
+    for step_number, step in enumerate(steps, start=1):
         if cancel_requested():
             raise RuntimeError("Session check execution cancelled")
-        result = await executor.execute(step.model_copy(update={"action_id": uuid4()}))
+        with flow_step(step_number):
+            result = await executor.execute(
+                step.model_copy(update={"action_id": uuid4()})
+            )
         for event in result.events:
             events.append(event.model_copy(update={"check_id": check_id}))
 
@@ -100,7 +112,7 @@ def cookie_snapshot(cookies: list[Any]) -> dict[str, Any]:
 async def protected_state(
     page: Page, resource: str, marker_selector: str
 ) -> dict[str, Any]:
-    response = await page.goto(resource, wait_until="domcontentloaded")
+    response = await goto_and_settle(page, resource)
     status = response.status if response is not None else None
     marker_present = await page.locator(marker_selector).count() > 0
     return {
@@ -120,4 +132,47 @@ def check_event(
         kind=kind,
         summary=summary,
         redacted_details=details,
+    )
+
+
+def replay_server_error(
+    authenticated: dict[str, Any], replay: dict[str, Any], anonymous: dict[str, Any]
+) -> bool:
+    """Whether a server error prevents a trustworthy replay verdict.
+
+    A 5xx normally means the procedure failed. Some applications, however,
+    answer every signed-out request to a protected page with a 5xx. When the
+    replay receives exactly the anonymous control's status, that status is
+    how the application rejects signed-out visitors, not a failure. When the
+    replay shows the account marker, an anonymous 5xx without the marker still
+    proves the marker is not public.
+    """
+
+    authenticated_status = cast(int, authenticated["status"])
+    replay_status = cast(int, replay["status"])
+    anonymous_status = cast(int, anonymous["status"])
+    if authenticated_status >= 500:
+        return True
+    if replay_status >= 500:
+        return replay_status != anonymous_status
+    if anonymous_status >= 500:
+        replay_authenticated = replay_status == 200 and bool(
+            replay.get("marker_present")
+        )
+        return not replay_authenticated or bool(anonymous.get("marker_present"))
+    return False
+
+
+def replay_rejected(replay: dict[str, Any], anonymous: dict[str, Any]) -> bool:
+    """Whether the replay was refused like a signed-out visitor."""
+
+    if anonymous.get("marker_present"):
+        return False
+    replay_status = cast(int, replay["status"])
+    if replay_status in {401, 403}:
+        return True
+    return (
+        replay_status >= 500
+        and replay_status == anonymous["status"]
+        and not replay.get("marker_present")
     )

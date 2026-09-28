@@ -6,8 +6,43 @@ Tracks calls, observations, and simulates token usage and costs.
 
 from collections.abc import Sequence
 
-from authflowguard.bedrock import BedrockActionDecision, PageObservationForModel
+from authflowguard.bedrock import (
+    BedrockActionDecision,
+    BedrockClassificationDecision,
+    ObservedControlForModel,
+    PageObservationForModel,
+)
+from authflowguard.control_roles import ControlRole, RoleSuggestion
+from authflowguard.control_safety import names_irreversible_action
 from authflowguard.models import ActionWaitCondition, BrowserAction, BrowserActionType
+
+_USERNAME_HINTS = ("user", "login", "email", "e-mail", "member")
+_SUBMIT_HINTS = ("sign in", "log in", "login", "submit")
+_TEXT_INPUT_TYPES = (None, "text", "email", "tel")
+_REGISTRATION_HINTS = ("register", "sign up", "create account", "not yet a customer")
+_RESET_HINTS = ("forgot", "reset password", "recover")
+_LOGOUT_HINTS = ("log out", "logout", "sign out")
+_ACCOUNT_MENU_HINTS = ("account", "profile", "user menu")
+
+
+def _describes(control: ObservedControlForModel, hints: Sequence[str]) -> bool:
+    words = " ".join(
+        value or ""
+        for value in (
+            control.name,
+            control.placeholder,
+            control.autocomplete,
+            control.aria_label,
+            control.text,
+        )
+    ).lower()
+    return any(hint in words for hint in hints)
+
+
+def _is_button(control: ObservedControlForModel) -> bool:
+    return control.tag == "button" or (
+        control.tag == "input" and control.control_type in ("submit", "button", "image")
+    )
 
 
 class DeterministicModelDouble:
@@ -31,6 +66,7 @@ class DeterministicModelDouble:
         self.output_tokens = output_tokens
         self.observations: list[PageObservationForModel] = []
         self.choose_calls = 0
+        self.classify_calls = 0
         self._filled_username = False
         self._filled_password = False
         self._clicked_submit = False
@@ -66,6 +102,119 @@ class DeterministicModelDouble:
             actual_cost_usd=self.actual_cost_usd,
             reserved_cost_usd=self.reserved_cost_usd,
         )
+
+    def estimate_classification_cost(
+        self, observation: PageObservationForModel
+    ) -> float:
+        return self.reserved_cost_usd
+
+    def classify_controls(
+        self, observation: PageObservationForModel
+    ) -> BedrockClassificationDecision:
+        """Name the login controls the way a careful model would, offline.
+
+        The password is the visible password field; the username is the
+        nearest text-like field before it, preferring one whose names say
+        username or email; the submit is the first button after the password
+        that says it signs in, else the first button after it. A control
+        whose label names an irreversible action is never chosen.
+        """
+
+        self.classify_calls += 1
+        self.observations.append(observation)
+        controls = [control for control in observation.controls if control.visible]
+        suggestions: list[RoleSuggestion] = []
+
+        password_index = next(
+            (
+                index
+                for index, control in enumerate(controls)
+                if control.tag == "input" and control.control_type == "password"
+            ),
+            None,
+        )
+        if password_index is not None:
+            password = controls[password_index]
+            suggestions.append(
+                RoleSuggestion(password.observed_control_id, ControlRole.PASSWORD)
+            )
+            before = [
+                control
+                for control in controls[:password_index]
+                if control.tag == "input"
+                and control.control_type in _TEXT_INPUT_TYPES
+                and control.form_index == password.form_index
+            ]
+            username = next(
+                (c for c in reversed(before) if _describes(c, _USERNAME_HINTS)),
+                before[-1] if before else None,
+            )
+            if username is not None:
+                suggestions.append(
+                    RoleSuggestion(username.observed_control_id, ControlRole.USERNAME)
+                )
+            after = [
+                control
+                for control in controls[password_index + 1 :]
+                if _is_button(control)
+                and control.form_index == password.form_index
+                and not names_irreversible_action(
+                    f"{control.text or ''} {control.aria_label or ''}"
+                )
+            ]
+            submit = next(
+                (c for c in after if _describes(c, _SUBMIT_HINTS)),
+                after[0] if after else None,
+            )
+            if submit is not None:
+                suggestions.append(
+                    RoleSuggestion(submit.observed_control_id, ControlRole.SUBMIT)
+                )
+
+        return BedrockClassificationDecision(
+            suggestions=tuple(
+                suggestion
+                for suggestion in (*suggestions, *self._other_roles(controls))
+                if suggestion.role.value in observation.objective
+            ),
+            discarded_count=0,
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            actual_cost_usd=self.actual_cost_usd,
+            reserved_cost_usd=self.reserved_cost_usd,
+        )
+
+    @staticmethod
+    def _other_roles(
+        controls: Sequence[ObservedControlForModel],
+    ) -> list[RoleSuggestion]:
+        """The first link or button named for each non-login role, if any.
+
+        Only the roles the observation's objective names are returned.
+        """
+
+        suggestions: list[RoleSuggestion] = []
+        for role, hints, kinds in (
+            (ControlRole.REGISTRATION_LINK, _REGISTRATION_HINTS, ("a", "button")),
+            (ControlRole.RESET_LINK, _RESET_HINTS, ("a", "button")),
+            (ControlRole.LOGOUT, _LOGOUT_HINTS, ("a", "button")),
+            (ControlRole.ACCOUNT_MENU, _ACCOUNT_MENU_HINTS, ("button",)),
+        ):
+            match = next(
+                (
+                    control
+                    for control in controls
+                    if control.tag in kinds
+                    and _describes(control, hints)
+                    and not names_irreversible_action(
+                        f"{control.text or ''} {control.aria_label or ''}"
+                    )
+                ),
+                None,
+            )
+            if match is not None:
+                suggestions.append(RoleSuggestion(match.observed_control_id, role))
+        return suggestions
 
     def _decide_heuristically(
         self, observation: PageObservationForModel

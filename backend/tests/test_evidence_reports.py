@@ -5,7 +5,11 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from authflowguard import models
-from authflowguard.evidence import EvidenceStore, transient_secret_redaction
+from authflowguard.evidence import (
+    EvidenceStore,
+    redact_persisted_data,
+    transient_secret_redaction,
+)
 from authflowguard.models import (
     CheckId,
     CheckOutcome,
@@ -153,4 +157,53 @@ def test_offline_reports_are_written_from_saved_models(tmp_path: Path) -> None:
 
     assert report["metadata"]["scan_id"] == str(scan_id)
     assert report["evidence"][0]["check_id"] == CheckId.LOGIN_ENUMERATION.value
-    assert "WSTG-IDNT-04" in Path(html_path).read_text()
+    html = Path(html_path).read_text()
+    assert "WSTG-IDNT-04" in html
+    assert "Executive Summary" in html
+    assert "All Findings Overview" in html
+    assert "Evidence Snapshot" in html
+    assert "Return indistinguishable login failure responses" in html
+    assert "Bounded test" in html
+
+
+def test_html_report_rates_failures_and_lists_unrun_checks(tmp_path: Path) -> None:
+    scan_id = uuid4()
+    store = EvidenceStore(tmp_path)
+    store.create_scan(
+        scan_id,
+        {
+            "target": "https://app.example/login",
+            "selected_checks": [
+                CheckId.LOGIN_ENUMERATION.value,
+                CheckId.LOGOUT_INVALIDATION.value,
+            ],
+        },
+    )
+    evidence = make_evidence(scan_id)
+    evidence.observations = {"status_code": 401, "note": "<script>"}
+    result = make_result(scan_id)
+    result.outcome = CheckOutcome.FINDING_CONFIRMED
+
+    _, html_path = export_scan_reports(store, scan_id, [evidence], [result])
+    html = Path(html_path).read_text()
+
+    assert "1 check(s) failed" in html
+    assert "Priority checks requiring analyst attention: Login Enumeration." in html
+    assert "MEDIUM" in html
+    assert "NOT RUN" in html
+    assert "&quot;status_code&quot;: 401" in html
+    assert "<script>" not in html
+
+
+def test_persisted_urls_keep_hash_routes_but_drop_token_fragments() -> None:
+    redacted = redact_persisted_data(
+        {
+            "url": "http://127.0.0.1:3000/?next=query-secret#/login",
+            "protected-url": "https://app.example/callback#access_token=secret",
+        }
+    )
+
+    assert redacted == {
+        "url": "http://127.0.0.1:3000/#/login",
+        "protected-url": "https://app.example/callback",
+    }

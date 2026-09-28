@@ -164,13 +164,13 @@ def create_react_json_app(
         username = str(body.get("username", ""))
         known = username == KNOWN_USERNAME
         state.pending_users.add(username)
-        if not known:
-            message = (
-                "No account exists for that email address."
-                if selected_mode is EvaluationMode.VULNERABLE
-                else "The email address or verification code is incorrect."
+        if not known and selected_mode is EvaluationMode.VULNERABLE:
+            return JSONResponse(
+                {"message": "No account exists for that email address."},
+                status_code=401,
             )
-            return JSONResponse({"message": message}, status_code=401)
+        # The secure mode answers every email identically and rejects an
+        # unknown one only at verification, with the same generic message.
         return JSONResponse({"next": "verification", "message": "Code sent."})
 
     @application.post("/api/auth/verify")

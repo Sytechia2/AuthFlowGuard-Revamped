@@ -15,7 +15,10 @@ from authflowguard.checks.session_common import (
     execute_login_steps,
     login_steps_for,
     protected_state,
+    replay_rejected,
+    replay_server_error,
 )
+from authflowguard.control_safety import describe_error
 from authflowguard.models import (
     AuthProfile,
     CheckId,
@@ -27,6 +30,7 @@ from authflowguard.models import (
     SecurityPolicy,
     TestRunEvidence,
 )
+from authflowguard.page_settling import goto_and_settle
 from authflowguard.secrets import RuntimeSecrets
 
 OWASP_REFERENCE = "WSTG-SESS-03"
@@ -67,9 +71,7 @@ async def run_session_fixation_check(
                 context = await browser.new_context(service_workers="block")
                 try:
                     page = await context.new_page()
-                    await page.goto(
-                        str(profile.target.target_url), wait_until="domcontentloaded"
-                    )
+                    await goto_and_settle(page, str(profile.target.target_url))
                     pre_login_cookies = await context.cookies()
                     observations["pre_login_session"] = cookie_snapshot(
                         pre_login_cookies
@@ -91,6 +93,7 @@ async def run_session_fixation_check(
                         scan_id=scan_id,
                         steps=steps,
                         secrets=runtime_secrets,
+                        password_reference=password_reference,
                         events=events,
                         check_id=CheckId.SESSION_FIXATION,
                         cancel_requested=cancel_requested,
@@ -166,7 +169,7 @@ async def run_session_fixation_check(
             finally:
                 await browser.close()
     except Exception as error:
-        errors.append(type(error).__name__)
+        errors.append(describe_error(error))
         events.append(
             check_event(
                 scan_id,
@@ -262,8 +265,7 @@ def analyse_session_fixation(
             outcome=CheckOutcome.INCONCLUSIVE,
             explanation="Session fixation controls did not produce usable statuses.",
         )
-    status_values = [cast(int, status) for status in statuses]
-    if any(status >= 500 for status in status_values):
+    if replay_server_error(authenticated, replay, anonymous):
         return CheckResult(
             **base,
             outcome=CheckOutcome.EXECUTION_ERROR,
@@ -279,7 +281,7 @@ def analyse_session_fixation(
         explanation = (
             "The original pre-login session retained authenticated access after login."
         )
-    elif replay_status in {401, 403} and not anonymous.get("marker_present"):
+    elif replay_rejected(replay, anonymous):
         outcome = CheckOutcome.NO_ISSUE_OBSERVED
         explanation = (
             "The original pre-login session did not authenticate in the isolated "

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from authflowguard.authentication import observe_guidance_page
+from authflowguard.control_safety import SafeMessageError
 from authflowguard.evidence import redact_persisted_data, transient_secret_redaction
 from authflowguard.models import AuthProfile, EvidenceEvent
 from authflowguard.scan_manager import (
@@ -16,6 +17,7 @@ from authflowguard.scan_manager import (
     ScanManager,
     ScanRecord,
     ScanState,
+    public_failure_message,
 )
 from authflowguard.worker_protocol import (
     WorkerCommand,
@@ -293,12 +295,24 @@ def execute_worker_command(
         block=True,
         timeout=5,
     )
-    try:
+    published = False
+
+    async def execute_and_publish() -> None:
+        nonlocal published
         if command.operation is WorkerOperation.OBSERVE_GUIDANCE:
-            message = asyncio.run(_execute_observation_command(command, cancel_event))
+            result = await _execute_observation_command(command, cancel_event)
         else:
-            message = asyncio.run(_execute_scan_command(command, cancel_event, output))
-    except BaseException:
+            result = await _execute_scan_command(command, cancel_event, output)
+        # Publish before the event loop shuts down, so a hang in loop or
+        # interpreter teardown cannot hide a result that is already final.
+        output.put(result.model_dump(mode="json"), block=True, timeout=5)
+        published = True
+
+    try:
+        asyncio.run(execute_and_publish())
+    except BaseException as error:
+        if published:
+            return
         message = WorkerMessage(
             correlation_id=command.correlation_id,
             scan_id=command.scan_id,
@@ -306,7 +320,12 @@ def execute_worker_command(
             sequence=2,
             message_type=WorkerMessageType.FAILED,
             error_code="scan_worker_failed",
-            error="The isolated scan worker failed",
+            # Only a safe-message error may cross the process boundary as text.
+            error=(
+                public_failure_message(error)
+                if isinstance(error, SafeMessageError)
+                else "The isolated scan worker failed"
+            ),
             cleanup_confirmed=True,
         )
-    output.put(message.model_dump(mode="json"), block=True, timeout=5)
+        output.put(message.model_dump(mode="json"), block=True, timeout=5)

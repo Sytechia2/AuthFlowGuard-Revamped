@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 from authflowguard.action_executor import BrowserActionExecutor
+from authflowguard.control_safety import describe_error, flow_step
 from authflowguard.models import (
     AuthFeature,
     AuthProfile,
@@ -34,6 +35,7 @@ from authflowguard.secrets import RuntimeSecrets
 OWASP_REFERENCE = "WSTG-IDNT-04"
 ANALYSER_VERSION = "1.0"
 PAIR_COUNT = 3
+STEP_APPEAR_TIMEOUT_MS = 2000
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,19 @@ def _fill_references(
     return username_reference, password_reference
 
 
+async def _step_target_available(
+    executor: BrowserActionExecutor, step: BrowserAction
+) -> bool:
+    """Whether the control a recorded step acts on is present and visible.
+
+    The executor finds it the way it will act on it: by fingerprint when the
+    step has one, otherwise by position.
+    """
+
+    # Allow a client-rendered step a moment to appear.
+    return await executor.control_is_available(step, STEP_APPEAR_TIMEOUT_MS)
+
+
 async def _run_failed_login_attempt(
     *,
     browser: Browser,
@@ -125,6 +140,7 @@ async def _run_failed_login_attempt(
     identifier: str,
     username_reference: str,
     password_reference: str,
+    password_step: bool,
     failure_password: str,
     label: str,
     events: list[EvidenceEvent],
@@ -140,17 +156,35 @@ async def _run_failed_login_attempt(
     try:
         context = await browser.new_context()
         page = await context.new_page()
+        # The failed attempt types a wrong password, but where it replaces
+        # a password it is still a password and belongs only in the password
+        # field. In a two-step flow it replaces a one-time code instead.
         executor = BrowserActionExecutor(
             page,
             profile.target,
             attempt_secrets,
             scan_id,
+            password_references=(
+                frozenset({password_reference}) if password_step else frozenset()
+            ),
         )
         action_events: list[EvidenceEvent] = []
-        for step in steps:
+        steps_completed = 0
+        for step_number, step in enumerate(steps, start=1):
             if cancel_requested():
                 raise asyncio.CancelledError("Login enumeration cancelled")
-            result = await executor.execute(_new_attempt_action(step))
+            if steps_completed and not await _step_target_available(executor, step):
+                # A multi-step login can reject an unknown identifier before
+                # the next step's control appears. That early end is the
+                # application's observable response, so it is recorded. The
+                # known-identifier attempt must complete every step, so a
+                # broken flow remains an error rather than a comparison.
+                if label == "nonexistent":
+                    break
+                raise ValueError("The known-identifier attempt could not continue")
+            with flow_step(step_number):
+                result = await executor.execute(_new_attempt_action(step))
+            steps_completed += 1
             action_events.extend(_event_for_check(event) for event in result.events)
             events.extend(_event_for_check(event) for event in result.events)
 
@@ -166,12 +200,15 @@ async def _run_failed_login_attempt(
                 "redacted_details": {
                     **page_evidence.redacted_details,
                     "comparison_label": label,
-                    "signature": await _page_signature(
-                        page,
-                        page_evidence,
-                        action_events,
-                        identifier,
-                    ),
+                    "signature": {
+                        **await _page_signature(
+                            page,
+                            page_evidence,
+                            action_events,
+                            identifier,
+                        ),
+                        "steps_completed": steps_completed,
+                    },
                 },
             }
         )
@@ -191,11 +228,17 @@ async def run_login_enumeration_check(
     known_identifier_reference: str,
     nonexistent_identifier_reference: str,
     failure_password_reference: str,
+    password_references: frozenset[str],
     username_action_reference: str | None = None,
     password_action_reference: str | None = None,
     cancel_requested: Callable[[], bool] = lambda: False,
 ) -> LoginEnumerationRun:
-    """Compare failed logins for known and nonexistent identifiers three times."""
+    """Compare failed logins for known and nonexistent identifiers three times.
+
+    ``password_references`` names the scan's references that hold passwords.
+    The failure password replaces the saved flow's second fill, and is typed
+    as a password only when that fill's reference is one of them.
+    """
 
     if profile.features.get(AuthFeature.LOGIN) is not FeatureStatus.VERIFIED:
         raise ValueError("The auth profile has no verified login feature")
@@ -240,6 +283,7 @@ async def run_login_enumeration_check(
                             identifier=identifier,
                             username_reference=username_reference,
                             password_reference=password_reference,
+                            password_step=password_reference in password_references,
                             failure_password=failure_password,
                             label=label,
                             events=events,
@@ -247,7 +291,7 @@ async def run_login_enumeration_check(
                         )
                         completed_steps.append(step_label)
                     except Exception as error:
-                        errors.append(f"{step_label}: {type(error).__name__}")
+                        errors.append(f"{step_label}: {describe_error(error)}")
                         events.append(
                             EvidenceEvent(
                                 event_id=uuid4(),

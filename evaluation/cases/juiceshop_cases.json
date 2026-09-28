@@ -1,0 +1,156 @@
+{
+  "schema_version": "1.0",
+  "prepared_by": "Sufian Bin Iskandar (Member 5)",
+  "prepared_on": "2026-09-27",
+  "target": {
+    "name": "OWASP Juice Shop",
+    "version": "20.2.0",
+    "image": "bkimminich/juice-shop:v20.2.0",
+    "image_digest": "sha256:73c53fbf442e8337b3ea3d98c7e8550308854701ebdfce4cc39768f36b75430e",
+    "profile": "quiet",
+    "start_command": "docker run -d --name authflowguard-juiceshop -e NODE_ENV=quiet -p 127.0.0.1:3000:3000 bkimminich/juice-shop:v20.2.0",
+    "origin": "http://127.0.0.1:3000"
+  },
+  "method": "Every expected_outcome is the application's real behaviour, established by probing Juice Shop directly with curl and a plain browser before AuthFlowGuard was run. The ground_truth field records that probe. A case passes only when AuthFlowGuard reports what the application actually does. The quiet profile changes presentation only (welcome banner, challenge notifications, hints, tutorial); the probes were repeated under it and gave identical results.",
+  "cases": [
+    {
+      "case_id": "J-CHK-001",
+      "check_id": "login_enumeration",
+      "outcome_type": "secure",
+      "expected_outcome": "no_issue_observed",
+      "execution_mode": "live_scan",
+      "application": "J",
+      "fixture_mode": "external",
+      "owasp_reference": "WSTG-IDNT-04",
+      "setup": {
+        "target_url": "http://127.0.0.1:3000/#/login",
+        "permitted_origins": ["http://127.0.0.1:3000"],
+        "protected_resource_url": "http://127.0.0.1:3000/profile",
+        "marker_selector": "#email",
+        "known_username": "admin@juice-sh.op",
+        "known_password": "admin123",
+        "nonexistent_username": "eva-js-chk001-{run}@example.test",
+        "failure_password": "Eva-Wrong-Pass-123!"
+      },
+      "ground_truth": "POST /rest/user/login returns HTTP 401 with the identical body 'Invalid email or password.' for a known email with a wrong password and for an unknown email.",
+      "rationale": "Failed-login responses are indistinguishable, so login does not reveal whether an account exists.",
+      "notes": ""
+    },
+    {
+      "case_id": "J-CHK-002",
+      "check_id": "registration_enumeration",
+      "outcome_type": "vulnerable",
+      "expected_outcome": "finding_confirmed",
+      "execution_mode": "live_scan",
+      "application": "J",
+      "fixture_mode": "external",
+      "owasp_reference": "WSTG-IDNT-04",
+      "setup": {
+        "target_url": "http://127.0.0.1:3000/#/login",
+        "permitted_origins": ["http://127.0.0.1:3000"],
+        "protected_resource_url": "http://127.0.0.1:3000/profile",
+        "marker_selector": "#email",
+        "known_username": "admin@juice-sh.op",
+        "known_password": "admin123",
+        "nonexistent_username": "eva-js-chk002-{run}@example.test",
+        "failure_password": "Eva-Wrong-Pass-123!",
+        "registration_url": "http://127.0.0.1:3000/#/register"
+      },
+      "ground_truth": "POST /api/Users with an existing email returns HTTP 400 'email must be unique'; with a fresh email it returns HTTP 201 and creates the account.",
+      "rationale": "Registration discloses that an email is already registered.",
+      "notes": "The identifier contains {run}, so each run registers a new account and the case stays repeatable against a long-lived container."
+    },
+    {
+      "case_id": "J-CHK-003",
+      "check_id": "reset_request_enumeration",
+      "outcome_type": "vulnerable",
+      "expected_outcome": "finding_confirmed",
+      "execution_mode": "live_scan",
+      "application": "J",
+      "fixture_mode": "external",
+      "owasp_reference": "WSTG-IDNT-04",
+      "setup": {
+        "target_url": "http://127.0.0.1:3000/#/login",
+        "permitted_origins": ["http://127.0.0.1:3000"],
+        "protected_resource_url": "http://127.0.0.1:3000/profile",
+        "marker_selector": "#email",
+        "known_username": "admin@juice-sh.op",
+        "known_password": "admin123",
+        "nonexistent_username": "eva-js-chk003-{run}@example.test",
+        "failure_password": "Eva-Wrong-Pass-123!"
+      },
+      "ground_truth": "GET /rest/user/security-question returns the account's security question for a known email and an empty object for an unknown email.",
+      "rationale": "The password-reset flow discloses whether an email belongs to an account.",
+      "notes": ""
+    },
+    {
+      "case_id": "J-CHK-004",
+      "check_id": "login_throttling",
+      "outcome_type": "vulnerable",
+      "expected_outcome": "finding_confirmed",
+      "execution_mode": "live_scan",
+      "application": "J",
+      "fixture_mode": "external",
+      "owasp_reference": "WSTG-ATHN-03",
+      "setup": {
+        "target_url": "http://127.0.0.1:3000/#/login",
+        "permitted_origins": ["http://127.0.0.1:3000"],
+        "protected_resource_url": "http://127.0.0.1:3000/profile",
+        "marker_selector": "#email",
+        "known_username": "admin@juice-sh.op",
+        "known_password": "admin123",
+        "nonexistent_username": "eva-js-chk004-{run}@example.test",
+        "failure_password": "Eva-Wrong-Pass-123!"
+      },
+      "ground_truth": "Six consecutive wrong-password attempts for the admin account each returned HTTP 401, and the correct password immediately afterwards returned HTTP 200.",
+      "rationale": "No lockout or throttling restricts the valid control after repeated failures.",
+      "notes": "Juice Shop never locks the account, so this case cannot disturb the others."
+    },
+    {
+      "case_id": "J-CHK-005",
+      "check_id": "session_fixation",
+      "outcome_type": "secure",
+      "expected_outcome": "no_issue_observed",
+      "execution_mode": "live_scan",
+      "application": "J",
+      "fixture_mode": "external",
+      "owasp_reference": "WSTG-SESS-03",
+      "setup": {
+        "target_url": "http://127.0.0.1:3000/#/login",
+        "permitted_origins": ["http://127.0.0.1:3000"],
+        "protected_resource_url": "http://127.0.0.1:3000/profile",
+        "marker_selector": "#email",
+        "known_username": "admin@juice-sh.op",
+        "known_password": "admin123",
+        "nonexistent_username": "eva-js-chk005-{run}@example.test",
+        "failure_password": "Eva-Wrong-Pass-123!"
+      },
+      "ground_truth": "No token cookie exists before login; the only pre-login cookies are language and banner preferences. Login mints a new JWT, so there is no pre-login session identifier to fix.",
+      "rationale": "Replaying the pre-login cookie state cannot reach the account.",
+      "notes": ""
+    },
+    {
+      "case_id": "J-CHK-006",
+      "check_id": "logout_invalidation",
+      "outcome_type": "vulnerable",
+      "expected_outcome": "finding_confirmed",
+      "execution_mode": "live_scan",
+      "application": "J",
+      "fixture_mode": "external",
+      "owasp_reference": "WSTG-SESS-06",
+      "setup": {
+        "target_url": "http://127.0.0.1:3000/#/login",
+        "permitted_origins": ["http://127.0.0.1:3000"],
+        "protected_resource_url": "http://127.0.0.1:3000/profile",
+        "marker_selector": "#email",
+        "known_username": "admin@juice-sh.op",
+        "known_password": "admin123",
+        "nonexistent_username": "eva-js-chk006-{run}@example.test",
+        "failure_password": "Eva-Wrong-Pass-123!"
+      },
+      "ground_truth": "Logging out sends no request to the server. Replaying the pre-logout token cookie in a fresh browser context still renders /profile with the account's email.",
+      "rationale": "Logout clears the token only in the browser; the server continues to accept it.",
+      "notes": "Juice Shop's logout is a client-side menu button, not an HTML form that submits a POST."
+    }
+  ]
+}

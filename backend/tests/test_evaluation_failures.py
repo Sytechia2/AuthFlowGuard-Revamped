@@ -40,6 +40,7 @@ async def run_against_outage(
             maximum_active_seconds=30,
         ),
         credential_references=["known"],
+        password_references=frozenset(),
     )
 
     await page.goto(f"{origin}/login", wait_until="domcontentloaded")
@@ -166,7 +167,9 @@ def test_a_target_that_stops_responding_never_reports_a_security_pass() -> None:
 
     case = next(
         c
-        for c in load_cases(Path("evaluation/cases/formal_cases.json"))
+        for c in load_cases(
+            Path(__file__).resolve().parents[2] / "evaluation/cases/formal_cases.json"
+        )
         if c.case_id == "A-CHK-005-secure"
     )
     hang = FaultSpec(

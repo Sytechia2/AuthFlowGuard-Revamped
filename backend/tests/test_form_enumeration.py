@@ -17,7 +17,9 @@ import pytest
 import uvicorn
 from authflowguard import models
 from authflowguard.checks.form_enumeration import (
+    CLIENT_STATE_FIELDS,
     LABELS,
+    REPEAT_LABEL,
     FormEnumerationRun,
     normalize_response,
 )
@@ -47,7 +49,7 @@ from authflowguard.models import (
 )
 from authflowguard.secrets import RuntimeSecrets
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 CHECKS = (CheckId.REGISTRATION_ENUMERATION, CheckId.RESET_REQUEST_ENUMERATION)
 ANALYSERS = {
@@ -55,6 +57,7 @@ ANALYSERS = {
     CheckId.RESET_REQUEST_ENUMERATION: analyse_reset_request_enumeration,
 }
 UNKNOWN = "disposable@example.test"
+UNKNOWN_REPEAT = "disposable-repeat@example.test"
 PASSWORD = "disposable-password-123!"
 
 
@@ -498,3 +501,260 @@ def test_discovers_nonstandard_route_from_visible_link(check: CheckId) -> None:
         run = asyncio.run(run_check(check, profile_for(origin)))
     assert not run.evidence.errors
     assert len(app.state.submissions) == 2
+    assert run.evidence.observations["form_url_source"] == "keyword_search"
+
+
+def client_form_app(vulnerable: bool, noisy: bool = False) -> FastAPI:
+    """A single-page app: no native POST form, JSON requests, a debounced
+    reset lookup and a custom dropdown. Every registration returns a new
+    record id, which must not read as a difference. A noisy app also adds a
+    random reference string to every response, which normalization cannot
+    recognize."""
+
+    app = FastAPI()
+    registered = {KNOWN_USERNAME}
+
+    def body(values: dict[str, Any]) -> dict[str, Any]:
+        return {**values, "ref": uuid4().hex} if noisy else values
+
+    @app.get("/app")
+    async def page() -> HTMLResponse:
+        return HTMLResponse(CLIENT_APP_PAGE)
+
+    @app.post("/api/users")
+    async def register(request: Request) -> JSONResponse:
+        email = (await request.json())["email"]
+        if vulnerable and email in registered:
+            return JSONResponse(
+                body({"error": "email must be unique"}), status_code=400
+            )
+        registered.add(email)
+        return JSONResponse(
+            body({"id": len(registered) * 7, "status": "ok"}), status_code=201
+        )
+
+    @app.get("/api/question")
+    async def question(email: str) -> JSONResponse:
+        if vulnerable and email in registered:
+            return JSONResponse(body({"question": "Pet?"}))
+        return JSONResponse(body({}))
+
+    return app
+
+
+CLIENT_APP_PAGE = """<!doctype html><title>Shop</title><div id="view"></div>
+<script>
+const view = document.getElementById("view");
+function render() {
+  if (location.hash === "#/register") {
+    view.innerHTML = `<form>
+      <input id="emailControl" type="text" aria-label="Email address">
+      <input type="password"><input type="password">
+      <div role="combobox" tabindex="0" id="question">Choose a question</div>
+      <div id="options" hidden><div role="option" id="pet">Pet?</div></div>
+      <input id="answer" type="text" aria-label="Answer">
+      <button type="submit">Register</button></form><p id="out"></p>`;
+    const question = document.getElementById("question");
+    const options = document.getElementById("options");
+    question.onkeydown = (event) => {
+      if (event.key === "Enter") { options.hidden = false; }
+    };
+    document.getElementById("pet").onclick = () => {
+      question.textContent = "Pet?";
+      options.hidden = true;
+    };
+    view.querySelector("form").onsubmit = async (event) => {
+      event.preventDefault();
+      const email = document.getElementById("emailControl").value;
+      const response = await fetch("/api/users", {method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({email})});
+      if (response.ok) { location.hash = "#/login"; }
+      else {
+        document.getElementById("out").textContent = (await response.json()).error;
+      }
+    };
+  } else if (location.hash === "#/forgot-password") {
+    view.innerHTML = `<input id="email" type="email">
+      <input id="securityAnswer" type="password" disabled>
+      <button type="submit" disabled>Change</button>`;
+    let timer;
+    document.getElementById("email").oninput = (event) => {
+      clearTimeout(timer);
+      timer = setTimeout(async () => {
+        const response = await fetch(
+          "/api/question?email=" + encodeURIComponent(event.target.value));
+        const body = await response.json();
+        document.getElementById("securityAnswer").disabled = !body.question;
+      }, 600);
+    };
+  } else {
+    view.innerHTML = "<p>Signed out</p>";
+  }
+}
+window.onhashchange = render;
+render();
+</script>"""
+
+
+@pytest.mark.parametrize("check", CHECKS)
+@pytest.mark.parametrize(
+    ("vulnerable", "noisy", "expected"),
+    [
+        (True, False, CheckOutcome.FINDING_CONFIRMED),
+        (False, False, CheckOutcome.NO_ISSUE_OBSERVED),
+        # Account state still shows through the volatile content.
+        (True, True, CheckOutcome.FINDING_CONFIRMED),
+        # Volatile content alone must not read as enumeration.
+        (False, True, CheckOutcome.INCONCLUSIVE),
+    ],
+)
+def test_client_rendered_forms_are_compared(
+    check: CheckId, vulnerable: bool, noisy: bool, expected: CheckOutcome
+) -> None:
+    route = (
+        "register" if check is CheckId.REGISTRATION_ENUMERATION else "forgot-password"
+    )
+    with serve(client_form_app(vulnerable, noisy)) as origin:
+        profile = profile_for(origin)
+        run = asyncio.run(run_check(check, profile, form_url=f"{origin}/app#/{route}"))
+
+    assert run.evidence.errors == []
+    observations = run.evidence.observations
+    assert observations[LABELS[0]]["interaction"] == "client"
+    assert observations[REPEAT_LABEL]["interaction"] == "client"
+    saved = run.evidence.model_dump_json()
+    assert KNOWN_USERNAME not in saved
+    assert UNKNOWN not in saved
+    assert UNKNOWN_REPEAT not in saved
+    assert PASSWORD not in saved
+    assert ANALYSERS[check](run.evidence, profile, SecurityPolicy()).outcome is expected
+
+
+def client_signature(
+    responses: list[list[Any]], submitted: list[list[Any]] | None = None
+) -> dict[str, Any]:
+    def state(background: list[list[Any]]) -> dict[str, Any]:
+        return {
+            "background_responses": background,
+            **{field: "a" * 64 for field in CLIENT_STATE_FIELDS[1:]},
+        }
+
+    return {
+        "interaction": "client",
+        "reaction": state(responses),
+        "submission_observed": submitted is not None,
+        "submission": state(submitted) if submitted is not None else None,
+        "safe_visible_messages": [],
+    }
+
+
+LOOKUP = ["GET", "b" * 64, 200, "c" * 64]
+
+
+@pytest.mark.parametrize(
+    ("check", "known", "unknown", "expected"),
+    [
+        # Nothing reacted to either identifier: nothing was compared.
+        (
+            CheckId.RESET_REQUEST_ENUMERATION,
+            client_signature([]),
+            client_signature([]),
+            CheckOutcome.INCONCLUSIVE,
+        ),
+        (
+            CheckId.RESET_REQUEST_ENUMERATION,
+            client_signature([LOOKUP]),
+            client_signature([LOOKUP]),
+            CheckOutcome.NO_ISSUE_OBSERVED,
+        ),
+        # The disposable registration was rejected: a difference proves nothing.
+        (
+            CheckId.REGISTRATION_ENUMERATION,
+            client_signature([], [["POST", "b" * 64, 400, "c" * 64]]),
+            client_signature([], [["POST", "b" * 64, 400, "d" * 64]]),
+            CheckOutcome.INCONCLUSIVE,
+        ),
+        (
+            CheckId.REGISTRATION_ENUMERATION,
+            client_signature([], [["POST", "b" * 64, 400, "c" * 64]]),
+            client_signature([], [["POST", "b" * 64, 201, "d" * 64]]),
+            CheckOutcome.FINDING_CONFIRMED,
+        ),
+        (
+            CheckId.REGISTRATION_ENUMERATION,
+            client_signature([], [["POST", "b" * 64, 503, "c" * 64]]),
+            client_signature([], [["POST", "b" * 64, 201, "d" * 64]]),
+            CheckOutcome.EXECUTION_ERROR,
+        ),
+    ],
+)
+def test_client_form_analysis_requires_an_exercised_form(
+    check: CheckId,
+    known: dict[str, Any],
+    unknown: dict[str, Any],
+    expected: CheckOutcome,
+) -> None:
+    evidence = models.TestRunEvidence(
+        evidence_id=uuid4(),
+        scan_id=uuid4(),
+        check_id=check,
+        profile_version="1.0",
+        observations={LABELS[0]: known, LABELS[1]: unknown},
+        coverage={"limitations": ["Fixture evidence."]},
+    )
+    result = ANALYSERS[check](evidence, profile_for("http://app"), SecurityPolicy())
+    assert result.outcome is expected
+
+
+REGISTERED = ["POST", "b" * 64, 201, "c" * 64]
+
+
+@pytest.mark.parametrize(
+    ("known", "repeat", "expected"),
+    [
+        # Only the body differs, and it differs between nonexistent
+        # identifiers too: volatile content, not account state.
+        (
+            client_signature([], [["POST", "b" * 64, 201, "d" * 64]]),
+            client_signature([], [["POST", "b" * 64, 201, "e" * 64]]),
+            CheckOutcome.INCONCLUSIVE,
+        ),
+        # The body is volatile, but the status differs only for the known
+        # identifier.
+        (
+            client_signature([], [["POST", "b" * 64, 400, "d" * 64]]),
+            client_signature([], [["POST", "b" * 64, 201, "e" * 64]]),
+            CheckOutcome.FINDING_CONFIRMED,
+        ),
+        # The nonexistent attempts agree, so the known difference is stable.
+        (
+            client_signature([], [["POST", "b" * 64, 201, "d" * 64]]),
+            client_signature([], [REGISTERED]),
+            CheckOutcome.FINDING_CONFIRMED,
+        ),
+        (
+            client_signature([], [REGISTERED]),
+            {"interaction": "client"},
+            CheckOutcome.INCONCLUSIVE,
+        ),
+    ],
+)
+def test_client_form_analysis_ignores_volatile_differences(
+    known: dict[str, Any], repeat: dict[str, Any], expected: CheckOutcome
+) -> None:
+    check = CheckId.REGISTRATION_ENUMERATION
+    evidence = models.TestRunEvidence(
+        evidence_id=uuid4(),
+        scan_id=uuid4(),
+        check_id=check,
+        profile_version="1.0",
+        observations={
+            LABELS[0]: known,
+            LABELS[1]: client_signature([], [REGISTERED]),
+            REPEAT_LABEL: repeat,
+        },
+        coverage={"limitations": ["Fixture evidence."]},
+    )
+    result = ANALYSERS[check](evidence, profile_for("http://app"), SecurityPolicy())
+    assert result.outcome is expected

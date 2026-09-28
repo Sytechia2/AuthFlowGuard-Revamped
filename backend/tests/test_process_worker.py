@@ -24,6 +24,8 @@ from authflowguard.evaluation_targets.controlled_app import (
     KNOWN_USERNAME,
 )
 from authflowguard.models import (
+    BrowserAction,
+    BrowserActionType,
     CheckId,
     DiscoveryMode,
     DiscoveryProvenance,
@@ -559,3 +561,109 @@ def test_guidance_observation_and_replay_use_spawned_workers(tmp_path: Path) -> 
             assert record.results
         finally:
             manager.shutdown()
+
+
+def test_unsafe_control_reason_crosses_the_worker_boundary(tmp_path: Path) -> None:
+    # A guided flow whose second step points the username at the submit
+    # button, as a replay against the wrong page would.
+    with run_controlled_server() as origin:
+        manager = ScanManager(tmp_path)
+        record = manager.create_scan(
+            ScanRequest(
+                target={
+                    "target_url": f"{origin}/login",
+                    "permitted_origins": [origin],
+                },
+                selected_checks=[CheckId.LOGIN_ENUMERATION],
+            )
+        )
+        record.state = ScanState.AWAITING_GUIDANCE
+        record.pending_execution = _controlled_execution(origin)
+        manager._persist_state(record)
+        navigate, _username, _password, submit = guided_login_actions(origin)
+        wrong_control = BrowserAction(
+            action_type=BrowserActionType.FILL,
+            observed_control_id=submit.observed_control_id,
+            value_reference="login-username",
+            description="Fill the username",
+        )
+        try:
+            manager.submit_guidance(
+                record.scan_id,
+                GuidanceSubmission(actions=[navigate, wrong_control]),
+            )
+            assert record.future is not None
+            record.future.result(timeout=90)
+
+            assert record.state is ScanState.FAILED
+            assert record.error == (
+                f"Scan execution failed: Step 2: {submit.observed_control_id} "
+                "is a button, not a text field, so the value was not typed into it."
+            )
+            metadata = (tmp_path / str(record.scan_id) / "metadata.json").read_text(
+                encoding="utf-8"
+            )
+            assert KNOWN_USERNAME not in metadata
+        finally:
+            manager.shutdown()
+
+
+def _completes_then_lingers_worker(
+    command_data: dict[str, Any], output: Any, _cancel_event: Any
+) -> None:
+    command = WorkerCommand.model_validate(command_data)
+    for sequence, message_type in enumerate(
+        (WorkerMessageType.READY, WorkerMessageType.COMPLETED), start=1
+    ):
+        output.put(
+            WorkerMessage(
+                correlation_id=command.correlation_id,
+                scan_id=command.scan_id,
+                worker_generation=command.worker_generation,
+                sequence=sequence,
+                message_type=message_type,
+                cleanup_confirmed=message_type is WorkerMessageType.COMPLETED,
+            ).model_dump(mode="json")
+        )
+    # Simulates a hang in interpreter teardown after the result was sent.
+    time.sleep(30)
+
+
+def test_worker_that_lingers_after_its_result_is_reaped_and_result_kept(
+    tmp_path: Path,
+) -> None:
+    supervisor = WorkerSupervisor(
+        entrypoint=_completes_then_lingers_worker,
+        exit_grace_seconds=0.5,
+    )
+    scan_id = UUID("00000000-0000-0000-0000-000000000025")
+    command = WorkerCommand(
+        scan_id=scan_id,
+        worker_generation=1,
+        operation=WorkerOperation.OBSERVE_GUIDANCE,
+        data_root=str(tmp_path),
+        request=_request(),
+    )
+    result: Future[tuple[WorkerMessage | None, int | None, bool, bool]] = Future()
+    started = time.monotonic()
+    future = supervisor.start(
+        command,
+        lambda message, exit_code, forced, timed_out: result.set_result(
+            (message, exit_code, forced, timed_out)
+        ),
+        max_runtime_seconds=3600,
+    )
+
+    future.result(timeout=20)
+    message, exit_code, forced, timed_out = result.result(timeout=1)
+
+    # Resolved within the exit grace, not at the one-hour runtime limit.
+    assert time.monotonic() - started < 20
+    assert message is not None
+    assert message.message_type is WorkerMessageType.COMPLETED
+    assert message.cleanup_confirmed is True
+    # The terminal message decides the outcome, not the signalled exit.
+    assert exit_code is None
+    assert forced is False
+    assert timed_out is False
+    assert supervisor.is_active(scan_id, 1) is False

@@ -1,5 +1,6 @@
 """Validated execution of structured browser actions."""
 
+import asyncio
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,20 +22,64 @@ from playwright.async_api import (
 )
 
 from authflowguard.cancellation import cancellation_checkpoint
+from authflowguard.control_fingerprint import (
+    DESCRIBE_CONTROLS_SCRIPT,
+    FingerprintMiss,
+    fingerprints_by_control,
+    fingerprints_for,
+    resolve,
+)
+from authflowguard.control_safety import (
+    ControlFacts,
+    ControlOutcome,
+    ControlRefusal,
+    RecordedControlNotFoundError,
+    UnsafeControlError,
+    activation_refusal,
+    fill_refusal,
+)
 from authflowguard.evidence import publish_completed_events
 from authflowguard.models import (
     ActionWaitCondition,
     BrowserAction,
     BrowserActionType,
+    ControlFingerprint,
     EvidenceEvent,
     EvidenceKind,
     TargetScope,
     TrafficReference,
 )
+from authflowguard.page_settling import background_requests_settled, goto_and_settle
 from authflowguard.scope import url_is_in_scope, url_without_query_or_fragment
 from authflowguard.secrets import RuntimeSecrets
 
 CONTROL_SELECTOR = "input, button, select, textarea, a[href]"
+
+# Reads only nonsecret facts about a control. A text field's value is never
+# read: it may already hold a credential. Button-like inputs show their value
+# as their label, so theirs is read.
+_CONTROL_FACTS_SCRIPT = """element => {
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    const tag = element.tagName.toLowerCase();
+    const inputType = tag === 'input' ? String(element.type).toLowerCase() : null;
+    const parts = [element.getAttribute('aria-label'), element.getAttribute('title')];
+    if (tag === 'button' || tag === 'a') {
+        parts.push(element.innerText);
+    } else if (['button', 'submit', 'reset', 'image'].includes(inputType)) {
+        parts.push(element.value, element.getAttribute('alt'));
+    }
+    return {
+        tag,
+        input_type: inputType,
+        visible: rect.width > 0 && rect.height > 0
+            && style.visibility !== 'hidden' && style.visibility !== 'collapse',
+        enabled: !element.matches(':disabled')
+            && element.getAttribute('aria-disabled') !== 'true',
+        read_only: !!element.readOnly,
+        label: parts.filter(Boolean).join(' ').slice(0, 500),
+    };
+}"""
 
 
 class InvalidControlReferenceError(ValueError):
@@ -87,10 +132,37 @@ class ActionExecutionResult:
     page_changes: ObservablePageChanges
     events: list[EvidenceEvent]
     traffic: list[TrafficReference]
+    # The fingerprint of the control the action resolved to, read just
+    # before acting on it. None for an action without a control.
+    control_fingerprint: ControlFingerprint | None = None
+
+    def recorded(self, action: BrowserAction) -> BrowserAction:
+        """Return ``action`` carrying the fingerprint of the control it used.
+
+        A recorder saves this copy so replays can find the control by what it
+        is. An action that already has a fingerprint keeps it: the recorded
+        identity, not today's, is what a replay must match.
+        """
+
+        if (
+            action.control_fingerprint is not None
+            or self.control_fingerprint is None
+            or action.action_id != self.action_id
+        ):
+            return action
+        return action.model_copy(
+            update={"control_fingerprint": self.control_fingerprint}
+        )
 
 
 class BrowserActionExecutor:
     """Execute only the action types defined by the shared contract."""
+
+    # How long a recorded control may take to appear, or to stop matching
+    # several controls, before the action is refused. A client-rendered page
+    # can still be building its form when the navigation settles.
+    CONTROL_LOOKUP_TIMEOUT_SECONDS = 5.0
+    CONTROL_LOOKUP_INTERVAL_SECONDS = 0.1
 
     def __init__(
         self,
@@ -98,12 +170,25 @@ class BrowserActionExecutor:
         target: TargetScope,
         secrets: RuntimeSecrets,
         scan_id: UUID,
+        *,
+        password_references: frozenset[str],
     ) -> None:
+        """Bind the executor to one page, scope and set of runtime secrets.
+
+        ``password_references`` names the secret references that hold
+        passwords. It is required so that every caller states it: a password
+        is typed only into a password field, and a password field receives
+        only one of these references. Pass an empty set when the caller never
+        fills a password.
+        """
+
         self._page = page
         self._target = target
         self._secrets = secrets
         self._scan_id = scan_id
+        self._password_references = frozenset(password_references)
         self._scope_guard_installed = False
+        self._resolved_fingerprint: ControlFingerprint | None = None
 
     async def execute(self, action: BrowserAction) -> ActionExecutionResult:
         cancellation_checkpoint()
@@ -141,6 +226,7 @@ class BrowserActionExecutor:
         self._page.on("request", record_request)
         self._page.on("response", record_response)
 
+        self._resolved_fingerprint = None
         try:
             await self._execute_action(action)
         finally:
@@ -179,6 +265,7 @@ class BrowserActionExecutor:
             page_changes=page_changes,
             events=events,
             traffic=traffic,
+            control_fingerprint=self._resolved_fingerprint,
         )
         publish_completed_events(result.events)
         return result
@@ -395,11 +482,24 @@ class BrowserActionExecutor:
         if not url_is_in_scope(destination, self._target):
             raise ValueError("Navigation destination is outside permitted_origins")
 
-        await self._page.goto(destination, wait_until="domcontentloaded")
+        await goto_and_settle(self._page, destination)
 
     async def _click(self, action: BrowserAction) -> None:
-        control = await self._find_control(action.observed_control_id)
-        await control.click()
+        control = await self._find_control(action)
+        control_id = action.observed_control_id or ""
+        facts = await self._require_activatable(
+            control, control_id, ControlOutcome.NOT_CLICKED
+        )
+        async with background_requests_settled(self._page):
+            try:
+                await control.click()
+            except PlaywrightTimeoutError as error:
+                raise UnsafeControlError(
+                    control_id,
+                    ControlRefusal.NOT_CLICKABLE_IN_TIME,
+                    ControlOutcome.NOT_CLICKED,
+                    facts,
+                ) from error
         try:
             await self._page.wait_for_load_state(
                 "domcontentloaded",
@@ -411,39 +511,81 @@ class BrowserActionExecutor:
             pass
 
     async def _fill(self, action: BrowserAction) -> None:
-        control = await self._find_control(action.observed_control_id)
         if action.value_reference is None:
             raise ValueError("A fill action requires value_reference")
+        control = await self._find_control(action)
 
+        password_value = action.value_reference in self._password_references
+        outcome = self._outcome(action)
+        control_id = action.observed_control_id or ""
+        facts = await self._read_control_facts(control)
+        refusal = fill_refusal(facts, password_value=password_value)
+        if refusal is ControlRefusal.NOT_VISIBLE:
+            await self._wait_until_visible(control, control_id, facts, outcome)
+            facts = await self._read_control_facts(control)
+            refusal = fill_refusal(facts, password_value=password_value)
+        if refusal is ControlRefusal.DISABLED:
+            # A form often disables a field until the page is ready for it.
+            await self._wait_until_enabled(control, control_id, facts, outcome)
+            facts = await self._read_control_facts(control)
+            refusal = fill_refusal(facts, password_value=password_value)
+        if refusal is not None:
+            raise UnsafeControlError(control_id, refusal, outcome, facts)
+
+        # Resolve only after every check passed, so a refused action never
+        # holds the live value.
         live_value = self._secrets.resolve(action.value_reference)
-        await control.fill(live_value)
+        try:
+            await control.fill(live_value)
+        except PlaywrightError as error:
+            # Playwright's message can quote the value being typed, so it is
+            # replaced by fixed wording and kept only as the chained cause.
+            refusal = (
+                ControlRefusal.NOT_EDITABLE_IN_TIME
+                if isinstance(error, PlaywrightTimeoutError)
+                else ControlRefusal.FILL_FAILED
+            )
+            raise UnsafeControlError(control_id, refusal, outcome, facts) from error
 
     async def _select(self, action: BrowserAction) -> None:
-        control = await self._find_control(action.observed_control_id)
+        control = await self._find_control(action)
         await control.select_option(action.option_value)
 
     async def _press_key(self, action: BrowserAction) -> None:
         if action.key is None:
             raise ValueError("A press_key action requires key")
 
-        if action.observed_control_id is None:
-            await self._page.keyboard.press(action.key)
-            return
+        async with background_requests_settled(self._page):
+            if action.observed_control_id is None:
+                await self._page.keyboard.press(action.key)
+                return
 
-        control = await self._find_control(action.observed_control_id)
-        await control.press(action.key)
+            control = await self._find_control(action)
+            control_id = action.observed_control_id
+            facts = await self._require_activatable(
+                control, control_id, ControlOutcome.KEY_NOT_PRESSED
+            )
+            try:
+                await control.press(action.key)
+            except PlaywrightTimeoutError as error:
+                raise UnsafeControlError(
+                    control_id,
+                    ControlRefusal.NO_KEY_RESPONSE_IN_TIME,
+                    ControlOutcome.KEY_NOT_PRESSED,
+                    facts,
+                ) from error
 
     async def _wait(self, action: BrowserAction) -> None:
         if action.wait_for is None:
             raise ValueError("A wait action requires wait_for")
 
         if action.wait_for is ActionWaitCondition.CONTROL_VISIBLE:
-            control = await self._find_control(action.observed_control_id)
+            control = await self._find_control(action)
             await control.wait_for(state="visible")
             return
 
         if action.wait_for is ActionWaitCondition.CONTROL_HIDDEN:
-            control = await self._find_control(action.observed_control_id)
+            control = await self._find_control(action)
             await control.wait_for(state="hidden")
             return
 
@@ -454,17 +596,222 @@ class BrowserActionExecutor:
         else:
             await self._page.wait_for_load_state("networkidle")
 
-    async def _find_control(self, observed_control_id: str | None) -> Locator:
-        control_number = self._parse_control_number(observed_control_id)
-        controls = self._page.locator(CONTROL_SELECTOR)
-        control_count = await controls.count()
+    async def _read_control_facts(self, control: Locator) -> ControlFacts:
+        facts = await control.evaluate(_CONTROL_FACTS_SCRIPT)
+        return ControlFacts(
+            tag=str(facts["tag"]),
+            input_type=(
+                str(facts["input_type"]) if facts["input_type"] is not None else None
+            ),
+            visible=bool(facts["visible"]),
+            enabled=bool(facts["enabled"]),
+            read_only=bool(facts["read_only"]),
+            label=str(facts["label"]),
+        )
 
-        if control_number > control_count:
-            raise InvalidControlReferenceError(
-                f"The recorded control '{observed_control_id}' is no longer present"
+    async def _wait_until_visible(
+        self,
+        control: Locator,
+        control_id: str,
+        facts: ControlFacts,
+        outcome: ControlOutcome,
+    ) -> None:
+        """Allow a client-rendered control the page's usual time to appear."""
+
+        try:
+            await control.wait_for(state="visible")
+        except PlaywrightTimeoutError as error:
+            raise UnsafeControlError(
+                control_id, ControlRefusal.NOT_VISIBLE, outcome, facts
+            ) from error
+
+    async def _wait_until_enabled(
+        self,
+        control: Locator,
+        control_id: str,
+        facts: ControlFacts,
+        outcome: ControlOutcome,
+    ) -> None:
+        """Allow a briefly disabled field as long as a hidden one gets to appear.
+
+        The bound is the page's default timeout, the same one the visibility
+        wait uses. The caller re-reads the facts afterwards, so every other
+        check still runs on the enabled field.
+        """
+
+        handle = None
+        try:
+            handle = await control.element_handle()
+            await self._page.wait_for_function(
+                """element => !element.matches(':disabled')
+                    && element.getAttribute('aria-disabled') !== 'true'""",
+                arg=handle,
             )
+        except PlaywrightTimeoutError as error:
+            raise UnsafeControlError(
+                control_id, ControlRefusal.DISABLED, outcome, facts
+            ) from error
+        finally:
+            if handle is not None:
+                await handle.dispose()
 
-        return controls.nth(control_number - 1)
+    async def _require_activatable(
+        self,
+        control: Locator,
+        control_id: str,
+        outcome: ControlOutcome,
+    ) -> ControlFacts:
+        """Refuse to click or send keys to a hidden or destructive control."""
+
+        facts = await self._read_control_facts(control)
+        refusal = activation_refusal(facts)
+        if refusal is ControlRefusal.NOT_VISIBLE:
+            await self._wait_until_visible(control, control_id, facts, outcome)
+            facts = await self._read_control_facts(control)
+            refusal = activation_refusal(facts)
+        if refusal is not None:
+            raise UnsafeControlError(control_id, refusal, outcome, facts)
+        return facts
+
+    def _outcome(self, action: BrowserAction) -> ControlOutcome:
+        """What a refusal of ``action`` leaves undone, as fixed wording."""
+
+        if action.action_type is BrowserActionType.FILL:
+            if action.value_reference in self._password_references:
+                return ControlOutcome.PASSWORD_NOT_TYPED
+            return ControlOutcome.VALUE_NOT_TYPED
+        if action.action_type is BrowserActionType.SELECT:
+            return ControlOutcome.NOT_SELECTED
+        if action.action_type is BrowserActionType.PRESS_KEY:
+            return ControlOutcome.KEY_NOT_PRESSED
+        if action.action_type is BrowserActionType.WAIT:
+            return ControlOutcome.NOT_WAITED_FOR
+        return ControlOutcome.NOT_CLICKED
+
+    async def _describe_controls(self) -> list[dict[str, object]]:
+        """Describe every addressable control in one DOM revision.
+
+        The locator's own element list is read, so an index here is the
+        index ``nth`` addresses.
+        """
+
+        for attempt in range(2):
+            try:
+                descriptions: list[dict[str, object]] = await self._page.locator(
+                    CONTROL_SELECTOR
+                ).evaluate_all(DESCRIBE_CONTROLS_SCRIPT)
+                return descriptions
+            except PlaywrightError as error:
+                if attempt or "Execution context was destroyed" not in str(error):
+                    raise
+                await self._page.wait_for_load_state("domcontentloaded", timeout=3000)
+        raise AssertionError("unreachable")
+
+    async def control_fingerprints(self) -> dict[str, ControlFingerprint]:
+        """Fingerprint every control on the page now, keyed by ``control-N``.
+
+        A caller that builds actions from an observation of the page pins
+        them with these, so each action later finds the control it was built
+        for even if the page shifts before it runs.
+        """
+
+        return fingerprints_by_control(
+            await self._describe_controls(), self._secrets.redact_text
+        )
+
+    async def _locate(self, action: BrowserAction, timeout_seconds: float) -> int:
+        """Return the 0-based index of the action's control on the page.
+
+        An action with a fingerprint is resolved by it (see
+        ``control_fingerprint.resolve``), polling for up to
+        ``timeout_seconds`` while the page is still rendering. It never falls
+        back to the recorded position. An action without one, saved before
+        fingerprints existed, is resolved by position and relies on the
+        kind checks alone. Either way the resolved control's current
+        fingerprint is kept for the result.
+
+        The executor's secrets redact the live attributes exactly as saved
+        profiles are redacted, so both sides of the comparison agree.
+        """
+
+        control_number = self._parse_control_number(action.observed_control_id)
+        recorded = action.control_fingerprint
+        redact = self._secrets.redact_text
+        if recorded is None:
+            descriptions = await self._describe_controls()
+            if control_number > len(descriptions):
+                raise InvalidControlReferenceError(
+                    f"The recorded control '{action.observed_control_id}' "
+                    "is no longer present"
+                )
+            index = control_number - 1
+        else:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout_seconds
+            while True:
+                cancellation_checkpoint()
+                descriptions = await self._describe_controls()
+                found = resolve(recorded, descriptions, redact)
+                if not isinstance(found, FingerprintMiss):
+                    index = found
+                    break
+                if loop.time() >= deadline:
+                    raise RecordedControlNotFoundError(
+                        action.observed_control_id or "",
+                        (
+                            ControlRefusal.NOT_ON_PAGE
+                            if found is FingerprintMiss.ABSENT
+                            else ControlRefusal.AMBIGUOUS_ON_PAGE
+                        ),
+                        self._outcome(action),
+                        recorded=recorded,
+                    )
+                await asyncio.sleep(self.CONTROL_LOOKUP_INTERVAL_SECONDS)
+        self._resolved_fingerprint = fingerprints_for(descriptions, redact)[index]
+        return index
+
+    async def _find_control(self, action: BrowserAction) -> Locator:
+        index = await self._locate(action, self.CONTROL_LOOKUP_TIMEOUT_SECONDS)
+        return self._page.locator(CONTROL_SELECTOR).nth(index)
+
+    async def require_control(self, action: BrowserAction) -> None:
+        """Check that the action's control can be found, without acting on it.
+
+        Raises ``RecordedControlNotFoundError`` when a fingerprint does not
+        resolve and ``InvalidControlReferenceError`` when a position is not
+        on the page.
+        """
+
+        await self._locate(action, self.CONTROL_LOOKUP_TIMEOUT_SECONDS)
+
+    async def control_is_available(
+        self, action: BrowserAction, timeout_ms: float
+    ) -> bool:
+        """Whether the action's control is on the page and visible in time.
+
+        Used to notice that a multi-step flow ended early, so a control that
+        is missing, ambiguous or hidden gives ``False`` rather than an error.
+        """
+
+        if action.observed_control_id is None:
+            return True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_ms / 1000
+        if action.control_fingerprint is None:
+            number = self._parse_control_number(action.observed_control_id)
+            control = self._page.locator(CONTROL_SELECTOR).nth(number - 1)
+        else:
+            try:
+                index = await self._locate(action, timeout_ms / 1000)
+            except RecordedControlNotFoundError:
+                return False
+            control = self._page.locator(CONTROL_SELECTOR).nth(index)
+        remaining_ms = max((deadline - loop.time()) * 1000, 1)
+        try:
+            await control.wait_for(state="visible", timeout=remaining_ms)
+        except PlaywrightTimeoutError:
+            return False
+        return True
 
     def _parse_control_number(self, observed_control_id: str | None) -> int:
         if observed_control_id is None:

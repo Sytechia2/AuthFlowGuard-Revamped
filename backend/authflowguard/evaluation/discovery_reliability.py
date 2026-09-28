@@ -177,9 +177,9 @@ def render(
         ]
     else:
         lines += [
-            "Discovery in a scan started from the web interface is rule-based and does",
-            "not call Bedrock, so these figures need no AWS access. They do **not**",
-            "measure the terminal Bedrock agent, which stays unmeasured.",
+            "These scans used rule-based discovery, the default, which makes no AWS",
+            "calls. Bedrock discovery is also available to web scans, but is **not**",
+            "measured here: that needs AWS credentials and billable model calls.",
         ]
     lines += [
         "",

@@ -9,12 +9,13 @@ from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
 from enum import StrEnum
 from pathlib import Path
-from threading import RLock
-from typing import Any, Literal
+from threading import Lock, RLock
+from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
+from authflowguard.auth_profiles import login_discovery_source
 from authflowguard.authentication import (
     GuidedPageObservation,
     LoginFormDiscoveryError,
@@ -61,11 +62,20 @@ from authflowguard.checks.session_fixation import (
     run_session_fixation_check,
 )
 from authflowguard.config import (
+    BedrockServerSettings,
     load_server_settings,
     observation_timeout_seconds,
     validate_bedrock_configuration,
     worker_timeout_seconds,
 )
+from authflowguard.control_roles import (
+    LINK_ROLES,
+    LOGIN_ROLES,
+    ControlRole,
+    RoleContext,
+    ValidatedRoles,
+)
+from authflowguard.control_safety import SafeMessageError
 from authflowguard.evaluation.cost_tracking import (
     CostLedger,
     CostLedgerStore,
@@ -77,7 +87,25 @@ from authflowguard.evidence import (
     redact_persisted_data,
     transient_secret_redaction,
 )
+from authflowguard.feature_discovery import (
+    FeatureDiscoveryRequest,
+    ObservedControls,
+    RoleClassifier,
+)
+from authflowguard.login_suggestions import (
+    ClassificationBudget,
+    ControlClassificationClient,
+    SuggestedControls,
+    SuggestionStatus,
+    classification_objective,
+    classify_within_budget,
+    observation_for_classification,
+    rules_link_roles,
+    rules_suggestion,
+    with_link_suggestions,
+)
 from authflowguard.models import (
+    AuthFeature,
     AuthProfile,
     BrowserAction,
     CheckId,
@@ -87,6 +115,7 @@ from authflowguard.models import (
     DiscoveryProvenance,
     EvidenceEvent,
     EvidenceKind,
+    ExecutionLimits,
     ScanRequest,
     TestRunEvidence,
 )
@@ -221,8 +250,40 @@ class ScanWorkerUnavailableError(ScanManagerError):
     status_code = 503
 
 
+class ScanDeletionError(ScanManagerError):
+    code = "scan_deletion_failed"
+
+
 class GuidanceObservationError(ScanManagerError):
     code = "guidance_observation_failed"
+
+
+# The longest the developer waits for a model's control suggestions before
+# the observation is returned without them.
+CONTROL_SUGGESTION_TIMEOUT_SECONDS = 30.0
+
+
+def _limits_exceed_server(
+    limits: ExecutionLimits, settings: BedrockServerSettings
+) -> bool:
+    return (
+        limits.maximum_ai_decisions > settings.server_max_decisions
+        or limits.maximum_active_seconds > settings.server_max_seconds
+        or limits.maximum_inference_cost_usd > settings.server_max_cost_usd
+    )
+
+
+def public_failure_message(error: BaseException) -> str:
+    """Describe a failed scan without exposing exception text.
+
+    An exception message may contain secrets, so only a ``SafeMessageError``,
+    whose message is built from fixed wording, is shown. Any other error shows
+    its type alone, which is safe and still makes the failure diagnosable.
+    """
+
+    if isinstance(error, SafeMessageError):
+        return f"Scan execution failed: {error.safe_message}"
+    return f"Scan execution failed ({type(error).__name__})"
 
 
 class ScanExecutionInput(BaseModel):
@@ -246,6 +307,19 @@ class ScanExecutionInput(BaseModel):
     def secret_values(self) -> tuple[str, ...]:
         return tuple(value for value in self.runtime_secrets.values() if value)
 
+    def password_references(self) -> frozenset[str]:
+        """The references that hold passwords, and only those.
+
+        The browser types these only into password fields and types nothing
+        else into a password field. The failure and registration passwords are
+        passwords too: the checks type them into password fields.
+        """
+
+        references = {self.password_reference, self.failure_password_reference}
+        if self.registration_password_reference is not None:
+            references.add(self.registration_password_reference)
+        return frozenset(references)
+
     def redact_text(self, value: str) -> str:
         return redact_text(value, self.runtime_secrets.values())
 
@@ -257,6 +331,28 @@ class ScanExecutionInput(BaseModel):
         self.runtime_secrets.clear()
 
 
+ObservedControlId = Annotated[str, Field(pattern=r"^control-[1-9][0-9]{0,5}$")]
+
+
+class GuidedFeatureLinks(BaseModel):
+    """The developer's answers about the login page's other links.
+
+    Each is an observed control id, or None for "no such link". They pass
+    the same gate as suggested roles before anything is saved.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    registration_link: ObservedControlId | None = None
+    reset_link: ObservedControlId | None = None
+
+    def chosen(self) -> dict[ControlRole, str | None]:
+        return {
+            ControlRole.REGISTRATION_LINK: self.registration_link,
+            ControlRole.RESET_LINK: self.reset_link,
+        }
+
+
 class GuidanceSubmission(BaseModel):
     """Transient guided-flow input; actions are sanitized before they are saved."""
 
@@ -266,6 +362,8 @@ class GuidanceSubmission(BaseModel):
     protected_resource: HttpUrl | None = None
     account_marker_selector: str | None = None
     account_marker_description: str | None = None
+    # Absent from older clients: the links are then looked for by the rules.
+    feature_links: GuidedFeatureLinks | None = None
 
 
 class GuidanceObservationRequest(BaseModel):
@@ -333,8 +431,13 @@ class ScanManager:
         cancellation_grace_seconds: float = 3.0,
         worker_timeout: float | None = None,
         observation_timeout: float | None = None,
+        suggestion_timeout: float = CONTROL_SUGGESTION_TIMEOUT_SECONDS,
     ) -> None:
         self._store = EvidenceStore(data_root)
+        self._suggestion_timeout = suggestion_timeout
+        # One classification at a time, so concurrent observations cannot
+        # both pass the scan's cost check before either is reserved.
+        self._classification_lock = Lock()
         self._data_root = Path(data_root).resolve()
         self._worker_backend = worker_backend
         self._action_client_factory = action_client_factory
@@ -420,13 +523,7 @@ class ScanManager:
                     raise ScanBusyError("Another scan is already running")
                 if record.request.discovery_mode == DiscoveryMode.BEDROCK:
                     settings = load_server_settings()
-                    limits = record.request.limits
-                    if (
-                        limits.maximum_ai_decisions > settings.server_max_decisions
-                        or limits.maximum_active_seconds > settings.server_max_seconds
-                        or limits.maximum_inference_cost_usd
-                        > settings.server_max_cost_usd
-                    ):
+                    if _limits_exceed_server(record.request.limits, settings):
                         raise ScanConfigurationError(
                             "Requested Bedrock limits exceed server maximum limits"
                         )
@@ -589,13 +686,278 @@ class ScanManager:
             raise RuntimeError("Guidance observation cancelled")
         self._save_events(record, [safe_event])
         safe_controls = safe_event.redacted_details.get("controls", [])
+        controls = safe_controls if isinstance(safe_controls, list) else []
+        page_url = safe_event.redacted_details.get("url")
+        page_title = safe_event.redacted_details.get("title")
+        suggestions = await self._suggest_login_controls(
+            record,
+            page_url if isinstance(page_url, str) else "",
+            page_title if isinstance(page_title, str) else "",
+            [control for control in controls if isinstance(control, dict)],
+        )
         return {
             "scan_id": str(record.scan_id),
             "event_id": str(safe_event.event_id),
-            "url": safe_event.redacted_details.get("url"),
-            "title": safe_event.redacted_details.get("title"),
-            "controls": safe_controls if isinstance(safe_controls, list) else [],
+            "url": page_url,
+            "title": page_title,
+            "controls": controls,
+            "suggested_controls": suggestions.as_response(),
         }
+
+    async def _suggest_login_controls(
+        self,
+        record: ScanRecord,
+        page_url: str,
+        page_title: str,
+        controls: list[dict[str, Any]],
+    ) -> SuggestedControls:
+        """Suggest the login controls: the rules first, then a model if allowed.
+
+        The registration and reset links are suggested too: by the rules,
+        and by the model only as extra roles in the request made for the
+        login controls, never in a request of their own.
+
+        Never raises: a model failure returns the observation without
+        suggestions and a status that says why.
+        """
+
+        rules_links = ValidatedRoles()
+        try:
+            context = RoleContext(record.request.target, page_url) if page_url else None
+            rules_links = rules_link_roles(controls, context)
+            rules = rules_suggestion(controls)
+            if rules is not None:
+                return with_link_suggestions(rules, rules_links)
+            if record.request.discovery_mode != DiscoveryMode.BEDROCK:
+                return with_link_suggestions(
+                    SuggestedControls(status=SuggestionStatus.NOT_DETECTED),
+                    rules_links,
+                )
+            if record.cancel_requested:
+                return with_link_suggestions(
+                    SuggestedControls(status=SuggestionStatus.AI_UNAVAILABLE),
+                    rules_links,
+                )
+            prepared = self._prepare_classification(record)
+            if isinstance(prepared, SuggestedControls):
+                return with_link_suggestions(prepared, rules_links)
+            client, budget = prepared
+            roles = (
+                *LOGIN_ROLES,
+                *(role for role in LINK_ROLES if rules_links.control_for(role) is None),
+            )
+            execution = record.pending_execution
+            observation = observation_for_classification(
+                page_url=page_url,
+                page_title=page_title,
+                controls=controls,
+                redact=execution.redact_text if execution is not None else str,
+                objective=classification_objective(roles),
+            )
+        except Exception:
+            return with_link_suggestions(
+                SuggestedControls(status=SuggestionStatus.AI_FAILED), rules_links
+            )
+
+        try:
+            suggestions = await asyncio.wait_for(
+                asyncio.to_thread(
+                    classify_within_budget,
+                    client,
+                    observation,
+                    controls,
+                    budget,
+                    self._classification_lock,
+                    roles=roles,
+                    context=context,
+                ),
+                timeout=self._suggestion_timeout,
+            )
+        except TimeoutError:
+            suggestions = SuggestedControls(
+                status=SuggestionStatus.AI_TIMED_OUT, model_requests=1
+            )
+        except Exception:
+            suggestions = SuggestedControls(status=SuggestionStatus.AI_FAILED)
+        self._record_classification_usage(record, budget, suggestions)
+        return with_link_suggestions(suggestions, rules_links)
+
+    def _role_classifier(
+        self, record: ScanRecord, execution: ScanExecutionInput
+    ) -> RoleClassifier | None:
+        """Ask a model for roles during a scan, within its limits and ledger.
+
+        Only a scan using Bedrock discovery gets a classifier. Each request
+        is prepared, reserved and reconciled exactly like the observation's
+        suggestion request; any limit, failure or timeout answers None.
+        """
+
+        if record.request.discovery_mode != DiscoveryMode.BEDROCK:
+            return None
+
+        async def classify(
+            observed: ObservedControls,
+            roles: tuple[ControlRole, ...],
+            context: RoleContext,
+        ) -> ValidatedRoles | None:
+            if record.cancel_requested:
+                return None
+            try:
+                prepared = self._prepare_classification(record)
+                if isinstance(prepared, SuggestedControls):
+                    return None
+                client, budget = prepared
+                observation = observation_for_classification(
+                    page_url=observed.page_url,
+                    page_title=observed.page_title,
+                    controls=observed.controls,
+                    redact=execution.redact_text,
+                    objective=classification_objective(roles),
+                )
+            except Exception:
+                return None
+            try:
+                suggestions = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        classify_within_budget,
+                        client,
+                        observation,
+                        observed.controls,
+                        budget,
+                        self._classification_lock,
+                        roles=roles,
+                        context=context,
+                    ),
+                    timeout=self._suggestion_timeout,
+                )
+            except TimeoutError:
+                suggestions = SuggestedControls(
+                    status=SuggestionStatus.AI_TIMED_OUT, model_requests=1
+                )
+            except Exception:
+                suggestions = SuggestedControls(status=SuggestionStatus.AI_FAILED)
+            self._record_classification_usage(record, budget, suggestions)
+            return suggestions.roles
+
+        return classify
+
+    def _feature_discovery(
+        self,
+        record: ScanRecord,
+        execution: ScanExecutionInput,
+        guidance: GuidanceSubmission | None = None,
+    ) -> FeatureDiscoveryRequest:
+        """What to look for after the login, from the checks this scan runs.
+
+        A developer's guided answer about a link is saved whichever checks
+        run, and replaces the rules' search for that link.
+        """
+
+        selected = set(record.request.selected_checks)
+        features: set[AuthFeature] = set()
+        if CheckId.REGISTRATION_ENUMERATION in selected:
+            features.add(AuthFeature.REGISTRATION)
+        if CheckId.RESET_REQUEST_ENUMERATION in selected:
+            features.add(AuthFeature.RESET_REQUEST)
+        if CheckId.LOGOUT_INVALIDATION in selected:
+            features.add(AuthFeature.LOGOUT)
+        chosen: dict[ControlRole, str | None] | None = None
+        if guidance is not None and guidance.feature_links is not None:
+            chosen = guidance.feature_links.chosen()
+            if chosen[ControlRole.REGISTRATION_LINK]:
+                features.add(AuthFeature.REGISTRATION)
+            if chosen[ControlRole.RESET_LINK]:
+                features.add(AuthFeature.RESET_REQUEST)
+        return FeatureDiscoveryRequest(
+            features=frozenset(features),
+            classify=self._role_classifier(record, execution),
+            chosen_links=chosen,
+        )
+
+    def _prepare_classification(
+        self, record: ScanRecord
+    ) -> tuple[ControlClassificationClient, ClassificationBudget] | SuggestedControls:
+        """Decide whether this scan may ask a model, as a scan start does.
+
+        The caller has checked that the scan uses Bedrock discovery. Its
+        limits must be within the server's, it must have model requests
+        left, and Bedrock must be configured unless a client factory was
+        given (tests and offline runs). The budget is checked when the
+        request is reserved.
+        """
+
+        settings = load_server_settings()
+        limits = record.request.limits
+        if _limits_exceed_server(limits, settings):
+            return SuggestedControls(status=SuggestionStatus.AI_UNAVAILABLE)
+        if record.model_request_count >= limits.maximum_ai_decisions:
+            return SuggestedControls(status=SuggestionStatus.AI_DECISION_LIMIT_REACHED)
+        client: object
+        if self._action_client_factory is not None:
+            client = self._action_client_factory()
+            source = UsageSource.MOCK
+        else:
+            is_valid, _reason = validate_bedrock_configuration(settings)
+            if not is_valid:
+                return SuggestedControls(status=SuggestionStatus.AI_UNAVAILABLE)
+            client = BedrockActionClient(
+                BedrockConfiguration(
+                    aws_profile=settings.aws_profile,
+                    aws_region=settings.aws_region,
+                    model_id=settings.model_id,
+                    max_output_tokens=settings.max_output_tokens,
+                    maximum_estimated_cost_usd=settings.maximum_estimated_cost_usd,
+                )
+            )
+            source = UsageSource.LIVE
+        if not isinstance(client, ControlClassificationClient):
+            return SuggestedControls(status=SuggestionStatus.AI_UNAVAILABLE)
+        ledger_store = CostLedgerStore(
+            self._store.scan_directory(record.scan_id) / "cost-ledger.ndjson"
+        )
+        try:
+            ledger = ledger_store.load_into()
+        except (OSError, ValueError):
+            # Spending against a ledger that cannot be read could pass the
+            # scan's cost limit unnoticed.
+            return SuggestedControls(status=SuggestionStatus.AI_UNAVAILABLE)
+        return client, ClassificationBudget(
+            scan_id=record.scan_id,
+            limit_usd=limits.maximum_inference_cost_usd,
+            ledger=ledger,
+            ledger_store=ledger_store,
+            usage_source=source,
+            model_id=settings.model_id,
+        )
+
+    def _record_classification_usage(
+        self,
+        record: ScanRecord,
+        budget: ClassificationBudget,
+        suggestions: SuggestedControls,
+    ) -> None:
+        """Show a classification request in the scan's usage like any other."""
+
+        with self._lock:
+            record.model_request_count += suggestions.model_requests
+            if suggestions.answered:
+                record.decision_count += 1
+                record.total_input_tokens += suggestions.input_tokens
+                record.total_output_tokens += suggestions.output_tokens
+            record.cost_ledger = budget.ledger
+            record.cost_ledger_damaged = False
+            record.estimated_cost_usd = float(budget.ledger.total_observed_cost_usd())
+            record.unresolved_reservations_usd = float(
+                budget.ledger.total_unresolved_reservations_usd()
+            )
+            if (
+                suggestions.model_requests
+                and record.provenance is not None
+                and record.provenance.usage_source == "none"
+            ):
+                record.provenance.usage_source = budget.usage_source.value
+                record.provenance.model_id = budget.model_id
+            self._persist_state(record)
 
     async def _observe_guidance_in_process(
         self,
@@ -746,6 +1108,28 @@ class ScanManager:
                     "The guided scan worker could not be started"
                 ) from None
             return record
+
+    def delete_scan(self, scan_id: UUID) -> None:
+        """Remove an inactive scan with its evidence, results, and reports."""
+
+        with self._lock:
+            record = self._records.get(scan_id)
+            if record is None and scan_id not in self._recovery_errors:
+                raise ScanNotFoundError(f"Scan '{scan_id}' was not found")
+            if record is not None and (
+                self._is_active(record) or record.state is ScanState.AWAITING_GUIDANCE
+            ):
+                raise InvalidScanStateError("Cancel the scan before deleting it")
+            try:
+                self._store.delete_scan(scan_id)
+            except OSError:
+                raise ScanDeletionError(
+                    "The scan files are in use and could not be deleted"
+                ) from None
+            if record is not None:
+                self._discard_pending_execution(record)
+            self._records.pop(scan_id, None)
+            self._recovery_errors.pop(scan_id, None)
 
     def list_scans(self) -> list[ScanRecord]:
         with self._lock:
@@ -1188,6 +1572,7 @@ class ScanManager:
             saved_profile: AuthProfile | None = None
             if record.request.reuse_saved_profile:
                 saved_profile = self._find_saved_profile(record, execution)
+            feature_discovery = self._feature_discovery(record, execution)
 
             try:
                 if saved_profile is not None:
@@ -1200,12 +1585,15 @@ class ScanManager:
                         profile=saved_profile,
                         scan_id=record.scan_id,
                         runtime_secrets=runtime_secrets,
+                        password_references=execution.password_references(),
                     )
                     profile_execution = await replay_verified_auth_profile(
                         profile=saved_profile,
                         scan_id=record.scan_id,
                         runtime_secrets=runtime_secrets,
+                        password_references=execution.password_references(),
                         account_marker_selector=execution.account_marker_selector,
+                        feature_discovery=feature_discovery,
                     )
                 elif record.request.discovery_mode == DiscoveryMode.BEDROCK:
                     record.phase = "discovering"
@@ -1279,6 +1667,7 @@ class ScanManager:
                         cost_ledger=record.cost_ledger,
                         usage_source=source,
                         model_id=model_id,
+                        feature_discovery=feature_discovery,
                     )
                     if record.cost_ledger:
                         record.estimated_cost_usd = float(
@@ -1302,6 +1691,7 @@ class ScanManager:
                         protected_resource=str(execution.protected_resource),
                         account_marker_selector=execution.account_marker_selector,
                         account_marker_description=execution.account_marker_description,
+                        feature_discovery=feature_discovery,
                     )
             except (LoginFormDiscoveryError, ValueError) as error:
                 with self._lock:
@@ -1367,9 +1757,11 @@ class ScanManager:
                 target=record.request.target,
                 runtime_secrets=runtime_secrets,
                 actions=guidance.actions,
+                password_references=execution.password_references(),
                 protected_resource=str(execution.protected_resource),
                 account_marker_selector=execution.account_marker_selector,
                 account_marker_description=execution.account_marker_description,
+                feature_discovery=self._feature_discovery(record, execution, guidance),
             )
             await self._complete_profile_execution(
                 record,
@@ -1435,6 +1827,7 @@ class ScanManager:
                         known_identifier_reference=execution.username_reference,
                         nonexistent_identifier_reference=execution.nonexistent_identifier_reference,
                         failure_password_reference=execution.failure_password_reference,
+                        password_references=execution.password_references(),
                         cancel_requested=record.cancellation.is_requested,
                     )
                 elif check_id is CheckId.RESET_REQUEST_ENUMERATION:
@@ -1718,7 +2111,7 @@ class ScanManager:
                 error_code = "scan_cancelled"
             else:
                 next_state = ScanState.FAILED
-                public_error = "Scan execution failed"
+                public_error = public_failure_message(error)
                 error_code = "scan_execution_failed"
             self._discard_pending_execution(record)
             record.active_check = None
@@ -1787,6 +2180,7 @@ class ScanManager:
         self._store.update_metadata(record.scan_id, metadata)
 
     def _load_persisted_scans(self) -> None:
+        self._store.purge_deleted_scans()
         for scan_id in self._store.list_scan_ids():
             try:
                 metadata = self._store.read_metadata(scan_id)
@@ -2023,8 +2417,9 @@ class ScanManager:
             "error": record.error,
             "error_code": record.error_code,
             "profile_source": (
-                record.profile.discovery_history[-1].source.value
-                if record.profile and record.profile.discovery_history
+                source.value
+                if record.profile
+                and (source := login_discovery_source(record.profile)) is not None
                 else None
             ),
             "guidance_required": record.state is ScanState.AWAITING_GUIDANCE,

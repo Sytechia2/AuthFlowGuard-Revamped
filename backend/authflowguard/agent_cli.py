@@ -158,6 +158,7 @@ async def run_live_session(
                     DEFAULT_USERNAME_REFERENCE,
                     DEFAULT_PASSWORD_REFERENCE,
                 ],
+                password_references=frozenset({DEFAULT_PASSWORD_REFERENCE}),
                 progress_callback=print_progress,
                 cost_ledger_store=ledger_store,
                 cost_ledger=cost_ledger,

@@ -1,10 +1,11 @@
 """Measures what a scan consumed, from saved evidence only.
 
 EVA-008 asks for browser request counts, model usage, cost, and durations.
-Model usage and cost need live Bedrock calls, which scans started from the web
-interface do not make; those stay unmeasured and are reported as such. Browser
-request volume and scan duration are recorded in saved evidence and are
-measured here.
+Model usage and cost need live Bedrock calls. The measured scans use
+rule-based discovery, the default, which makes none; Bedrock discovery is
+available but was not run live, so model usage stays unmeasured and is
+reported as such. Browser request volume and scan duration are recorded in
+saved evidence and are measured here.
 """
 
 import json
@@ -98,8 +99,9 @@ def render(measurements: list[ScanMeasurement]) -> str:
         "| --- | --- |",
         "| Browser request volume | Measured, from the saved event log |",
         "| Scan duration | Measured, wall clock per case |",
-        "| Model input/output tokens | **Not measured** — no Bedrock calls |",
-        "| Estimated cost before credits | **Not measured** — no model calls |",
+        "| Model input/output tokens | **Not measured** — rule-based scans make no "
+        "Bedrock calls |",
+        "| Estimated cost before credits | **Not measured** — no live model calls |",
         "",
         "Cost accounting is implemented and tested in",
         "`authflowguard.evaluation.cost_model` and `cost_tracking`. It reuses the",

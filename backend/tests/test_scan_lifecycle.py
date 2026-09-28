@@ -8,6 +8,11 @@ from uuid import uuid4
 
 import pytest
 from authflowguard.app import create_app
+from authflowguard.control_safety import (
+    ControlOutcome,
+    ControlRefusal,
+    UnsafeControlError,
+)
 from authflowguard.models import CheckId, ScanRequest
 from authflowguard.scan_manager import ScanExecutionInput, ScanManager, ScanState
 from fastapi.testclient import TestClient
@@ -198,6 +203,7 @@ def test_stale_worker_generation_cannot_finalize_newer_execution(
     )
     assert record.state is ScanState.FAILED
     assert record.error_code == "scan_execution_failed"
+    assert record.error == "Scan execution failed (RuntimeError)"
 
 
 @pytest.mark.parametrize(
@@ -245,3 +251,76 @@ def test_corrupt_scan_metadata_is_reported_instead_of_hidden(tmp_path: Path) -> 
         "code": "scan_recovery_failed",
         "detail": "The persisted scan could not be recovered safely",
     }
+
+
+SECRET_CANARY = "canary-secret-7q2x"
+
+
+def _run_failing_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> tuple[str, str]:
+    """Fail discovery with ``error``; return the scan's error and its metadata."""
+
+    manager = ScanManager(tmp_path, worker_backend="thread")
+    record = manager.create_scan(_request())
+
+    async def fail_login(**_kwargs: Any) -> None:
+        raise error
+
+    monkeypatch.setattr(
+        "authflowguard.scan_manager.execute_verified_login_flow", fail_login
+    )
+    execution = ScanExecutionInput.model_validate(
+        {**_execution_json(), "runtime_secrets": {"password": SECRET_CANARY}}
+    )
+    manager.start_scan(record.scan_id, execution)
+    assert record.future is not None
+    record.future.result(timeout=5)
+
+    assert record.state is ScanState.FAILED
+    assert record.error is not None
+    metadata = (tmp_path / str(record.scan_id) / "metadata.json").read_text(
+        encoding="utf-8"
+    )
+    return record.error, metadata
+
+
+def test_safe_message_error_reaches_the_scan_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The Playwright message quotes the typed value; it is kept only as the
+    # chained cause and must never be surfaced.
+    try:
+        try:
+            raise TimeoutError(f'locator.fill("{SECRET_CANARY}"): Timeout exceeded')
+        except TimeoutError as cause:
+            raise UnsafeControlError(
+                "control-16",
+                ControlRefusal.NOT_EDITABLE_IN_TIME,
+                ControlOutcome.PASSWORD_NOT_TYPED,
+            ).at_step(2) from cause
+    except UnsafeControlError as caught:
+        error = caught
+
+    public_error, metadata = _run_failing_scan(tmp_path, monkeypatch, error)
+
+    assert public_error == (
+        "Scan execution failed: Step 2: control-16 did not become editable "
+        "within the time limit, so the password was not typed into it."
+    )
+    assert SECRET_CANARY not in public_error
+    assert SECRET_CANARY not in metadata
+    assert json.loads(metadata)["error"] == public_error
+
+
+def test_other_errors_still_show_only_their_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    public_error, metadata = _run_failing_scan(
+        tmp_path,
+        monkeypatch,
+        RuntimeError(f'locator.fill("{SECRET_CANARY}"): Timeout exceeded'),
+    )
+
+    assert public_error == "Scan execution failed (RuntimeError)"
+    assert SECRET_CANARY not in metadata
