@@ -19,6 +19,11 @@ ACTION_TOOL_NAME = "choose_browser_action"
 CLASSIFICATION_TOOL_NAME = "assign_control_roles"
 # More assignments than any login page needs; the rest are discarded unread.
 MAXIMUM_ROLE_ASSIGNMENTS = 20
+# The classification answer's own output limit. Each assignment costs about
+# 20 tokens, so the action request's small limit cut off a five-role answer
+# mid-way in a live run (Bedrock then rejects the incomplete tool call and
+# reports no usage). This fits MAXIMUM_ROLE_ASSIGNMENTS with room to spare.
+CLASSIFICATION_MAX_OUTPUT_TOKENS = 512
 
 CLASSIFICATION_SYSTEM_PROMPT = (
     "Identify the authentication controls in the supplied page observation. "
@@ -362,7 +367,7 @@ class BedrockActionClient:
                 }
             ],
             "inferenceConfig": {
-                "maxTokens": self._configuration.max_output_tokens,
+                "maxTokens": CLASSIFICATION_MAX_OUTPUT_TOKENS,
                 "temperature": 0,
             },
             "toolConfig": {
@@ -500,9 +505,13 @@ class BedrockActionClient:
         # Treat every character as a token. This intentionally overestimates normal
         # English and JSON input so the reservation is conservative.
         estimated_input_tokens = len(serialized_request)
+        # Reserve the output limit this request actually sets.
+        output_limit = request.get("inferenceConfig", {}).get(
+            "maxTokens", self._configuration.max_output_tokens
+        )
         return self._calculate_cost(
             input_tokens=estimated_input_tokens,
-            output_tokens=self._configuration.max_output_tokens,
+            output_tokens=int(output_limit),
         )
 
     def _read_action(self, response: dict[str, Any]) -> BrowserAction:
