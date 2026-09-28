@@ -47,8 +47,20 @@ class LogoutInvalidationRun:
 LOGOUT_LABEL = re.compile(r"\b(log|sign)\s*-?\s*(out|off)\b", re.IGNORECASE)
 LOGOUT_URL = re.compile(r"(log|sign)[-_]?(out|off)", re.IGNORECASE)
 MENU_LABEL = re.compile(r"account|user|profile|menu", re.IGNORECASE)
+# The search runs signed in, often on an account page. A control named for an
+# irreversible account action is never clicked, whatever else it matches.
+DESTRUCTIVE_LABEL = re.compile(
+    r"\b(delete|remove|close|deactivate|disable|cancel|erase|terminate|"
+    r"unsubscribe)\b",
+    re.IGNORECASE,
+)
 CLICKABLE = 'button, a[href], [role="button"], [role="menuitem"]'
-MENU_TOGGLE = f'{CLICKABLE}, [aria-haspopup="true"], [aria-haspopup="menu"]'
+# Only buttons that declare a popup or expandable region are opened as menus:
+# a link navigates away, and a plain button performs its action.
+MENU_TOGGLE = (
+    ':is(button, [role="button"])'
+    ':is([aria-haspopup="true"], [aria-haspopup="menu"], [aria-expanded])'
+)
 MAX_MENU_TOGGLES = 3
 
 
@@ -99,7 +111,10 @@ async def _find_visible_control(
     controls = page.locator(selector)
     for index in range(await controls.count()):
         control = controls.nth(index)
-        if await control.is_visible() and label.search(await _control_label(control)):
+        if not await control.is_visible():
+            continue
+        text = await _control_label(control)
+        if label.search(text) and not DESTRUCTIVE_LABEL.search(text):
             return control
     return None
 
@@ -117,11 +132,17 @@ async def _find_logout_control(page: Any) -> Any:
         toggle = toggles.nth(index)
         if not await toggle.is_visible():
             continue
-        if not MENU_LABEL.search(await _control_label(toggle)):
+        text = await _control_label(toggle)
+        if not MENU_LABEL.search(text) or DESTRUCTIVE_LABEL.search(text):
             continue
+        url_before = page.url
         await toggle.click()
         opened += 1
         await page.wait_for_timeout(300)
+        if page.url != url_before:
+            # Opening a menu does not navigate. The remaining toggles belong
+            # to a page that was never inspected, so stop searching here.
+            return None
         control = await _find_visible_control(page, CLICKABLE, LOGOUT_LABEL)
         if control is not None:
             return control

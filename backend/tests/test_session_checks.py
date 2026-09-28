@@ -9,6 +9,7 @@ import pytest
 from authflowguard.authentication import VerifiedLoginExecution
 from authflowguard.checks.logout_invalidation import (
     LogoutInvalidationRun,
+    _find_logout_control,
     analyse_logout_invalidation,
     run_logout_invalidation_check,
 )
@@ -44,6 +45,7 @@ from authflowguard.scan_manager import ScanExecutionInput, ScanManager, ScanStat
 from authflowguard.secrets import RuntimeSecrets
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from playwright.async_api import async_playwright
 from test_form_enumeration import serve
 
 
@@ -491,3 +493,62 @@ def test_client_side_menu_logout_is_found_and_reported() -> None:
     assert observations["post_logout_control"]["marker_present"] is False
     result = analyse_logout_invalidation(run.evidence, profile, SecurityPolicy())
     assert result.outcome is CheckOutcome.FINDING_CONFIRMED
+
+
+async def _search_for_logout(html: str) -> tuple[str | None, list[str]]:
+    """Run the logout search on a page and report what it clicked."""
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            await page.set_content(html)
+            control = await _find_logout_control(page)
+            label = " ".join((await control.inner_text()).split()) if control else None
+            return label, await page.evaluate("window.clicked")
+        finally:
+            await browser.close()
+
+
+def test_logout_search_never_clicks_destructive_or_navigating_controls() -> None:
+    """Controls whose labels mention the account, but that act or navigate
+    rather than open a menu, sit before the real account menu."""
+
+    found, clicked = asyncio.run(
+        _search_for_logout(
+            """<script>window.clicked = [];</script>
+            <button aria-haspopup="true" onclick="clicked.push('delete')">
+                Delete account</button>
+            <button aria-expanded="false" onclick="clicked.push('close')">
+                Close my profile</button>
+            <a href="#/account" onclick="clicked.push('link')">My account</a>
+            <button onclick="clicked.push('plain')">Edit profile</button>
+            <button aria-haspopup="menu" onclick="clicked.push('menu');
+                    document.getElementById('menu').hidden = false">
+                Account</button>
+            <div id="menu" hidden>
+                <button onclick="clicked.push('delete-in-menu')">
+                    Log out and delete account</button>
+                <button>Log out</button>
+            </div>"""
+        )
+    )
+
+    assert found == "Log out"
+    assert clicked == ["menu"]
+
+
+def test_logout_search_stops_when_a_toggle_navigates() -> None:
+    found, clicked = asyncio.run(
+        _search_for_logout(
+            """<script>window.clicked = [];</script>
+            <button aria-haspopup="true"
+                    onclick="clicked.push('user'); location.hash = '#/users'">
+                Users</button>
+            <button aria-haspopup="menu" onclick="clicked.push('menu')">
+                Account</button>"""
+        )
+    )
+
+    assert found is None
+    assert clicked == ["user"]
