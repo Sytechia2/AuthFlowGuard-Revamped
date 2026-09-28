@@ -1049,6 +1049,7 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
   }, [scanId]);
 
   async function observePage() {
+    const requestedUrl = observationUrl.trim();
     setIsObserving(true);
     setError(null);
     try {
@@ -1057,17 +1058,20 @@ function DiscoveryView({ scanId, onSubmitted }: DiscoveryViewProps) {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: observationUrl.trim() }),
+          body: JSON.stringify({ url: requestedUrl }),
         },
       );
       if (!response.ok)
         throw new Error("The target page could not be observed.");
       const observed = (await response.json()) as GuidanceObservation;
       setObservation(observed);
+      // Navigate to the address the user typed: the observed URL can lose a
+      // hash route such as #/login and replay would open the app's home page.
+      const navigateUrl = requestedUrl || (observed.url ?? "");
       setActions((currentActions) =>
         currentActions.map((action, index) =>
           index === 0
-            ? { ...action, url: observed.url ?? "" }
+            ? { ...action, url: navigateUrl }
             : { ...action, controlId: "" },
         ),
       );

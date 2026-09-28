@@ -26,7 +26,11 @@ from authflowguard.models import (
     TrafficReference,
 )
 from authflowguard.page_settling import goto_and_settle
-from authflowguard.scope import url_is_in_scope, url_without_query_or_fragment
+from authflowguard.scope import (
+    url_is_in_scope,
+    url_without_query_keeping_route,
+    url_without_query_or_fragment,
+)
 
 CONTROL_SELECTOR = "input, button, select, textarea, a[href]"
 READ_CONTROLS_SCRIPT = r"""selector => [...document.querySelectorAll(selector)]
@@ -206,7 +210,7 @@ class PlaywrightWorker:
             kind=EvidenceKind.PAGE_STATE,
             summary="The browser recorded the visible page controls.",
             redacted_details={
-                "url": url_without_query_or_fragment(page.url),
+                "url": url_without_query_keeping_route(page.url),
                 "title": await page.title(),
                 "controls": controls,
             },

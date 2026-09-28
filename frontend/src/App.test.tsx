@@ -356,7 +356,9 @@ describe("setup workflow", () => {
         url: "/api/scans/guided-scan/guidance/observe",
         method: "POST",
         response: {
-          url: "https://staging.example.test/login",
+          // The observed page URL has no fragment, like the backend's
+          // record of a hash-routed single-page app.
+          url: "https://staging.example.test/",
           title: "Sign in",
           controls: [
             {
@@ -450,6 +452,9 @@ describe("setup workflow", () => {
     expect(
       screen.getByRole("button", { name: "Cancel scan" }),
     ).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Login page address"), {
+      target: { value: "  https://staging.example.test/#/login  " },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Find login fields" }));
     await waitFor(() => {
       expect(screen.getByText("control-5")).toBeInTheDocument();
@@ -473,6 +478,24 @@ describe("setup workflow", () => {
         expect.objectContaining({ method: "POST" }),
       );
     });
+    const requestBody = (url: string) => {
+      const call = fetchMock.mock.calls.find(([input]) => input === url) as
+        [string, RequestInit] | undefined;
+      return JSON.parse(String(call?.[1].body)) as {
+        url?: string;
+        actions?: { action_type: string; url?: string }[];
+      };
+    };
+    expect(requestBody("/api/scans/guided-scan/guidance/observe").url).toBe(
+      "https://staging.example.test/#/login",
+    );
+    // Replay must open the hash route the user typed, not the app's home page.
+    expect(requestBody("/api/scans/guided-scan/guidance").actions?.[0]).toEqual(
+      expect.objectContaining({
+        action_type: "navigate",
+        url: "https://staging.example.test/#/login",
+      }),
+    );
   });
 
   test("navigation switches between testing and results views", () => {
