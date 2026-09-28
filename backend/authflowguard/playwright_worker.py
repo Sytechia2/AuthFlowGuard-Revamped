@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 from uuid import UUID, uuid4
 
 from playwright.async_api import (
@@ -43,11 +43,26 @@ READ_CONTROLS_SCRIPT = r"""selector => [...document.querySelectorAll(selector)]
                 .includes(type)) {
             value_present = element.value !== '';
         }
-        let text = null;
-        if (tag === 'button' || tag === 'a' || type === 'button' || type === 'submit') {
-            const raw = (element.innerText || '').split(/\s+/).join(' ').trim();
-            text = raw ? raw.slice(0, 60) : null;
+        const inputKind = tag === 'input' ? (type || '').toLowerCase() : null;
+        let raw = null;
+        if (['button', 'submit', 'reset'].includes(inputKind)) {
+            // A button-like input shows its value as its label; no other
+            // field's value is read, because it may be a credential.
+            raw = element.getAttribute('value');
+        } else if (inputKind === 'image') {
+            raw = element.getAttribute('alt');
+        } else if (tag === 'button' || tag === 'a'
+            || type === 'button' || type === 'submit') {
+            raw = element.innerText;
         }
+        raw = (raw || '').split(/\s+/).join(' ').trim();
+        const text = raw ? raw.slice(0, 60) : null;
+        // Which form the control belongs to, as its position among the
+        // page's forms, so controls can be grouped without reading them.
+        const owner = element.form || element.closest('form');
+        const formPosition = owner
+            ? Array.prototype.indexOf.call(document.forms, owner)
+            : -1;
         const rect = element.getBoundingClientRect();
         const style = getComputedStyle(element);
         return {
@@ -64,6 +79,7 @@ READ_CONTROLS_SCRIPT = r"""selector => [...document.querySelectorAll(selector)]
             value_present,
             visible: rect.width > 0 && rect.height > 0
                 && style.visibility !== 'hidden',
+            form_index: formPosition >= 0 ? formPosition : null,
         };
     })"""
 
@@ -92,6 +108,9 @@ class SafeControlDescription(TypedDict):
     role: str | None
     value_present: bool | None
     visible: bool
+    # The control's form as its position among the page's forms; None when
+    # it is in no form. Absent from observations saved before it existed.
+    form_index: NotRequired[int | None]
 
 
 class PlaywrightWorker:

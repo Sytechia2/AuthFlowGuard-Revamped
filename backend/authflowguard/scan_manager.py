@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
 from enum import StrEnum
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
@@ -61,6 +61,7 @@ from authflowguard.checks.session_fixation import (
     run_session_fixation_check,
 )
 from authflowguard.config import (
+    BedrockServerSettings,
     load_server_settings,
     observation_timeout_seconds,
     validate_bedrock_configuration,
@@ -78,6 +79,15 @@ from authflowguard.evidence import (
     redact_persisted_data,
     transient_secret_redaction,
 )
+from authflowguard.login_suggestions import (
+    ClassificationBudget,
+    ControlClassificationClient,
+    SuggestedControls,
+    SuggestionStatus,
+    classify_within_budget,
+    observation_for_classification,
+    rules_suggestion,
+)
 from authflowguard.models import (
     AuthProfile,
     BrowserAction,
@@ -88,6 +98,7 @@ from authflowguard.models import (
     DiscoveryProvenance,
     EvidenceEvent,
     EvidenceKind,
+    ExecutionLimits,
     ScanRequest,
     TestRunEvidence,
 )
@@ -226,6 +237,21 @@ class GuidanceObservationError(ScanManagerError):
     code = "guidance_observation_failed"
 
 
+# The longest the developer waits for a model's control suggestions before
+# the observation is returned without them.
+CONTROL_SUGGESTION_TIMEOUT_SECONDS = 30.0
+
+
+def _limits_exceed_server(
+    limits: ExecutionLimits, settings: BedrockServerSettings
+) -> bool:
+    return (
+        limits.maximum_ai_decisions > settings.server_max_decisions
+        or limits.maximum_active_seconds > settings.server_max_seconds
+        or limits.maximum_inference_cost_usd > settings.server_max_cost_usd
+    )
+
+
 def public_failure_message(error: BaseException) -> str:
     """Describe a failed scan without exposing exception text.
 
@@ -360,8 +386,13 @@ class ScanManager:
         cancellation_grace_seconds: float = 3.0,
         worker_timeout: float | None = None,
         observation_timeout: float | None = None,
+        suggestion_timeout: float = CONTROL_SUGGESTION_TIMEOUT_SECONDS,
     ) -> None:
         self._store = EvidenceStore(data_root)
+        self._suggestion_timeout = suggestion_timeout
+        # One classification at a time, so concurrent observations cannot
+        # both pass the scan's cost check before either is reserved.
+        self._classification_lock = Lock()
         self._data_root = Path(data_root).resolve()
         self._worker_backend = worker_backend
         self._action_client_factory = action_client_factory
@@ -447,13 +478,7 @@ class ScanManager:
                     raise ScanBusyError("Another scan is already running")
                 if record.request.discovery_mode == DiscoveryMode.BEDROCK:
                     settings = load_server_settings()
-                    limits = record.request.limits
-                    if (
-                        limits.maximum_ai_decisions > settings.server_max_decisions
-                        or limits.maximum_active_seconds > settings.server_max_seconds
-                        or limits.maximum_inference_cost_usd
-                        > settings.server_max_cost_usd
-                    ):
+                    if _limits_exceed_server(record.request.limits, settings):
                         raise ScanConfigurationError(
                             "Requested Bedrock limits exceed server maximum limits"
                         )
@@ -616,13 +641,164 @@ class ScanManager:
             raise RuntimeError("Guidance observation cancelled")
         self._save_events(record, [safe_event])
         safe_controls = safe_event.redacted_details.get("controls", [])
+        controls = safe_controls if isinstance(safe_controls, list) else []
+        page_url = safe_event.redacted_details.get("url")
+        page_title = safe_event.redacted_details.get("title")
+        suggestions = await self._suggest_login_controls(
+            record,
+            page_url if isinstance(page_url, str) else "",
+            page_title if isinstance(page_title, str) else "",
+            [control for control in controls if isinstance(control, dict)],
+        )
         return {
             "scan_id": str(record.scan_id),
             "event_id": str(safe_event.event_id),
-            "url": safe_event.redacted_details.get("url"),
-            "title": safe_event.redacted_details.get("title"),
-            "controls": safe_controls if isinstance(safe_controls, list) else [],
+            "url": page_url,
+            "title": page_title,
+            "controls": controls,
+            "suggested_controls": suggestions.as_response(),
         }
+
+    async def _suggest_login_controls(
+        self,
+        record: ScanRecord,
+        page_url: str,
+        page_title: str,
+        controls: list[dict[str, Any]],
+    ) -> SuggestedControls:
+        """Suggest the login controls: the rules first, then a model if allowed.
+
+        Never raises: a model failure returns the observation without
+        suggestions and a status that says why.
+        """
+
+        try:
+            rules = rules_suggestion(controls)
+            if rules is not None:
+                return rules
+            if record.request.discovery_mode != DiscoveryMode.BEDROCK:
+                return SuggestedControls(status=SuggestionStatus.NOT_DETECTED)
+            if record.cancel_requested:
+                return SuggestedControls(status=SuggestionStatus.AI_UNAVAILABLE)
+            prepared = self._prepare_classification(record)
+            if isinstance(prepared, SuggestedControls):
+                return prepared
+            client, budget = prepared
+            execution = record.pending_execution
+            observation = observation_for_classification(
+                page_url=page_url,
+                page_title=page_title,
+                controls=controls,
+                redact=execution.redact_text if execution is not None else str,
+            )
+        except Exception:
+            return SuggestedControls(status=SuggestionStatus.AI_FAILED)
+
+        try:
+            suggestions = await asyncio.wait_for(
+                asyncio.to_thread(
+                    classify_within_budget,
+                    client,
+                    observation,
+                    controls,
+                    budget,
+                    self._classification_lock,
+                ),
+                timeout=self._suggestion_timeout,
+            )
+        except TimeoutError:
+            suggestions = SuggestedControls(
+                status=SuggestionStatus.AI_TIMED_OUT, model_requests=1
+            )
+        except Exception:
+            suggestions = SuggestedControls(status=SuggestionStatus.AI_FAILED)
+        self._record_classification_usage(record, budget, suggestions)
+        return suggestions
+
+    def _prepare_classification(
+        self, record: ScanRecord
+    ) -> tuple[ControlClassificationClient, ClassificationBudget] | SuggestedControls:
+        """Decide whether this scan may ask a model, as a scan start does.
+
+        The caller has checked that the scan uses Bedrock discovery. Its
+        limits must be within the server's, it must have model requests
+        left, and Bedrock must be configured unless a client factory was
+        given (tests and offline runs). The budget is checked when the
+        request is reserved.
+        """
+
+        settings = load_server_settings()
+        limits = record.request.limits
+        if _limits_exceed_server(limits, settings):
+            return SuggestedControls(status=SuggestionStatus.AI_UNAVAILABLE)
+        if record.model_request_count >= limits.maximum_ai_decisions:
+            return SuggestedControls(status=SuggestionStatus.AI_DECISION_LIMIT_REACHED)
+        client: object
+        if self._action_client_factory is not None:
+            client = self._action_client_factory()
+            source = UsageSource.MOCK
+        else:
+            is_valid, _reason = validate_bedrock_configuration(settings)
+            if not is_valid:
+                return SuggestedControls(status=SuggestionStatus.AI_UNAVAILABLE)
+            client = BedrockActionClient(
+                BedrockConfiguration(
+                    aws_profile=settings.aws_profile,
+                    aws_region=settings.aws_region,
+                    model_id=settings.model_id,
+                    max_output_tokens=settings.max_output_tokens,
+                    maximum_estimated_cost_usd=settings.maximum_estimated_cost_usd,
+                )
+            )
+            source = UsageSource.LIVE
+        if not isinstance(client, ControlClassificationClient):
+            return SuggestedControls(status=SuggestionStatus.AI_UNAVAILABLE)
+        ledger_store = CostLedgerStore(
+            self._store.scan_directory(record.scan_id) / "cost-ledger.ndjson"
+        )
+        try:
+            ledger = ledger_store.load_into()
+        except (OSError, ValueError):
+            # Spending against a ledger that cannot be read could pass the
+            # scan's cost limit unnoticed.
+            return SuggestedControls(status=SuggestionStatus.AI_UNAVAILABLE)
+        return client, ClassificationBudget(
+            scan_id=record.scan_id,
+            limit_usd=limits.maximum_inference_cost_usd,
+            ledger=ledger,
+            ledger_store=ledger_store,
+            usage_source=source,
+            model_id=settings.model_id,
+        )
+
+    def _record_classification_usage(
+        self,
+        record: ScanRecord,
+        budget: ClassificationBudget,
+        suggestions: SuggestedControls,
+    ) -> None:
+        """Show a classification request in the scan's usage like any other."""
+
+        with self._lock:
+            record.model_request_count += suggestions.model_requests
+            if suggestions.answered:
+                record.decision_count += 1
+                record.total_input_tokens += suggestions.input_tokens
+                record.total_output_tokens += suggestions.output_tokens
+            record.cost_ledger = budget.ledger
+            record.cost_ledger_damaged = False
+            record.estimated_cost_usd = float(budget.ledger.total_observed_cost_usd())
+            record.unresolved_reservations_usd = float(
+                budget.ledger.total_unresolved_reservations_usd()
+            )
+            if (
+                suggestions.model_requests
+                and record.provenance is not None
+                and record.provenance.usage_source == "none"
+            ):
+                record.provenance.usage_source = budget.usage_source.value
+                record.provenance.model_id = budget.model_id
+            self._persist_state(record)
 
     async def _observe_guidance_in_process(
         self,

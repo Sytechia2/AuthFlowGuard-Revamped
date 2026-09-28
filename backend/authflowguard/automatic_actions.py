@@ -697,6 +697,7 @@ class AutomaticBrowserController:
                             if isinstance(control.get("form_action"), str)
                             else None
                         ),
+                        form_index=control.get("form_index"),
                         value_present=control.get("value_present"),
                         visible=control["visible"],
                         allowed_actions=self._allowed_actions(control),

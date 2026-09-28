@@ -30,6 +30,14 @@ from authflowguard.automatic_actions import (
     ProgressCallback,
 )
 from authflowguard.cancellation import close_resources
+from authflowguard.control_roles import (
+    ControlRole,
+    RoleSuggestion,
+    rules_is_password,
+    rules_is_submit,
+    rules_is_username,
+    validate_role_suggestions,
+)
 from authflowguard.control_safety import RecordedControlNotFoundError, flow_step
 from authflowguard.evaluation.cost_tracking import (
     CostLedger,
@@ -242,31 +250,32 @@ async def discover_login_form_actions(
     """
 
     controls = await PlaywrightWorker().read_controls(page)
+    is_submit = rules_is_submit
 
-    def is_username(control: SafeControlDescription) -> bool:
-        name = (control.get("name") or "").lower()
-        return control.get("autocomplete") == "username" or (
-            control.get("type") == "email" and name in {"email", "username", "login"}
-        )
+    username_control = _select_one_control(controls, "username", rules_is_username)
 
-    def is_password(control: SafeControlDescription) -> bool:
-        return control.get("type") == "password" and control.get("autocomplete") in {
-            None,
-            "current-password",
-        }
-
-    def is_submit(control: SafeControlDescription) -> bool:
-        return control.get("tag") in {"button", "input"} and control.get("type") in {
-            None,
-            "submit",
-        }
-
-    username_control = _select_one_control(controls, "username", is_username)
-
-    password_controls = [control for control in controls if is_password(control)]
+    password_controls = [control for control in controls if rules_is_password(control)]
     if len(password_controls) == 1:
         password_control = _control_id(password_controls[0])
         submit_control = _select_one_control(controls, "submit", is_submit)
+        # The same gate as a model's suggestion: the rules only propose roles.
+        validated = validate_role_suggestions(
+            controls,
+            [
+                RoleSuggestion(username_control, ControlRole.USERNAME),
+                RoleSuggestion(password_control, ControlRole.PASSWORD),
+                RoleSuggestion(submit_control, ControlRole.SUBMIT),
+            ],
+        )
+        if not validated.has_login_set:
+            reasons = ", ".join(
+                f"{rejection.role.value} {rejection.observed_control_id}: "
+                f"{rejection.reason.value}"
+                for rejection in validated.rejected
+            )
+            raise LoginFormDiscoveryError(
+                f"The discovered login controls were not usable ({reasons})"
+            )
         return [
             BrowserAction(
                 action_type=BrowserActionType.NAVIGATE,
