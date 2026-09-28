@@ -1,0 +1,242 @@
+{
+  "schema_version": "1.0",
+  "purpose": "Which control on each evaluated page plays which authentication role, for measuring the control-role classifier (authflowguard.evaluation.role_accuracy).",
+  "method": "Established without running AuthFlowGuard. A, B and C were read from the fixture source in backend/authflowguard/evaluation_targets/; the markup is identical in secure and vulnerable modes, which change only server behaviour. Juice Shop (J) was taken from its known v20 markup and has not been checked against a running instance: every J entry is marked verified=false, to be confirmed on the first live run.",
+  "matching": "A control is identified by stable attributes, never by its observed control-N number. Every key of a matcher must equal the observed control's value (text is compared ignoring case and repeated spaces); href_endswith must end the resolved link address. A role may list several matchers, any of which identifies the same control. Exactly one observed control must match, or the page's truth is reported as unresolved instead of being scored. A requested role mapped to null has no control on that page: any control the classifier gives that role is counted as extra.",
+  "steps": "goto opens origin+path; fill types a named credential (never stored here as a role); click presses a control; click_if_present presses it only when it appears within two seconds; wait_for waits for a selector to be visible; wait_for_url waits for a URL glob. Steps use CSS selectors for setup only; they are not what is scored.",
+  "applications": {
+    "A": {
+      "name": "Controlled server-rendered application",
+      "source": "backend/authflowguard/evaluation_targets/controlled_app.py",
+      "fixture_modes": ["secure", "vulnerable"],
+      "verified": true,
+      "credentials": {
+        "known": "developer@example.test",
+        "password": "correct-horse-battery-staple"
+      },
+      "password_references": ["password"],
+      "protected_resource_path": "/account",
+      "marker_selector": "[data-testid=\"account-marker\"]",
+      "sign_in": [
+        {"goto": "/login"},
+        {"fill": "input[name=\"username\"]", "value": "known"},
+        {"fill": "input[name=\"password\"]", "value": "password"},
+        {"click": "main button[type=\"submit\"]"},
+        {"wait_for": "[data-testid=\"account-marker\"]"}
+      ],
+      "login_sequence": ["A-login"],
+      "pages": [
+        {
+          "page_id": "A-login",
+          "path": "/login",
+          "requires_sign_in": false,
+          "requested_roles": ["username", "password", "submit", "registration_link", "reset_link"],
+          "roles": {
+            "username": {"tag": "input", "name": "username", "type": "email"},
+            "password": {"tag": "input", "name": "password", "type": "password"},
+            "submit": {"tag": "button", "text": "Sign in"},
+            "registration_link": {"tag": "a", "text": "Register", "href_endswith": "/register"},
+            "reset_link": {"tag": "a", "text": "Reset password", "href_endswith": "/reset"}
+          },
+          "derivation": "login_form() renders the email input name=username and the password input name=password inside the form built by _form_page(), whose submit button is labelled with the page title 'Sign in'. _page() adds a nav with Login, Register (/register) and Reset password (/reset) links."
+        },
+        {
+          "page_id": "A-account",
+          "path": "/account",
+          "requires_sign_in": true,
+          "requested_roles": ["logout", "account_menu"],
+          "roles": {
+            "logout": {"tag": "button", "text": "Log out"},
+            "account_menu": null
+          },
+          "derivation": "account() renders a POST /logout form with one button 'Log out'. The page has no menu toggle; the nav links are not account controls."
+        }
+      ]
+    },
+    "B": {
+      "name": "React/JSON bearer-token application with a one-time code",
+      "source": "backend/authflowguard/evaluation_targets/react_json_app.py",
+      "fixture_modes": ["secure", "vulnerable"],
+      "verified": true,
+      "credentials": {
+        "known": "developer@example.test",
+        "second_factor": "246810"
+      },
+      "password_references": [],
+      "protected_resource_path": "/account",
+      "marker_selector": "[data-testid=\"account-marker\"]",
+      "sign_in": [
+        {"goto": "/login"},
+        {"fill": "#username", "value": "known"},
+        {"click": "#continue"},
+        {"wait_for": "#verification-code"},
+        {"fill": "#verification-code", "value": "second_factor"},
+        {"click": "#verify"},
+        {"wait_for": "[data-testid=\"account-marker\"]"}
+      ],
+      "login_sequence": ["B-login", "B-code"],
+      "pages": [
+        {
+          "page_id": "B-login",
+          "path": "/login",
+          "requires_sign_in": false,
+          "requested_roles": ["username", "password", "submit", "registration_link", "reset_link"],
+          "roles": {
+            "username": {"tag": "input", "id": "username"},
+            "password": null,
+            "submit": {"tag": "button", "id": "continue"},
+            "registration_link": null,
+            "reset_link": null
+          },
+          "derivation": "_login_page() shows only the email input #username and the submit button #continue ('Continue'); there is no password field and no link. The code section is hidden until the email is accepted."
+        },
+        {
+          "page_id": "B-code",
+          "path": "/login",
+          "requires_sign_in": false,
+          "steps": [
+            {"fill": "#username", "value": "known"},
+            {"click": "#continue"},
+            {"wait_for": "#verification-code"}
+          ],
+          "requested_roles": ["verification_code", "submit"],
+          "roles": {
+            "verification_code": {"tag": "input", "id": "verification-code"},
+            "submit": {"tag": "button", "id": "verify"}
+          },
+          "derivation": "After #continue is pressed the #verification section is shown: the one-time-code input #verification-code and the button #verify ('Verify') that sends it. #continue stays visible but only restarts the first step."
+        },
+        {
+          "page_id": "B-account",
+          "path": "/account",
+          "requires_sign_in": true,
+          "requested_roles": ["logout", "account_menu"],
+          "roles": {
+            "logout": null,
+            "account_menu": null
+          },
+          "derivation": "_account_page() has no controls at all: no logout and no menu. Any answer here is extra."
+        }
+      ]
+    },
+    "C": {
+      "name": "Independent workshop booking desk",
+      "source": "backend/authflowguard/evaluation_targets/site_app.py",
+      "fixture_modes": ["secure", "vulnerable"],
+      "verified": true,
+      "credentials": {
+        "known": "MBR-40817",
+        "password": "lantern-orchard-47"
+      },
+      "password_references": ["password"],
+      "protected_resource_path": "/desk/bookings",
+      "marker_selector": "[data-desk=\"owner\"]",
+      "sign_in": [
+        {"goto": "/desk/entry"},
+        {"fill": "input[name=\"member_id\"]", "value": "known"},
+        {"fill": "input[name=\"passphrase\"]", "value": "password"},
+        {"click": "main button[type=\"submit\"]"},
+        {"wait_for": "[data-desk=\"owner\"]"}
+      ],
+      "login_sequence": ["C-login"],
+      "pages": [
+        {
+          "page_id": "C-login",
+          "path": "/desk/entry",
+          "requires_sign_in": false,
+          "requested_roles": ["username", "password", "submit", "registration_link", "reset_link"],
+          "roles": {
+            "username": {"tag": "input", "name": "member_id"},
+            "password": {"tag": "input", "name": "passphrase", "type": "password"},
+            "submit": {"tag": "button", "text": "Open my bookings"},
+            "registration_link": null,
+            "reset_link": null
+          },
+          "derivation": "entry() renders an untyped Member ID input name=member_id, a password input name=passphrase and the button 'Open my bookings'. The header's search box (name=q, type=search) is a distractor in another form. There is no registration or reset link."
+        },
+        {
+          "page_id": "C-bookings",
+          "path": "/desk/bookings",
+          "requires_sign_in": true,
+          "requested_roles": ["logout", "account_menu"],
+          "roles": {
+            "logout": {"tag": "button", "text": "Log out of the desk"},
+            "account_menu": null
+          },
+          "derivation": "bookings() renders a POST /desk/depart form with the button 'Log out of the desk'. There is no menu toggle; the header search box is not an account control."
+        }
+      ]
+    },
+    "J": {
+      "name": "OWASP Juice Shop v20.2.0 (external, Docker)",
+      "source": "Known Juice Shop v20 markup; not checked against a running instance",
+      "fixture_modes": ["external"],
+      "verified": false,
+      "verification_note": "To be confirmed on the first live run: open each page, check that exactly one control matches each matcher, and set verified=true.",
+      "credentials": {
+        "known": "admin@juice-sh.op",
+        "password": "admin123"
+      },
+      "password_references": ["password"],
+      "protected_resource_path": "/profile",
+      "marker_selector": "#email",
+      "sign_in": [
+        {"goto": "/#/login"},
+        {"click_if_present": "button[aria-label=\"Close Welcome Banner\"]"},
+        {"click_if_present": "a[aria-label=\"dismiss cookie message\"]"},
+        {"fill": "#email", "value": "known"},
+        {"fill": "#password", "value": "password"},
+        {"click": "#loginButton"},
+        {"wait_for_url": "**/#/search"}
+      ],
+      "login_sequence": ["J-login"],
+      "pages": [
+        {
+          "page_id": "J-login",
+          "path": "/#/login",
+          "requires_sign_in": false,
+          "steps": [
+            {"click_if_present": "button[aria-label=\"Close Welcome Banner\"]"},
+            {"click_if_present": "a[aria-label=\"dismiss cookie message\"]"},
+            {"wait_for": "#loginButton"}
+          ],
+          "requested_roles": ["username", "password", "submit", "registration_link", "reset_link"],
+          "roles": {
+            "username": {"tag": "input", "id": "email"},
+            "password": {"tag": "input", "id": "password"},
+            "submit": {"tag": "button", "id": "loginButton"},
+            "registration_link": {"tag": "a", "href_endswith": "#/register"},
+            "reset_link": {"tag": "a", "href_endswith": "#/forgot-password"}
+          },
+          "derivation": "Unverified. Juice Shop's login form: email field #email, password #password, login button #loginButton; 'Not yet a customer?' links to #/register and 'Forgot your password?' to #/forgot-password. The Google login button, the password-visibility toggle and 'Remember me' are distractors."
+        },
+        {
+          "page_id": "J-signed-in",
+          "path": "/#/search",
+          "requires_sign_in": true,
+          "requested_roles": ["logout", "account_menu"],
+          "roles": {
+            "logout": null,
+            "account_menu": {"tag": "button", "id": "navbarAccount"}
+          },
+          "derivation": "Unverified. The toolbar's account button #navbarAccount opens a menu; the logout item #navbarLogoutButton is only rendered once that menu is open, so no logout control is visible here."
+        },
+        {
+          "page_id": "J-menu-open",
+          "path": "/#/search",
+          "requires_sign_in": true,
+          "steps": [
+            {"click": "#navbarAccount"},
+            {"wait_for": "#navbarLogoutButton"}
+          ],
+          "requested_roles": ["logout", "account_menu"],
+          "roles": {
+            "logout": {"tag": "button", "id": "navbarLogoutButton"},
+            "account_menu": {"tag": "button", "id": "navbarAccount"}
+          },
+          "derivation": "Unverified. With the account menu open, #navbarLogoutButton ('Logout') is shown and #navbarAccount remains the menu toggle."
+        }
+      ]
+    }
+  }
+}

@@ -7,6 +7,7 @@ deterministically, so regenerating a table produces a byte-identical file.
 
 import csv
 import json
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from io import StringIO
@@ -44,6 +45,20 @@ def merge_result_files(paths: list[Path]) -> MergedRun:
             by_case[str(row["case_id"])] = row
     ordered = tuple(by_case[key] for key in sorted(by_case))
     return MergedRun(rows=ordered, source_runs=tuple(runs))
+
+
+def markdown_table(headers: Sequence[str], rows: Iterable[Sequence[object]]) -> str:
+    """Render rows as a Markdown table, escaping any pipe in a cell."""
+
+    def cell(value: object) -> str:
+        return str(value).replace("|", "\\|").replace("\n", " ")
+
+    lines = [
+        "| " + " | ".join(cell(header) for header in headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    lines += ["| " + " | ".join(cell(value) for value in row) + " |" for row in rows]
+    return "\n".join(lines)
 
 
 def render_markdown(merged: MergedRun, title: str) -> str:
