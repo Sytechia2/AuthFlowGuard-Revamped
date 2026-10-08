@@ -193,3 +193,6 @@ cython_debug/
 # Member 5 evaluation runs: keep results and reports, not raw scan data
 evaluation/results/*/scan-data/
 evaluation/results/*/fault-scan-data/
+
+# Generated UI mockups (Gemini design aid)
+tools/ui_mockups/output/
