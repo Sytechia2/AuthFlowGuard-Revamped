@@ -10,6 +10,7 @@ from authflowguard.authentication import VerifiedLoginExecution
 from authflowguard.checks.logout_invalidation import (
     LogoutInvalidationRun,
     _find_logout_control,
+    _submit_logout,
     analyse_logout_invalidation,
     run_logout_invalidation_check,
 )
@@ -705,3 +706,69 @@ def test_session_checks_never_read_a_page_redirected_outside_scope(
     )
     result = analyser(run.evidence, profile, SecurityPolicy())
     assert result.outcome is CheckOutcome.EXECUTION_ERROR
+
+
+def create_form_logout_app(html: str, posted: list[str]) -> FastAPI:
+    """Serve ``html`` signed in and record every form the page submits."""
+
+    application = FastAPI()
+
+    @application.get("/account", response_class=HTMLResponse)
+    def account() -> str:
+        return html
+
+    @application.post("/{path:path}", response_class=HTMLResponse)
+    def submitted(path: str) -> str:
+        posted.append(path)
+        return "<p>Submitted</p>"
+
+    return application
+
+
+async def _submit_logout_on(origin: str) -> str | None:
+    """Run the logout search on the served page; return its method or error."""
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            await page.goto(f"{origin}/account")
+            try:
+                attempt = await _submit_logout(page, f"{origin}/account")
+            except ValueError as error:
+                return str(error)
+            return attempt.method
+        finally:
+            await browser.close()
+
+
+DESTRUCTIVE_LOGOUT_FORMS = [
+    # The form's own action and submit label both look like logout.
+    """<form method="post" action="/logout-everywhere">
+        <button>Log out and delete account</button></form>""",
+    # The form's text says log out; its submit control deletes the account.
+    """<form method="post" action="/account/remove">
+        <p>Log out of every device</p>
+        <input type="submit" value="Delete account"></form>""",
+]
+
+
+@pytest.mark.parametrize("form", DESTRUCTIVE_LOGOUT_FORMS, ids=["button", "input"])
+def test_logout_form_with_a_destructive_submit_is_never_submitted(form: str) -> None:
+    posted: list[str] = []
+    with serve(create_form_logout_app(form, posted)) as origin:
+        outcome = asyncio.run(_submit_logout_on(origin))
+
+    assert outcome == "The application has no identifiable logout control"
+    assert posted == []
+
+
+@pytest.mark.parametrize("form", DESTRUCTIVE_LOGOUT_FORMS, ids=["button", "input"])
+def test_logout_search_skips_a_destructive_form_for_a_safe_one(form: str) -> None:
+    safe = '<form method="post" action="/logout"><button>Log out</button></form>'
+    posted: list[str] = []
+    with serve(create_form_logout_app(form + safe, posted)) as origin:
+        outcome = asyncio.run(_submit_logout_on(origin))
+
+    assert outcome == "form"
+    assert posted == ["logout"]

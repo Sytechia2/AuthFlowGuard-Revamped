@@ -100,6 +100,10 @@ async def _submit_logout_form(page: Any) -> LogoutAttempt | None:
         submit = form.locator('button, input[type="submit"]').first
         if await submit.count() == 0:
             continue
+        # A logout-looking form can still submit an account action, such as
+        # "Log out and delete account"; its control gets the same filter.
+        if DESTRUCTIVE_LABEL.search(await _control_label(submit)):
+            continue
         async with page.expect_response(
             lambda item: item.request.method.upper() == "POST", timeout=5000
         ) as response_info:
@@ -114,9 +118,15 @@ async def _submit_logout_form(page: Any) -> LogoutAttempt | None:
 
 
 async def _control_label(control: Any) -> str:
+    # A button-like input shows its value as its label. No other input's
+    # value is read: it may hold typed text.
     parts = await control.evaluate(
         """element => [element.innerText, element.getAttribute('aria-label'),
-                       element.getAttribute('title'), element.id]"""
+                       element.getAttribute('title'), element.id,
+                       element.tagName === 'INPUT'
+                           && ['button', 'submit', 'reset', 'image']
+                               .includes(element.type)
+                           ? element.value : null]"""
     )
     return " ".join(part for part in parts if part)
 
