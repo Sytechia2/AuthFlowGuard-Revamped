@@ -526,7 +526,7 @@ async def _verify_logout(
             with flow_step(number):
                 await executor.execute(step.model_copy(update={"action_id": uuid4()}))
         signed_in = await protected_state(
-            page, protected_resource, account_marker_selector
+            page, protected_resource, account_marker_selector, target
         )
         if not signed_in["marker_present"]:
             return None
@@ -536,7 +536,7 @@ async def _verify_logout(
                 result = await executor.execute(step)
             recorded.append(result.recorded(step))
         signed_out = await protected_state(
-            page, protected_resource, account_marker_selector
+            page, protected_resource, account_marker_selector, target
         )
         if signed_out["marker_present"]:
             return None

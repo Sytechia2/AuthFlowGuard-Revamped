@@ -6,9 +6,9 @@ from collections.abc import Callable
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from playwright.async_api import Page
+from playwright.async_api import Browser, BrowserContext, Page
 
-from authflowguard.action_executor import BrowserActionExecutor
+from authflowguard.action_executor import BrowserActionExecutor, install_scope_guard
 from authflowguard.control_safety import flow_step
 from authflowguard.models import (
     AuthFeature,
@@ -18,9 +18,23 @@ from authflowguard.models import (
     CheckId,
     EvidenceEvent,
     EvidenceKind,
+    TargetScope,
 )
 from authflowguard.page_settling import goto_and_settle
+from authflowguard.scope import url_is_in_scope
 from authflowguard.secrets import RuntimeSecrets
+
+
+async def new_scoped_context(browser: Browser, target: TargetScope) -> BrowserContext:
+    """Open a context that aborts requests outside permitted_origins.
+
+    The checks open some pages directly rather than through the executor, so
+    each context gets the executor's scope guard before any page loads.
+    """
+
+    context = await browser.new_context(service_workers="block")
+    await install_scope_guard(context, target)
+    return context
 
 
 def login_steps_for(profile: AuthProfile) -> list[BrowserAction]:
@@ -110,9 +124,13 @@ def cookie_snapshot(cookies: list[Any]) -> dict[str, Any]:
 
 
 async def protected_state(
-    page: Page, resource: str, marker_selector: str
+    page: Page, resource: str, marker_selector: str, target: TargetScope
 ) -> dict[str, Any]:
     response = await goto_and_settle(page, resource)
+    # The scope guard does not see a redirect's later hops, so a resource
+    # that redirected outside scope is never read or recorded.
+    if not url_is_in_scope(page.url, target):
+        raise ValueError("The protected resource led outside permitted_origins")
     status = response.status if response is not None else None
     marker_present = await page.locator(marker_selector).count() > 0
     return {

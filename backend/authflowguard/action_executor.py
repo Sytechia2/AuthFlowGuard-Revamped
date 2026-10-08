@@ -8,14 +8,15 @@ from hashlib import sha256
 from uuid import UUID, uuid4
 
 from playwright.async_api import (
-    Error as PlaywrightError,
-)
-from playwright.async_api import (
+    BrowserContext,
     Locator,
     Page,
     Request,
     Response,
     Route,
+)
+from playwright.async_api import (
+    Error as PlaywrightError,
 )
 from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
@@ -153,6 +154,23 @@ class ActionExecutionResult:
         return action.model_copy(
             update={"control_fingerprint": self.control_fingerprint}
         )
+
+
+async def install_scope_guard(context: BrowserContext, target: TargetScope) -> None:
+    """Abort every request the context sends outside permitted_origins.
+
+    Every page of the context, now or later, is covered. Playwright does not
+    route the later hops of a redirect, so a page that may have been
+    redirected must still be checked before it is read.
+    """
+
+    async def keep_request_inside_scope(route: Route) -> None:
+        if url_is_in_scope(route.request.url, target):
+            await route.continue_()
+        else:
+            await route.abort("blockedbyclient")
+
+    await context.route("**/*", keep_request_inside_scope)
 
 
 class BrowserActionExecutor:
@@ -468,13 +486,7 @@ class BrowserActionExecutor:
         if self._scope_guard_installed:
             return
 
-        async def keep_request_inside_scope(route: Route) -> None:
-            if url_is_in_scope(route.request.url, self._target):
-                await route.continue_()
-            else:
-                await route.abort("blockedbyclient")
-
-        await self._page.context.route("**/*", keep_request_inside_scope)
+        await install_scope_guard(self._page.context, self._target)
         self._scope_guard_installed = True
 
     async def _navigate(self, action: BrowserAction) -> None:

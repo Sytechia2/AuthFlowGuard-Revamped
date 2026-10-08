@@ -19,6 +19,7 @@ from authflowguard.checks.session_common import (
     cookie_snapshot,
     execute_login_steps,
     login_steps_for,
+    new_scoped_context,
     protected_state,
     replay_rejected,
     replay_server_error,
@@ -99,6 +100,10 @@ async def _submit_logout_form(page: Any) -> LogoutAttempt | None:
         submit = form.locator('button, input[type="submit"]').first
         if await submit.count() == 0:
             continue
+        # A logout-looking form can still submit an account action, such as
+        # "Log out and delete account"; its control gets the same filter.
+        if DESTRUCTIVE_LABEL.search(await _control_label(submit)):
+            continue
         async with page.expect_response(
             lambda item: item.request.method.upper() == "POST", timeout=5000
         ) as response_info:
@@ -113,9 +118,15 @@ async def _submit_logout_form(page: Any) -> LogoutAttempt | None:
 
 
 async def _control_label(control: Any) -> str:
+    # A button-like input shows its value as its label. No other input's
+    # value is read: it may hold typed text.
     parts = await control.evaluate(
         """element => [element.innerText, element.getAttribute('aria-label'),
-                       element.getAttribute('title'), element.id]"""
+                       element.getAttribute('title'), element.id,
+                       element.tagName === 'INPUT'
+                           && ['button', 'submit', 'reset', 'image']
+                               .includes(element.type)
+                           ? element.value : null]"""
     )
     return " ".join(part for part in parts if part)
 
@@ -278,7 +289,7 @@ async def run_logout_invalidation_check(
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
             try:
-                context = await browser.new_context(service_workers="block")
+                context = await new_scoped_context(browser, profile.target)
                 try:
                     page = await context.new_page()
                     await execute_login_steps(
@@ -293,7 +304,10 @@ async def run_logout_invalidation_check(
                         cancel_requested=cancel_requested,
                     )
                     authenticated = await protected_state(
-                        page, protected_resource, account_marker_selector
+                        page,
+                        protected_resource,
+                        account_marker_selector,
+                        profile.target,
                     )
                     observations["authenticated_control"] = authenticated
                     completed_steps.append("complete_login")
@@ -322,7 +336,10 @@ async def run_logout_invalidation_check(
                     observations["logout_method"] = logout.method
                     observations["logout_request_observed"] = logout.request_observed
                     after_logout = await protected_state(
-                        page, protected_resource, account_marker_selector
+                        page,
+                        protected_resource,
+                        account_marker_selector,
+                        profile.target,
                     )
                     observations["post_logout_control"] = after_logout
                     completed_steps.append("submit_logout")
@@ -341,12 +358,15 @@ async def run_logout_invalidation_check(
                 finally:
                     await context.close()
 
-                replay_context = await browser.new_context(service_workers="block")
+                replay_context = await new_scoped_context(browser, profile.target)
                 try:
                     await replay_context.add_cookies(cast(Any, old_cookies))
                     replay_page = await replay_context.new_page()
                     replay = await protected_state(
-                        replay_page, protected_resource, account_marker_selector
+                        replay_page,
+                        protected_resource,
+                        account_marker_selector,
+                        profile.target,
                     )
                     observations["old_session_replay"] = replay
                     events.append(
@@ -363,11 +383,14 @@ async def run_logout_invalidation_check(
                 finally:
                     await replay_context.close()
 
-                anonymous_context = await browser.new_context(service_workers="block")
+                anonymous_context = await new_scoped_context(browser, profile.target)
                 try:
                     anonymous_page = await anonymous_context.new_page()
                     anonymous = await protected_state(
-                        anonymous_page, protected_resource, account_marker_selector
+                        anonymous_page,
+                        protected_resource,
+                        account_marker_selector,
+                        profile.target,
                     )
                     observations["anonymous_control"] = anonymous
                     events.append(
