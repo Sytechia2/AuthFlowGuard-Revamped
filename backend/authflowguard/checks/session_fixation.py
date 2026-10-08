@@ -14,6 +14,7 @@ from authflowguard.checks.session_common import (
     cookie_snapshot,
     execute_login_steps,
     login_steps_for,
+    new_scoped_context,
     protected_state,
     replay_rejected,
     replay_server_error,
@@ -68,7 +69,7 @@ async def run_session_fixation_check(
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
             try:
-                context = await browser.new_context(service_workers="block")
+                context = await new_scoped_context(browser, profile.target)
                 try:
                     page = await context.new_page()
                     await goto_and_settle(page, str(profile.target.target_url))
@@ -99,7 +100,10 @@ async def run_session_fixation_check(
                         cancel_requested=cancel_requested,
                     )
                     authenticated = await protected_state(
-                        page, protected_resource, account_marker_selector
+                        page,
+                        protected_resource,
+                        account_marker_selector,
+                        profile.target,
                     )
                     post_login_cookies = await context.cookies()
                     observations["post_login_session"] = cookie_snapshot(
@@ -123,12 +127,15 @@ async def run_session_fixation_check(
                 finally:
                     await context.close()
 
-                replay_context = await browser.new_context(service_workers="block")
+                replay_context = await new_scoped_context(browser, profile.target)
                 try:
                     await replay_context.add_cookies(cast(Any, pre_login_cookies))
                     replay_page = await replay_context.new_page()
                     replay = await protected_state(
-                        replay_page, protected_resource, account_marker_selector
+                        replay_page,
+                        protected_resource,
+                        account_marker_selector,
+                        profile.target,
                     )
                     observations["original_session_replay"] = replay
                     events.append(
@@ -146,11 +153,14 @@ async def run_session_fixation_check(
                 finally:
                     await replay_context.close()
 
-                anonymous_context = await browser.new_context(service_workers="block")
+                anonymous_context = await new_scoped_context(browser, profile.target)
                 try:
                     anonymous_page = await anonymous_context.new_page()
                     anonymous = await protected_state(
-                        anonymous_page, protected_resource, account_marker_selector
+                        anonymous_page,
+                        protected_resource,
+                        account_marker_selector,
+                        profile.target,
                     )
                     observations["anonymous_control"] = anonymous
                     events.append(

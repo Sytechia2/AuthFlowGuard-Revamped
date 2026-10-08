@@ -554,3 +554,154 @@ def test_logout_search_stops_when_a_toggle_navigates() -> None:
 
     assert found is None
     assert clicked == ["user"]
+
+
+def create_cross_origin_app(outside: str, *, redirect_anonymous: bool) -> FastAPI:
+    """A login app whose pages also load content from ``outside``.
+
+    Each page embeds an image and a background request to the other origin.
+    With ``redirect_anonymous``, signed-out visitors to the protected page are
+    redirected there instead, as an external sign-in service would.
+    """
+
+    application = FastAPI()
+    sessions: set[str] = set()
+    beacons = (
+        f'<img src="{outside}/beacon.png" alt="">'
+        f'<script>fetch("{outside}/fetch").catch(() => {{}});</script>'
+    )
+
+    @application.get("/login", response_class=HTMLResponse)
+    def login_page() -> str:
+        return f"""<!doctype html><title>Login</title>{beacons}
+        <form method="post" action="/login">
+            <input name="username"><input name="password" type="password">
+            <button type="submit">Log in</button>
+        </form>"""
+
+    @application.post("/login")
+    def login() -> Response:
+        session = uuid4().hex
+        sessions.add(session)
+        response = RedirectResponse("/account", status_code=303)
+        response.set_cookie("session", session, path="/")
+        return response
+
+    @application.get("/account", response_class=HTMLResponse)
+    def account(request: Request) -> Response:
+        if request.cookies.get("session") not in sessions:
+            if redirect_anonymous:
+                return RedirectResponse(f"{outside}/signin", status_code=302)
+            return HTMLResponse(f"{beacons}<p>Sign in first</p>", status_code=401)
+        return HTMLResponse(
+            f"""{beacons}<p data-testid="account-marker">Signed in</p>
+            <form method="post" action="/logout"><button>Log out</button></form>"""
+        )
+
+    @application.post("/logout")
+    def logout(request: Request) -> Response:
+        sessions.discard(request.cookies.get("session", ""))
+        return RedirectResponse("/login", status_code=303)
+
+    return application
+
+
+def create_outside_app(received: list[str]) -> FastAPI:
+    application = FastAPI()
+
+    @application.get("/{path:path}", response_class=HTMLResponse)
+    def anything(path: str) -> str:
+        received.append(path)
+        return '<p data-testid="account-marker">Outside scope</p>'
+
+    return application
+
+
+def run_cross_origin_check(check: CheckId, origin: str) -> tuple[AuthProfile, Any]:
+    base_profile = profile_for(origin)
+    navigate, *controls = base_profile.authentication_steps[AuthFeature.LOGIN]
+    # The login form's controls are the only controls on the page.
+    numbered = [
+        step.model_copy(update={"observed_control_id": f"control-{number}"})
+        for step, number in zip(controls, (1, 2, 3), strict=True)
+    ]
+    profile = base_profile.model_copy(
+        update={"authentication_steps": {AuthFeature.LOGIN: [navigate, *numbered]}}
+    )
+    runner = (
+        run_session_fixation_check
+        if check is CheckId.SESSION_FIXATION
+        else run_logout_invalidation_check
+    )
+    secrets = RuntimeSecrets({"username": "user", "password": "pass"})
+    try:
+        run = asyncio.run(
+            runner(
+                profile=profile,
+                scan_id=uuid4(),
+                runtime_secrets=secrets,
+                username_reference="username",
+                password_reference="password",
+                protected_resource=f"{origin}/account",
+                account_marker_selector='[data-testid="account-marker"]',
+            )
+        )
+    finally:
+        secrets.discard_all()
+    return profile, run
+
+
+@pytest.mark.parametrize(
+    "check", [CheckId.SESSION_FIXATION, CheckId.LOGOUT_INVALIDATION]
+)
+def test_session_checks_never_send_requests_outside_scope(check: CheckId) -> None:
+    """Every context the check opens, including the replay and anonymous
+    ones, aborts requests to origins outside permitted_origins."""
+
+    received: list[str] = []
+    with serve(create_outside_app(received)) as outside:
+        application = create_cross_origin_app(outside, redirect_anonymous=False)
+        with serve(application) as origin:
+            profile, run = run_cross_origin_check(check, origin)
+
+    assert run.evidence.errors == []
+    assert received == []
+    assert not any(outside in str(event.redacted_details) for event in run.events)
+    analyser = (
+        analyse_session_fixation
+        if check is CheckId.SESSION_FIXATION
+        else analyse_logout_invalidation
+    )
+    result = analyser(run.evidence, profile, SecurityPolicy())
+    assert result.outcome is CheckOutcome.NO_ISSUE_OBSERVED
+
+
+@pytest.mark.parametrize(
+    "check", [CheckId.SESSION_FIXATION, CheckId.LOGOUT_INVALIDATION]
+)
+def test_session_checks_never_read_a_page_redirected_outside_scope(
+    check: CheckId,
+) -> None:
+    """A protected resource that redirects outside scope is not observed.
+
+    The browser follows a redirect without consulting the scope guard, so
+    the redirected request itself is not stopped; what the page then shows
+    must not become evidence, and the check stops with an error.
+    """
+
+    received: list[str] = []
+    with serve(create_outside_app(received)) as outside:
+        application = create_cross_origin_app(outside, redirect_anonymous=True)
+        with serve(application) as origin:
+            profile, run = run_cross_origin_check(check, origin)
+
+    assert run.evidence.errors == ["ValueError"]
+    assert outside not in str(run.evidence.observations)
+    assert not any(outside in str(event.redacted_details) for event in run.events)
+    analyser = (
+        analyse_session_fixation
+        if check is CheckId.SESSION_FIXATION
+        else analyse_logout_invalidation
+    )
+    result = analyser(run.evidence, profile, SecurityPolicy())
+    assert result.outcome is CheckOutcome.EXECUTION_ERROR
