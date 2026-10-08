@@ -35,6 +35,23 @@ Open `http://127.0.0.1:5173`. Vite forwards `/api` requests to the local
 backend, and the lower-left status indicator shows whether the connection is
 working.
 
+To open the interface from another computer on the same network, start it
+with `npm.cmd run dev:lan` instead and browse to `http://<this-computer's-IP>:5173`
+(`ipconfig` shows the IPv4 address). The backend stays on `127.0.0.1`; only the
+interface listens on the network and forwards API calls locally. Windows
+Firewall must allow inbound TCP 5173 on a Private network, for example from an
+administrator PowerShell:
+
+```powershell
+New-NetFirewallRule -DisplayName "AuthFlowGuard interface 5173" -Direction Inbound -Protocol TCP -LocalPort 5173 -Action Allow -Profile Private
+```
+
+AuthFlowGuard has no sign-in of its own: anyone who can reach this address can
+read results, start scans from this computer, and delete scans. Use it only on
+a trusted network, or limit the rule with `-RemoteAddress <other-computer-IP>`.
+Remove it afterwards with
+`Remove-NetFirewallRule -DisplayName "AuthFlowGuard interface 5173"`.
+
 ## 3. Verification
 
 Run the backend tests from the repository root:
