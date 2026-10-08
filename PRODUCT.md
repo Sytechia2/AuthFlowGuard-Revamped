@@ -80,6 +80,17 @@ assets are established; future work must not fabricate them.
 - Support both practical developer testing and repeatable professional
   assessment workflows.
 
+## Brand Commitments
+
+- The interface follows the familiar conventions of established vulnerability
+  scanners such as Tenable Nessus and Qualys: a scan list, severity-coded
+  findings, and drill-down from a scan to its checks and evidence. Security
+  professionals should recognise the tool category at a glance. (Chosen
+  2026-10-08 for the revamp shown at AWS AI Fest 2026.)
+- The theme is light.
+- The conventions are borrowed, never the brands: no third-party names, logos,
+  or trade dress appear in the product.
+
 ## Accessibility & Inclusion
 
 The interface must remain usable for both developers and security testers with

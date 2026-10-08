@@ -453,3 +453,69 @@ def test_guidance_api_observes_safe_controls_and_accepts_structured_flow(
     assert str(submitted[0][3].actions[0].url) == (
         "https://app.example/login?do-not-save=yes"
     )
+
+
+def test_guidance_keeps_the_scans_login_proof_unless_it_is_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    canary = "verification-status-canary"
+    application = create_app(data_root=tmp_path, worker_backend="thread")
+    manager = application.state.scan_manager
+    record = manager.create_scan(
+        ScanRequest(
+            target={
+                "target_url": "https://app.example/login",
+                "permitted_origins": ["https://app.example"],
+            },
+            selected_checks=[CheckId.LOGIN_ENUMERATION],
+        )
+    )
+    record.state = ScanState.AWAITING_GUIDANCE
+    record.pending_execution = ScanExecutionInput(
+        runtime_secrets={"username": "developer", "password": canary},
+        username_reference="username",
+        password_reference="password",
+        nonexistent_identifier_reference="missing",
+        failure_password_reference="failure",
+        protected_resource="https://app.example/account",
+        account_marker_selector="#email",
+        account_marker_description="Signed-in email",
+    )
+    manager._persist_state(record)
+    client = TestClient(application)
+
+    # The paused scan shows the values it was started with, never secrets.
+    status = client.get(f"/api/scans/{record.scan_id}")
+    assert status.status_code == 200
+    assert status.json()["verification"] == {
+        "protected_resource": "https://app.example/account",
+        "account_marker_selector": "#email",
+        "account_marker_description": "Signed-in email",
+    }
+    assert canary not in status.text
+
+    submitted = []
+    monkeypatch.setattr(
+        manager._executor,
+        "submit",
+        lambda *args: submitted.append(args),
+    )
+    guidance = client.post(
+        f"/api/scans/{record.scan_id}/guidance",
+        json={
+            "actions": [
+                {
+                    "action_type": "navigate",
+                    "url": "https://app.example/login",
+                    "description": "Open the login page",
+                }
+            ]
+        },
+    )
+    assert guidance.status_code == 200
+    execution = submitted[0][2]
+    assert execution.account_marker_selector == "#email"
+    assert execution.account_marker_description == "Signed-in email"
+    assert str(execution.protected_resource) == "https://app.example/account"
+    # Once the execution input is released the selector is no longer known.
+    assert client.get(f"/api/scans/{record.scan_id}").json()["verification"] is None

@@ -4,10 +4,12 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import App from "./App";
+import { checkDetail, methodology } from "./checkDetails";
 
 const defaultCapabilities = {
   bedrock_configured: true,
@@ -122,7 +124,36 @@ function mockHealthResponse(ok: boolean, status: string) {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  window.location.hash = "";
+  window.localStorage.clear();
 });
+
+// The app routes by URL hash: #/scans, #/new and #/scans/<id>.
+function renderAt(hash: string) {
+  window.location.hash = hash;
+  return render(<App />);
+}
+
+function fillNewScanForm(origin: string, targetUrl: string) {
+  fireEvent.change(screen.getByLabelText("Target URL"), {
+    target: { value: targetUrl },
+  });
+  fireEvent.change(screen.getByLabelText("Permitted origins"), {
+    target: { value: origin },
+  });
+  fireEvent.change(screen.getByLabelText("Known account username"), {
+    target: { value: "developer@example.test" },
+  });
+  fireEvent.change(screen.getByLabelText("Known account password"), {
+    target: { value: "known-password" },
+  });
+  fireEvent.change(screen.getByLabelText("Nonexistent account username"), {
+    target: { value: "missing@example.test" },
+  });
+  fireEvent.change(screen.getByLabelText("Invalid password"), {
+    target: { value: "wrong-password" },
+  });
+}
 
 describe("backend connection status", () => {
   test("shows connected only when the health response is successful", async () => {
@@ -172,32 +203,28 @@ describe("backend connection status", () => {
 describe("setup workflow", () => {
   test("tracks selected checks and prevents continuing with none", async () => {
     mockHealthResponse(true, "ok");
-    render(<App />);
+    renderAt("#/new");
 
-    const checkboxes = screen
+    const checkBoxes = screen
       .getAllByRole("checkbox")
-      .filter((cb) => cb.getAttribute("name") !== "discovery-mode");
-    // 6 security checks plus 1 reuse profile checkbox = 7 checkboxes total
-    expect(checkboxes.length).toBeGreaterThanOrEqual(6);
+      .filter((cb) => cb.id.startsWith("check-"));
+    expect(checkBoxes).toHaveLength(6);
     expect(screen.getByText("6 selected")).toBeInTheDocument();
+    expect(
+      screen.getByRole("checkbox", { name: "Logout invalidation" }),
+    ).toBeChecked();
 
-    // uncheck the 6 security checks
-    const checkBoxesOnly = screen
-      .getAllByRole("checkbox")
-      .filter((cb) => !cb.closest(".profile-reuse-setting"));
-    for (const checkbox of checkBoxesOnly) {
+    for (const checkbox of checkBoxes) {
       fireEvent.click(checkbox);
     }
 
     expect(screen.getByText("0 selected")).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: /start local scan/i }),
-    ).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Start scan" })).toBeDisabled();
   });
 
   test("renders discovery modes, capability banner, and execution limits", async () => {
     setupMockFetch();
-    render(<App />);
+    renderAt("#/new");
 
     await waitFor(() => {
       expect(
@@ -225,7 +252,7 @@ describe("setup workflow", () => {
         },
       },
     ]);
-    render(<App />);
+    renderAt("#/new");
 
     await waitFor(() => {
       expect(
@@ -265,36 +292,30 @@ describe("setup workflow", () => {
       },
     ]);
 
-    render(<App />);
+    renderAt("#/new");
 
-    fireEvent.change(screen.getByLabelText("Target URL"), {
-      target: { value: "https://staging.example.test/login" },
+    fireEvent.change(screen.getByLabelText("Scan name"), {
+      target: { value: "Staging sign-in" },
     });
-    fireEvent.change(screen.getByLabelText("Permitted origins"), {
-      target: { value: "https://staging.example.test" },
-    });
-    fireEvent.change(screen.getByLabelText("Known account username"), {
-      target: { value: "developer@example.test" },
-    });
-    fireEvent.change(screen.getByLabelText("Known account password"), {
-      target: { value: "known-password" },
-    });
-    fireEvent.change(screen.getByLabelText("Nonexistent account username"), {
-      target: { value: "missing@example.test" },
-    });
-    fireEvent.change(screen.getByLabelText("Invalid password"), {
-      target: { value: "wrong-password" },
-    });
+    fillNewScanForm(
+      "https://staging.example.test",
+      "https://staging.example.test/login",
+    );
     fireEvent.change(screen.getByLabelText("Protected resource URL"), {
       target: { value: "https://staging.example.test/account" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /start local scan/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Start scan" }));
 
+    // The new scan opens on its own page, named as the user typed.
     await waitFor(() => {
       expect(
-        screen.getByRole("heading", { name: "Check status" }),
+        screen.getByRole("heading", { name: "Scan in progress" }),
       ).toBeInTheDocument();
     });
+    expect(
+      screen.getByRole("heading", { level: 1, name: "Staging sign-in" }),
+    ).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/scans/scan-123");
 
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/scans",
@@ -410,40 +431,15 @@ describe("setup workflow", () => {
       },
     ]);
 
-    render(<App />);
+    renderAt("#/new");
 
-    fireEvent.change(screen.getByLabelText("Target URL"), {
-      target: { value: "https://staging.example.test/login" },
-    });
-    fireEvent.change(screen.getByLabelText("Permitted origins"), {
-      target: { value: "https://staging.example.test" },
-    });
-    fireEvent.change(screen.getByLabelText("Known account username"), {
-      target: { value: "developer@example.test" },
-    });
-    fireEvent.change(screen.getByLabelText("Known account password"), {
-      target: { value: "known-password" },
-    });
-    fireEvent.change(screen.getByLabelText("Nonexistent account username"), {
-      target: { value: "missing@example.test" },
-    });
-    fireEvent.change(screen.getByLabelText("Invalid password"), {
-      target: { value: "wrong-password" },
-    });
-    fireEvent.change(screen.getByLabelText("Protected resource URL"), {
-      target: { value: "https://staging.example.test/account" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /start local scan/i }));
+    fillNewScanForm(
+      "https://staging.example.test",
+      "https://staging.example.test/login",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Start scan" }));
 
-    await waitFor(() => {
-      expect(
-        screen.getByRole("button", { name: "Open Discovery" }),
-      ).toBeInTheDocument();
-    });
-    expect(
-      screen.getByRole("button", { name: "Cancel scan" }),
-    ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Open Discovery" }));
+    // A paused scan shows the guided sign-in help on its own page.
     await waitFor(() => {
       expect(
         screen.getByRole("heading", { name: "Help us log in" }),
@@ -519,7 +515,10 @@ describe("setup workflow", () => {
     };
   }
 
-  async function openDiscoveryWithObservation(observation: unknown) {
+  async function openDiscoveryWithObservation(
+    observation: unknown,
+    scanFields: Record<string, unknown> = {},
+  ) {
     const fetchMock = setupMockFetch([
       {
         url: "/api/scans",
@@ -543,6 +542,7 @@ describe("setup workflow", () => {
           evidence_count: 0,
           result_count: 0,
           results: [],
+          ...scanFields,
         },
       },
       {
@@ -557,35 +557,12 @@ describe("setup workflow", () => {
       },
     ]);
 
-    render(<App />);
-    fireEvent.change(screen.getByLabelText("Target URL"), {
-      target: { value: "https://shop.example.test/#/login" },
-    });
-    fireEvent.change(screen.getByLabelText("Permitted origins"), {
-      target: { value: "https://shop.example.test" },
-    });
-    fireEvent.change(screen.getByLabelText("Known account username"), {
-      target: { value: "developer@example.test" },
-    });
-    fireEvent.change(screen.getByLabelText("Known account password"), {
-      target: { value: "known-password" },
-    });
-    fireEvent.change(screen.getByLabelText("Nonexistent account username"), {
-      target: { value: "missing@example.test" },
-    });
-    fireEvent.change(screen.getByLabelText("Invalid password"), {
-      target: { value: "wrong-password" },
-    });
-    fireEvent.change(screen.getByLabelText("Protected resource URL"), {
-      target: { value: "https://shop.example.test/#/account" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /start local scan/i }));
-    await waitFor(() => {
-      expect(
-        screen.getByRole("button", { name: "Open Discovery" }),
-      ).toBeInTheDocument();
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Open Discovery" }));
+    renderAt("#/new");
+    fillNewScanForm(
+      "https://shop.example.test",
+      "https://shop.example.test/#/login",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Start scan" }));
     await waitFor(() => {
       expect(
         screen.getByRole("heading", { name: "Help us log in" }),
@@ -662,6 +639,68 @@ describe("setup workflow", () => {
       "control-6",
       "control-8",
     ]);
+  });
+
+  test("keeps the scan's login proof unless the user changes it", async () => {
+    const fetchMock = await openDiscoveryWithObservation(
+      {
+        url: "https://shop.example.test/",
+        title: "Shop",
+        controls: juiceShopLikeControls,
+        suggested_controls: {
+          username: "control-5",
+          password: "control-6",
+          submit: "control-7",
+          source: "rules",
+          status: "rules_detected",
+          rejected: [],
+        },
+      },
+      {
+        verification: {
+          protected_resource: "https://shop.example.test/#/profile",
+          account_marker_selector: "#email",
+          account_marker_description: "Signed-in email",
+        },
+      },
+    );
+
+    // The values the scan was started with are shown, not a default.
+    expect(screen.getByText(/^Login proof:/)).toHaveTextContent(
+      "Login proof: #email on https://shop.example.test/#/profile",
+    );
+    expect(screen.getByLabelText("Authenticated marker selector")).toHaveValue(
+      "#email",
+    );
+    expect(
+      screen.getByLabelText("Authenticated marker selector"),
+    ).not.toBeRequired();
+    expect(screen.getByLabelText("Marker description")).toHaveValue(
+      "Signed-in email",
+    );
+
+    // Only the changed description is sent; the selector and page are kept.
+    fireEvent.change(screen.getByLabelText("Marker description"), {
+      target: { value: "Email shown on the profile page" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: /save and verify guided flow/i }),
+    );
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/scans/suggested-scan/guidance",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+    const call = fetchMock.mock.calls.find(
+      ([input]) => input === "/api/scans/suggested-scan/guidance",
+    ) as [string, RequestInit];
+    const body = JSON.parse(String(call[1].body)) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("account_marker_selector");
+    expect(body).not.toHaveProperty("protected_resource");
+    expect(body.account_marker_description).toBe(
+      "Email shown on the profile page",
+    );
   });
 
   test("labels rules suggestions and ignores ones that are not options", async () => {
@@ -777,28 +816,44 @@ describe("setup workflow", () => {
     });
   });
 
-  test("navigation switches between testing and results views", () => {
+  test("the sidebar moves between the scan list and a new scan", async () => {
     mockHealthResponse(true, "ok");
     render(<App />);
 
-    fireEvent.click(screen.getByRole("button", { name: /testing/i }));
     expect(
-      screen.getByRole("heading", { name: "No scan is running" }),
+      screen.getByRole("heading", { level: 1, name: "Scans" }),
     ).toBeInTheDocument();
+    expect(await screen.findByText("No scans yet")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /results/i }));
+    const nav = screen.getByRole("navigation", { name: "Main" });
+    fireEvent.click(within(nav).getByRole("button", { name: "New scan" }));
     expect(
-      screen.getByRole("heading", { name: "Evidence will appear here" }),
+      screen.getByRole("heading", { level: 1, name: "New scan" }),
+    ).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/new");
+
+    fireEvent.click(within(nav).getByRole("button", { name: "Scans" }));
+    expect(
+      screen.getByRole("heading", { level: 1, name: "Scans" }),
     ).toBeInTheDocument();
   });
 
-  test("displays live AI exploration metrics and badges in Testing view", async () => {
+  test("shows live progress and AI metrics while a scan runs", async () => {
+    window.localStorage.setItem(
+      "authflowguard.scanNotes",
+      JSON.stringify({
+        "ai-scan-456": {
+          checks: ["login_enumeration", "logout_invalidation"],
+        },
+      }),
+    );
     setupMockFetch([
       {
         url: "/api/scans/ai-scan-456",
         response: {
           scan_id: "ai-scan-456",
           state: "running",
+          target_url: "https://shop.example.test/login",
           phase: "discovering_auth",
           discovery_mode: "bedrock",
           decision_count: 5,
@@ -813,7 +868,12 @@ describe("setup workflow", () => {
             usage_source: "bedrock_reported",
             reused_profile: false,
             guidance_used: false,
-            model_id: "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+            model_id: "amazon.nova-micro-v1:0",
+          },
+          execution_progress: {
+            active_check: "login_enumeration",
+            completed_checks: [],
+            cancelled_checks: [],
           },
           event_count: 12,
           evidence_count: 1,
@@ -823,39 +883,84 @@ describe("setup workflow", () => {
       },
     ]);
 
-    render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: /results/i }));
-    fireEvent.change(screen.getByLabelText("Scan ID"), {
-      target: { value: "ai-scan-456" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /load results/i }));
-
-    // Switch to Testing tab to view live metrics for this scan
-    fireEvent.click(screen.getByRole("button", { name: /testing/i }));
+    renderAt("#/scans/ai-scan-456");
 
     await waitFor(() => {
       expect(screen.getByText("Phase: discovering auth")).toBeInTheDocument();
-      expect(screen.getByText("Engine: bedrock")).toBeInTheDocument();
-      expect(screen.getByText("AI Exploration Metrics")).toBeInTheDocument();
-      expect(screen.getByText("$0.0145")).toBeInTheDocument();
-      expect(screen.getByText("Pending Resv.")).toBeInTheDocument();
     });
+    expect(
+      screen.getByRole("heading", {
+        level: 1,
+        name: "Scan of shop.example.test",
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("$0.0145")).toBeInTheDocument();
+    expect(screen.getByText("3,750")).toBeInTheDocument();
+    expect(screen.getByText("Reserved")).toBeInTheDocument();
+    expect(screen.getByText("Amazon Bedrock - Nova Micro")).toBeInTheDocument();
+    // The planned checks are listed with their state.
+    const running = screen
+      .getByText("Login account enumeration")
+      .closest("li")!;
+    expect(within(running).getByText("Running")).toBeInTheDocument();
+    const waiting = screen.getByText("Logout invalidation").closest("li")!;
+    expect(within(waiting).getByText("Waiting")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Cancel scan" }),
+    ).toBeInTheDocument();
   });
 
-  test("loads scan results and exposes offline report links and provenance", async () => {
+  test("shows severity-rated findings, details, evidence and provenance", async () => {
     setupMockFetch([
       {
         url: "/api/scans",
         response: [],
       },
       {
+        url: "/api/scans/scan-123/report/json",
+        response: {
+          metadata: { selected_checks: ["login_enumeration"] },
+          results: [
+            {
+              check_id: "login_enumeration",
+              outcome: "finding_confirmed",
+              owasp_reference: "WSTG-IDNT-04",
+              explanation: "Repeatable account differences were observed.",
+              coverage_limitations: ["Only three pairs were compared."],
+              analyser_version: "login-enumeration/2",
+              created_at: "2026-10-08T09:30:00Z",
+            },
+          ],
+          evidence: [
+            {
+              evidence_id: "ev-1",
+              check_id: "login_enumeration",
+              event_ids: ["e1", "e2"],
+              observations: { status_codes: [200, 200] },
+              control_comparisons: ["Pair 1: signatures were captured."],
+              errors: [],
+              coverage: {
+                attempted_steps: ["known_login", "unknown_login"],
+                completed_steps: ["known_login", "unknown_login"],
+                limitations: [
+                  "Only three pairs were compared.",
+                  "Timing was not measured.",
+                ],
+              },
+            },
+          ],
+        },
+      },
+      {
         url: "/api/scans/scan-123",
         response: {
           scan_id: "scan-123",
           state: "completed",
+          target_url: "https://app.example/login",
           event_count: 78,
           evidence_count: 6,
           result_count: 6,
+          report_available: true,
           discovery_mode: "bedrock",
           decision_count: 8,
           model_request_count: 9,
@@ -868,7 +973,7 @@ describe("setup workflow", () => {
             usage_source: "bedrock_reported",
             reused_profile: false,
             guidance_used: false,
-            model_id: "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+            model_id: "amazon.nova-micro-v1:0",
           },
           results: [
             {
@@ -876,6 +981,7 @@ describe("setup workflow", () => {
               outcome: "finding_confirmed",
               owasp_reference: "WSTG-IDNT-04",
               explanation: "Repeatable account differences were observed.",
+              coverage_limitations: ["Only three pairs were compared."],
             },
             {
               check_id: "registration_enumeration",
@@ -903,58 +1009,108 @@ describe("setup workflow", () => {
             },
             {
               check_id: "logout_invalidation",
-              outcome: "no_issue_observed",
+              outcome: "finding_confirmed",
               owasp_reference: "WSTG-SESS-06",
-              explanation: "The old session was rejected after logout.",
+              explanation: "The old session still worked after logout.",
             },
           ],
         },
       },
     ]);
 
+    // Open the scan by its ID from the scan list.
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: /results/i }));
     fireEvent.change(screen.getByLabelText("Scan ID"), {
       target: { value: "scan-123" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /load results/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Open scan" }));
 
-    await waitFor(() => {
-      expect(screen.getByText("finding_confirmed")).toBeInTheDocument();
-    });
+    const findings = await screen.findByRole("region", { name: "Findings" });
+    const rows = within(findings).getAllByRole("row").slice(1);
+    // Sorted by severity: Critical, Medium, Inconclusive, then passes.
+    expect(
+      rows.map((row) => within(row).getAllByRole("cell")[1].textContent),
+    ).toEqual([
+      "CHK-006",
+      "CHK-001",
+      "CHK-003",
+      "CHK-002",
+      "CHK-004",
+      "CHK-005",
+    ]);
+    expect(within(rows[0]).getByText("Critical")).toBeInTheDocument();
+    expect(within(rows[1]).getByText("Medium")).toBeInTheDocument();
+    expect(within(rows[2]).getByText("Inconclusive")).toBeInTheDocument();
+    expect(within(findings).getAllByText("Passed")).toHaveLength(3);
+    expect(
+      screen.getByRole("img", {
+        name: "Severity: 1 Critical, 1 Medium, 3 Passed, 1 Inconclusive",
+      }),
+    ).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Download JSON" })).toHaveAttribute(
       "href",
       "/api/scans/scan-123/report/json",
     );
-    expect(
-      screen.getByRole("heading", { name: "CHK-002 registration_enumeration" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("heading", {
-        name: "CHK-003 reset_request_enumeration",
-      }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("heading", { name: "CHK-004 login_throttling" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("heading", { name: "CHK-005 session_fixation" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("heading", { name: "CHK-006 logout_invalidation" }),
-    ).toBeInTheDocument();
-    expect(screen.getAllByText("no_issue_observed")).toHaveLength(4);
-    expect(screen.getByText("inconclusive")).toBeInTheDocument();
 
-    // Verify Discovery Provenance & Offline Assurance
+    // Expanding a finding shows the recommendation and coverage limits.
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Details for CHK-001 Login account enumeration",
+      }),
+    );
+    expect(screen.getByText("Recommendation")).toBeInTheDocument();
+    expect(screen.getByText("Coverage limits")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Evidence" }));
     expect(
-      screen.getByText("Discovery provenance & assurance"),
+      await screen.findByText("Pair 1: signatures were captured."),
     ).toBeInTheDocument();
-    expect(screen.getByText(/offline assurance:/i)).toBeInTheDocument();
-    expect(screen.getByText("$0.0452 USD")).toBeInTheDocument();
+    expect(
+      screen.getByText("2 recorded events · 2 of 2 steps completed"),
+    ).toBeInTheDocument();
+    // Each check shows the same fields as the HTML report.
+    const evidenceCard = screen.getByRole("region", {
+      name: "CHK-001 Login account enumeration",
+    });
+    const field = (label: string) =>
+      within(evidenceCard).getByText(label, { selector: "dt" }).nextSibling;
+    expect(field("Status")).toHaveTextContent("Fail");
+    expect(field("Severity")).toHaveTextContent("Medium");
+    expect(field("Recommendation")).toHaveTextContent(
+      /indistinguishable login failure responses/,
+    );
+    expect(field("Evidence package")).toHaveTextContent("ev-1");
+    expect(field("Analyser version")).toHaveTextContent("login-enumeration/2");
+    expect(field("Recorded at")).toHaveTextContent("8 Oct 2026");
+    // Coverage limitations are merged without repeats.
+    expect(
+      within(evidenceCard).getAllByText("Only three pairs were compared."),
+    ).toHaveLength(1);
+    expect(
+      within(evidenceCard).getByText("Timing was not measured."),
+    ).toBeInTheDocument();
+    expect(within(evidenceCard).getAllByText("Completed")).toHaveLength(2);
+    // The observations sit in a collapsed snapshot.
+    const snapshot = within(evidenceCard)
+      .getByText("Evidence snapshot")
+      .closest("details")!;
+    expect(snapshot).not.toHaveAttribute("open");
+    fireEvent.click(within(snapshot).getByText("Evidence snapshot"));
+    expect(snapshot).toHaveAttribute("open");
+    expect(snapshot.querySelector("pre")).toHaveTextContent(
+      /"status_codes": \[\s*200,\s*200\s*\]/,
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: "AI discovery" }));
+    expect(screen.getByText("Discovery provenance")).toBeInTheDocument();
+    expect(screen.getByText("$0.0452")).toBeInTheDocument();
+    expect(
+      screen.getByText(/deterministic analysers decide every verdict/i),
+    ).toBeInTheDocument();
   });
 
   test("deletes a saved scan only after confirmation", async () => {
+    let deleted = false;
     const savedScan = {
       scan_id: "scan-old",
       state: "completed",
@@ -965,13 +1121,20 @@ describe("setup workflow", () => {
       results: [],
     };
     const fetchMock = setupMockFetch([
-      { url: "/api/scans", method: "GET", response: [savedScan] },
+      {
+        url: "/api/scans",
+        method: "GET",
+        response: () => (deleted ? [] : [savedScan]),
+      },
       { url: "/api/scans/scan-old", method: "GET", response: savedScan },
       {
         url: "/api/scans/scan-old",
         method: "DELETE",
         status: 204,
-        response: null,
+        response: () => {
+          deleted = true;
+          return null;
+        },
       },
     ]);
     const confirmMock = vi
@@ -981,8 +1144,9 @@ describe("setup workflow", () => {
     vi.stubGlobal("confirm", confirmMock);
 
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: /results/i }));
-    fireEvent.click(await screen.findByRole("button", { name: /scan-old/ }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Scan of app.example" }),
+    );
     const deleteButton = await screen.findByRole("button", {
       name: "Delete scan",
     });
@@ -996,55 +1160,418 @@ describe("setup workflow", () => {
 
     fireEvent.click(deleteButton);
     await waitFor(() => {
-      expect(screen.getByText("No saved scans yet.")).toBeInTheDocument();
+      expect(screen.getByText("No scans yet")).toBeInTheDocument();
     });
     expect(deleteCalls()).toHaveLength(1);
     expect(deleteCalls()[0][0]).toBe("/api/scans/scan-old");
-    expect(screen.getByText("Evidence will appear here")).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/scans");
   });
 
-  test("shows saved runs and loads one without manual ID entry", async () => {
-    setupMockFetch([
+  function listedScan(scanId: string, state: string, host: string) {
+    return {
+      scan_id: scanId,
+      state,
+      target_url: `https://${host}/login`,
+      event_count: 1,
+      evidence_count: 1,
+      result_count: 0,
+      results: [],
+    };
+  }
+
+  test("deletes several selected scans from the list after confirmation", async () => {
+    window.localStorage.setItem(
+      "authflowguard.scanNotes",
+      JSON.stringify({
+        "scan-a": { name: "First scan" },
+        "scan-c": { name: "Kept scan" },
+      }),
+    );
+    const fetchMock = setupMockFetch([
       {
         url: "/api/scans",
+        method: "GET",
         response: [
-          {
-            scan_id: "past-scan-123",
-            state: "completed",
-            target_url: "http://127.0.0.1:8001/login",
-            event_count: 78,
-            evidence_count: 1,
-            result_count: 1,
-            results: [],
-          },
+          listedScan("scan-a", "completed", "a.example"),
+          listedScan("scan-b", "failed", "b.example"),
+          listedScan("scan-c", "cancelled", "c.example"),
         ],
       },
       {
-        url: "/api/scans/past-scan-123",
+        url: /^\/api\/scans\/scan-[ab]$/,
+        method: "DELETE",
+        status: 204,
+        response: null,
+      },
+    ]);
+    const confirmMock = vi
+      .fn()
+      .mockReturnValueOnce(false)
+      .mockReturnValue(true);
+    vi.stubGlobal("confirm", confirmMock);
+    const deleteCalls = () =>
+      fetchMock.mock.calls
+        .filter(
+          ([, init]) => (init as RequestInit | undefined)?.method === "DELETE",
+        )
+        .map(([url]) => url as string);
+
+    render(<App />);
+    const first = await screen.findByRole("checkbox", {
+      name: "Select First scan",
+    });
+    fireEvent.click(first);
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Select Scan of b.example" }),
+    );
+    // Selecting does not open the scan.
+    expect(window.location.hash).not.toContain("scan-");
+    const selectAll = screen.getByRole("checkbox", {
+      name: "Select all scans",
+    }) as HTMLInputElement;
+    expect(selectAll.indeterminate).toBe(true);
+
+    const deleteButton = screen.getByRole("button", {
+      name: "Delete selected (2)",
+    });
+    fireEvent.click(deleteButton);
+    expect(confirmMock).toHaveBeenLastCalledWith(
+      "Delete 2 scans? Their evidence, results, and reports will be permanently removed.",
+    );
+    expect(deleteCalls()).toHaveLength(0);
+
+    fireEvent.click(deleteButton);
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("checkbox", { name: "Select First scan" }),
+      ).not.toBeInTheDocument();
+    });
+    expect(deleteCalls()).toEqual(["/api/scans/scan-a", "/api/scans/scan-b"]);
+    expect(screen.queryByText("Scan of b.example")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Kept scan" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Delete selected/ }),
+    ).not.toBeInTheDocument();
+    // The deleted scan's browser-only name is forgotten too.
+    expect(
+      JSON.parse(
+        window.localStorage.getItem("authflowguard.scanNotes") ?? "{}",
+      ),
+    ).toEqual({ "scan-c": { name: "Kept scan" } });
+  });
+
+  test("keeps scans that fail to delete selected and explains why", async () => {
+    setupMockFetch([
+      {
+        url: "/api/scans",
+        method: "GET",
+        response: [
+          listedScan("scan-a", "completed", "a.example"),
+          listedScan("scan-b", "completed", "b.example"),
+        ],
+      },
+      {
+        url: "/api/scans/scan-a",
+        method: "DELETE",
+        status: 204,
+        response: null,
+      },
+      {
+        url: "/api/scans/scan-b",
+        method: "DELETE",
+        status: 409,
         response: {
-          scan_id: "past-scan-123",
-          state: "completed",
-          event_count: 78,
-          evidence_count: 1,
-          result_count: 1,
-          results: [],
+          detail: "The scan files are in use and could not be deleted",
         },
+      },
+    ]);
+    vi.stubGlobal("confirm", vi.fn().mockReturnValue(true));
+
+    render(<App />);
+    fireEvent.click(
+      await screen.findByRole("checkbox", { name: "Select all scans" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Delete selected (2)" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "1 scan could not be deleted. The scan files are in use and could not be deleted",
+    );
+    expect(screen.queryByText("Scan of a.example")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("checkbox", { name: "Select Scan of b.example" }),
+    ).toBeChecked();
+    expect(
+      screen.getByRole("button", { name: "Delete selected (1)" }),
+    ).toBeInTheDocument();
+  });
+
+  test("scans that are still working cannot be selected for deletion", async () => {
+    setupMockFetch([
+      {
+        url: "/api/scans",
+        method: "GET",
+        response: [
+          listedScan("scan-run", "running", "run.example"),
+          listedScan("scan-wait", "awaiting_guidance", "wait.example"),
+          listedScan("scan-done", "completed", "done.example"),
+        ],
       },
     ]);
 
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: /results/i }));
+    for (const name of ["Scan of run.example", "Scan of wait.example"]) {
+      const checkbox = await screen.findByRole("checkbox", {
+        name: `Select ${name}`,
+      });
+      expect(checkbox).toBeDisabled();
+      expect(checkbox).toHaveAttribute(
+        "title",
+        "Cancel the scan before deleting it",
+      );
+    }
+    // Select all takes only the finished scan.
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all scans" }));
+    expect(
+      screen.getByRole("checkbox", { name: "Select Scan of done.example" }),
+    ).toBeChecked();
+    expect(
+      screen.getByRole("checkbox", { name: "Select Scan of run.example" }),
+    ).not.toBeChecked();
+    expect(
+      screen.getByRole("button", { name: "Delete selected (1)" }),
+    ).toBeInTheDocument();
+  });
 
-    await waitFor(() => {
-      expect(screen.getByText("past-scan-123")).toBeInTheDocument();
-    });
-    fireEvent.click(screen.getByRole("button", { name: /past-scan-123/ }));
+  test("lists saved scans with severity counts and opens one", async () => {
+    const pastScan = {
+      scan_id: "past-scan-123",
+      state: "completed",
+      target_url: "http://127.0.0.1:8011/login",
+      event_count: 78,
+      evidence_count: 1,
+      result_count: 2,
+      results: [
+        {
+          check_id: "logout_invalidation",
+          outcome: "finding_confirmed",
+          owasp_reference: "WSTG-SESS-06",
+          explanation: "The session survived logout.",
+        },
+        {
+          check_id: "login_enumeration",
+          outcome: "no_issue_observed",
+          owasp_reference: "WSTG-IDNT-04",
+          explanation: "No difference.",
+        },
+      ],
+    };
+    setupMockFetch([
+      { url: "/api/scans", response: [pastScan] },
+      { url: "/api/scans/past-scan-123", response: pastScan },
+    ]);
 
-    await waitFor(() => {
-      expect(
-        screen.getByRole("heading", { name: "Scan results" }),
-      ).toBeInTheDocument();
+    render(<App />);
+
+    const row = (
+      await screen.findByText("http://127.0.0.1:8011/login")
+    ).closest("tr")!;
+    expect(within(row).getByText("Completed")).toBeInTheDocument();
+    expect(within(row).getByTitle("1 Critical")).toBeInTheDocument();
+    expect(within(row).getByTitle("1 Passed")).toBeInTheDocument();
+    fireEvent.click(
+      within(row).getByRole("button", { name: "Scan of 127.0.0.1:8011" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", {
+        level: 1,
+        name: "Scan of 127.0.0.1:8011",
+      }),
+    ).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/scans/past-scan-123");
+  });
+
+  test("renames a scan in this browser", async () => {
+    const scan = {
+      scan_id: "named-scan",
+      state: "completed",
+      target_url: "http://127.0.0.1:3000/#/login",
+      event_count: 1,
+      evidence_count: 1,
+      result_count: 0,
+      results: [],
+    };
+    setupMockFetch([{ url: "/api/scans/named-scan", response: scan }]);
+
+    renderAt("#/scans/named-scan");
+    fireEvent.click(await screen.findByRole("button", { name: "Rename scan" }));
+    fireEvent.change(screen.getByLabelText("Scan name"), {
+      target: { value: "Juice Shop - login and session checks" },
     });
-    expect(screen.getAllByText("completed")).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "Save name" }));
+
+    expect(
+      screen.getByRole("heading", {
+        level: 1,
+        name: "Juice Shop - login and session checks",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      JSON.parse(
+        window.localStorage.getItem("authflowguard.scanNotes") ?? "{}",
+      ),
+    ).toEqual({
+      "named-scan": { name: "Juice Shop - login and session checks" },
+    });
+  });
+
+  test("explains when a scan ID does not exist", async () => {
+    setupMockFetch([
+      { url: "/api/scans/missing", status: 404, response: { detail: "x" } },
+    ]);
+
+    renderAt("#/scans/missing");
+
+    expect(
+      await screen.findByRole("heading", { name: "Scan not found" }),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("check reference", () => {
+  test("the sidebar opens the six checks and their shared method", async () => {
+    setupMockFetch([{ url: "/api/scans", response: [] }]);
+    render(<App />);
+
+    const nav = screen.getByRole("navigation", { name: "Main" });
+    fireEvent.click(within(nav).getByRole("button", { name: "Checks" }));
+
+    expect(
+      screen.getByRole("heading", { level: 1, name: "Checks" }),
+    ).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/checks");
+    expect(within(nav).getByRole("button", { name: "Checks" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    expect(screen.getByText(methodology[0])).toBeInTheDocument();
+    const table = screen.getByRole("table");
+    const rows = within(table).getAllByRole("row").slice(1);
+    expect(rows).toHaveLength(6);
+    expect(within(rows[5]).getByText("CHK-006")).toBeInTheDocument();
+    expect(within(rows[5]).getByText("Critical")).toBeInTheDocument();
+
+    fireEvent.click(
+      within(rows[5]).getByRole("link", { name: "Logout invalidation" }),
+    );
+    expect(
+      screen.getByRole("heading", {
+        level: 1,
+        name: "CHK-006 Logout invalidation",
+      }),
+    ).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/checks/logout_invalidation");
+  });
+
+  test("a check's page explains its procedure and verdict rules", () => {
+    setupMockFetch();
+    renderAt("#/checks/logout_invalidation");
+    const detail = checkDetail("logout_invalidation")!;
+
+    expect(
+      screen.getByRole("heading", {
+        level: 1,
+        name: "CHK-006 Logout invalidation",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: /OWASP WSTG-SESS-06/ }),
+    ).toHaveAttribute("href", detail.owaspUrl);
+
+    const procedure = screen.getByRole("region", { name: "How it checks" });
+    const steps = within(procedure).getAllByRole("listitem");
+    expect(steps.map((step) => step.textContent)).toEqual(detail.procedure);
+
+    const verdicts = screen.getByRole("region", {
+      name: "How the verdict is decided",
+    });
+    const terms = within(verdicts).getAllByRole("term");
+    expect(terms.map((term) => term.textContent)).toEqual([
+      "FindingCritical",
+      "No issuePassed",
+      "Inconclusive",
+    ]);
+    expect(
+      within(verdicts)
+        .getAllByRole("definition")
+        .map((rule) => rule.textContent),
+    ).toEqual([
+      detail.verdicts.finding,
+      detail.verdicts.noIssue,
+      detail.verdicts.inconclusive,
+    ]);
+    expect(screen.getByText(detail.sourceFiles[0])).toBeInTheDocument();
+
+    // The last check links back to the one before it only.
+    const pager = screen.getByRole("navigation", { name: "Other checks" });
+    expect(within(pager).getAllByRole("link")).toHaveLength(1);
+    expect(within(pager).getByRole("link")).toHaveAttribute(
+      "href",
+      "#/checks/session_fixation",
+    );
+  });
+
+  test("a finding links to how its check works", async () => {
+    const scan = {
+      scan_id: "scan-link",
+      state: "completed",
+      target_url: "https://app.example/login",
+      event_count: 1,
+      evidence_count: 1,
+      result_count: 1,
+      results: [
+        {
+          check_id: "login_enumeration",
+          outcome: "finding_confirmed",
+          owasp_reference: "WSTG-IDNT-04",
+          explanation: "Repeatable account differences were observed.",
+        },
+      ],
+    };
+    setupMockFetch([{ url: "/api/scans/scan-link", response: scan }]);
+    renderAt("#/scans/scan-link");
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Details for CHK-001 Login account enumeration",
+      }),
+    );
+    const link = screen.getByRole("link", { name: "How this check works" });
+    expect(link).toHaveAttribute("href", "#/checks/login_enumeration");
+
+    fireEvent.click(link);
+    expect(
+      await screen.findByRole("heading", {
+        level: 1,
+        name: "CHK-001 Login account enumeration",
+      }),
+    ).toBeInTheDocument();
+  });
+
+  test("the New scan checks open their explanation in a new tab", () => {
+    setupMockFetch();
+    renderAt("#/new");
+
+    const link = screen.getByRole("link", {
+      name: "How Logout invalidation works",
+    });
+    expect(link).toHaveAttribute("href", "#/checks/logout_invalidation");
+    expect(link).toHaveAttribute("target", "_blank");
+    // The link sits outside the checkbox's label, so it does not toggle it.
+    expect(link.closest("label")).toBeNull();
   });
 });
