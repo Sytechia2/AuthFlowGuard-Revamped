@@ -658,6 +658,7 @@ def run_cross_origin_check(check: CheckId, origin: str) -> tuple[AuthProfile, An
     return profile, run
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "check", [CheckId.SESSION_FIXATION, CheckId.LOGOUT_INVALIDATION]
 )
@@ -683,6 +684,7 @@ def test_session_checks_never_send_requests_outside_scope(check: CheckId) -> Non
     assert result.outcome is CheckOutcome.NO_ISSUE_OBSERVED
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "check", [CheckId.SESSION_FIXATION, CheckId.LOGOUT_INVALIDATION]
 )
@@ -759,6 +761,7 @@ DESTRUCTIVE_LOGOUT_FORMS = [
 ]
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("form", DESTRUCTIVE_LOGOUT_FORMS, ids=["button", "input"])
 def test_logout_form_with_a_destructive_submit_is_never_submitted(form: str) -> None:
     posted: list[str] = []
@@ -769,6 +772,7 @@ def test_logout_form_with_a_destructive_submit_is_never_submitted(form: str) -> 
     assert posted == []
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("form", DESTRUCTIVE_LOGOUT_FORMS, ids=["button", "input"])
 def test_logout_search_skips_a_destructive_form_for_a_safe_one(form: str) -> None:
     safe = '<form method="post" action="/logout"><button>Log out</button></form>'
