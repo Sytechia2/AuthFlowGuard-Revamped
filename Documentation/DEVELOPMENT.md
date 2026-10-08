@@ -43,6 +43,17 @@ Run the backend tests from the repository root:
 .\.venv\Scripts\python -m pytest
 ```
 
+The full run takes several minutes, because many tests launch Chromium or run
+a whole scan against a served fixture. Those tests are marked `slow`. For a
+quick check while working, skip them:
+
+```powershell
+.\.venv\Scripts\python -m pytest -m "not slow"
+```
+
+This keeps the analyser, rule, and other unit tests and finishes in seconds.
+Run the full suite, without the marker filter, before merging.
+
 Run the interface behavior tests and build it from `frontend`:
 
 ```powershell

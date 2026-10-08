@@ -184,6 +184,7 @@ def run_logout_check(origin: str, profile: AuthProfile) -> Any:
     )
 
 
+@pytest.mark.slow
 def test_logout_behind_an_account_menu_is_verified_saved_and_replayed() -> None:
     with serve(create_client_logout_app()) as origin:
         secrets = RuntimeSecrets(
@@ -256,6 +257,7 @@ def test_logout_behind_an_account_menu_is_verified_saved_and_replayed() -> None:
     assert result.outcome is CheckOutcome.FINDING_CONFIRMED
 
 
+@pytest.mark.slow
 def test_a_page_whose_only_match_is_delete_account_saves_and_clicks_nothing() -> None:
     application = account_app(
         """<button aria-haspopup="menu"
@@ -271,6 +273,7 @@ def test_a_page_whose_only_match_is_delete_account_saves_and_clicks_nothing() ->
     assert application.state.deleted == 0
 
 
+@pytest.mark.slow
 def test_a_logout_that_leaves_the_account_signed_in_is_not_saved() -> None:
     application = account_app(
         """<form method="post" action="/logout"><button>Log out</button></form>""",
@@ -284,6 +287,7 @@ def test_a_logout_that_leaves_the_account_signed_in_is_not_saved() -> None:
     assert application.state.logouts == 1
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [
@@ -356,6 +360,7 @@ AI_ONLY_ACCOUNT = """
     <form method="post" action="/logout"><button>Leave</button></form>"""
 
 
+@pytest.mark.slow
 def test_ai_logout_is_validated_verified_saved_and_costed() -> None:
     application = account_app(AI_ONLY_ACCOUNT)
     ledger = CostLedger()
@@ -378,6 +383,7 @@ def test_ai_logout_is_validated_verified_saved_and_costed() -> None:
     assert [entry.is_reservation for entry in ledger] == [True, False]
 
 
+@pytest.mark.slow
 def test_a_malicious_ai_logout_answer_is_rejected() -> None:
     application = account_app(AI_ONLY_ACCOUNT)
     ledger = CostLedger()
@@ -519,6 +525,7 @@ def run_form_check(
 BOTH_FORMS = frozenset({AuthFeature.REGISTRATION, AuthFeature.RESET_REQUEST})
 
 
+@pytest.mark.slow
 def test_hash_routed_links_are_saved_and_used_by_the_form_checks() -> None:
     with serve(hash_routed_app()) as origin:
         # "Not yet a customer?" says nothing the rules recognise, and the
@@ -584,6 +591,7 @@ def test_hash_routed_links_are_saved_and_used_by_the_form_checks() -> None:
     assert unsaved.evidence.errors == ["ValueError"]
 
 
+@pytest.mark.slow
 def test_an_explicit_form_url_wins_over_the_saved_one() -> None:
     with serve(hash_routed_app()) as origin:
         profile = with_form_link(

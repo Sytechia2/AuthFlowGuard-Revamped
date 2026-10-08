@@ -379,6 +379,7 @@ def test_live_run_needs_confirmation_and_a_cost_cap(
 # --- End to end -------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_double_run_against_the_controlled_application(tmp_path: Path) -> None:
     exit_code = role_accuracy.main(
         [

@@ -128,6 +128,7 @@ def guided_login_actions(origin: str) -> list[BrowserAction]:
     ]
 
 
+@pytest.mark.slow
 def test_flow_executes_csrf_safe_login_and_builds_verified_profile() -> None:
     with run_controlled_server() as origin:
         result = asyncio.run(run_verified_flow(origin))
@@ -166,12 +167,14 @@ def test_flow_executes_csrf_safe_login_and_builds_verified_profile() -> None:
     assert "must-not-be-saved" not in persisted_output
 
 
+@pytest.mark.slow
 def test_flow_rejects_login_when_authenticated_marker_is_absent() -> None:
     with run_controlled_server() as origin:
         with pytest.raises(ValueError, match="account marker was absent"):
             asyncio.run(run_verified_flow(origin, password="incorrect-password"))
 
 
+@pytest.mark.slow
 def test_guided_flow_records_references_and_redacts_live_values() -> None:
     with run_controlled_server() as origin:
         result = asyncio.run(
@@ -201,6 +204,7 @@ def test_guided_flow_records_references_and_redacts_live_values() -> None:
     assert result.actions[2].value_reference == "login-password"
 
 
+@pytest.mark.slow
 def test_guided_flow_builds_verified_profile_and_replays_in_fresh_context() -> None:
     with run_controlled_server() as origin:
         target = TargetScope(
@@ -270,6 +274,7 @@ def test_profile_replay_rejects_unverified_or_incomplete_profiles() -> None:
         )
 
 
+@pytest.mark.slow
 def test_saved_profile_revalidation_rejects_changed_control_metadata() -> None:
     with run_controlled_server() as origin:
         result = asyncio.run(run_verified_flow(origin))
@@ -465,6 +470,7 @@ def without_fingerprints(profile: AuthProfile) -> AuthProfile:
     return legacy
 
 
+@pytest.mark.slow
 def test_a_saved_login_still_succeeds_after_controls_are_added_before_it() -> None:
     with run_shifting_login_server() as origin:
         recorded = asyncio.run(
@@ -515,6 +521,7 @@ def test_a_saved_login_still_succeeds_after_controls_are_added_before_it() -> No
         assert ShiftingLoginHandler.newsletter_posts == []
 
 
+@pytest.mark.slow
 def test_an_old_profile_replays_by_position_and_gains_fingerprints() -> None:
     with run_shifting_login_server() as origin:
         recorded = asyncio.run(
@@ -546,6 +553,7 @@ def test_an_old_profile_replays_by_position_and_gains_fingerprints() -> None:
     ]
 
 
+@pytest.mark.slow
 def test_a_saved_control_that_is_gone_asks_for_guidance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

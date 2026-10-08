@@ -266,6 +266,7 @@ async def execute_all_action_types(origin: str) -> None:
             await browser.close()
 
 
+@pytest.mark.slow
 def test_executor_supports_every_browser_action_type() -> None:
     with run_action_server() as origin:
         asyncio.run(execute_all_action_types(origin))
@@ -349,11 +350,13 @@ async def verify_executor_rejects_stale_references(origin: str) -> None:
             await browser.close()
 
 
+@pytest.mark.slow
 def test_executor_rejects_missing_secrets_and_stale_controls() -> None:
     with run_action_server() as origin:
         asyncio.run(verify_executor_rejects_stale_references(origin))
 
 
+@pytest.mark.slow
 def test_snapshot_remains_consistent_while_page_replaces_its_controls() -> None:
     async def snapshot_changing_page() -> None:
         async with async_playwright() as playwright:
@@ -429,6 +432,7 @@ async def sign_in_to_client_rendered_page(origin: str) -> None:
             await browser.close()
 
 
+@pytest.mark.slow
 def test_executor_waits_for_client_rendering_and_background_sign_in() -> None:
     with run_action_server() as origin:
         asyncio.run(sign_in_to_client_rendered_page(origin))
@@ -504,6 +508,7 @@ def click(control_id: str) -> BrowserAction:
     )
 
 
+@pytest.mark.slow
 def test_username_is_not_typed_into_a_button() -> None:
     async def check(page: Page, executor: BrowserActionExecutor) -> None:
         with pytest.raises(UnsafeControlError) as caught:
@@ -532,6 +537,7 @@ def test_username_is_not_typed_into_a_button() -> None:
     )
 
 
+@pytest.mark.slow
 def test_password_is_not_typed_into_a_text_field() -> None:
     async def check(page: Page, executor: BrowserActionExecutor) -> None:
         with pytest.raises(UnsafeControlError, match="not a password field"):
@@ -549,6 +555,7 @@ def test_password_is_not_typed_into_a_text_field() -> None:
     )
 
 
+@pytest.mark.slow
 def test_non_password_is_not_typed_into_a_password_field() -> None:
     async def check(page: Page, executor: BrowserActionExecutor) -> None:
         with pytest.raises(
@@ -567,6 +574,7 @@ def test_non_password_is_not_typed_into_a_password_field() -> None:
     )
 
 
+@pytest.mark.slow
 def test_wrong_password_is_still_typed_into_the_password_field() -> None:
     # Login enumeration's failed attempts type a wrong password on purpose.
     async def check(page: Page, executor: BrowserActionExecutor) -> None:
@@ -586,6 +594,7 @@ def test_wrong_password_is_still_typed_into_the_password_field() -> None:
     )
 
 
+@pytest.mark.slow
 def test_destructive_controls_are_never_clicked() -> None:
     async def check(page: Page, executor: BrowserActionExecutor) -> None:
         for control_id in ("control-1", "control-2", "control-3"):
@@ -620,6 +629,7 @@ def test_destructive_controls_are_never_clicked() -> None:
     )
 
 
+@pytest.mark.slow
 def test_a_cookie_banner_close_button_is_still_clickable() -> None:
     async def check(page: Page, executor: BrowserActionExecutor) -> None:
         await executor.execute(click("control-1"))
@@ -638,6 +648,7 @@ def test_a_cookie_banner_close_button_is_still_clickable() -> None:
     )
 
 
+@pytest.mark.slow
 def test_a_control_that_never_appears_is_not_clicked() -> None:
     async def check(page: Page, executor: BrowserActionExecutor) -> None:
         with pytest.raises(UnsafeControlError, match="did not become visible"):
@@ -656,6 +667,7 @@ def test_a_control_that_never_appears_is_not_clicked() -> None:
     )
 
 
+@pytest.mark.slow
 def test_a_field_revealed_later_is_still_filled() -> None:
     async def check(page: Page, executor: BrowserActionExecutor) -> None:
         await executor.execute(fill("control-1", "username"))
@@ -676,6 +688,7 @@ def test_a_field_revealed_later_is_still_filled() -> None:
     )
 
 
+@pytest.mark.slow
 def test_a_fill_timeout_becomes_a_safe_error(monkeypatch: pytest.MonkeyPatch) -> None:
     # Playwright's own timeout message quotes the value it was typing.
     async def time_out(_locator: Locator, value: str, **_kwargs: object) -> None:
@@ -707,6 +720,7 @@ def test_a_fill_timeout_becomes_a_safe_error(monkeypatch: pytest.MonkeyPatch) ->
     )
 
 
+@pytest.mark.slow
 def test_a_click_timeout_becomes_a_safe_error() -> None:
     # A control covered by an overlay never receives the click.
     async def check(page: Page, executor: BrowserActionExecutor) -> None:
@@ -818,6 +832,7 @@ async def record(
     return (await executor.execute(action)).recorded(action)
 
 
+@pytest.mark.slow
 def test_a_recorded_control_is_still_used_after_a_banner_moves_it() -> None:
     async def check(page: Page, executor: BrowserActionExecutor, load: Load) -> None:
         await load(f"<body>{LOGIN_FORM}</body>")
@@ -850,6 +865,7 @@ def test_a_recorded_control_is_still_used_after_a_banner_moves_it() -> None:
     )
 
 
+@pytest.mark.slow
 def test_a_removed_control_is_refused_without_using_the_old_position(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -882,6 +898,7 @@ def test_a_removed_control_is_refused_without_using_the_old_position(
     )
 
 
+@pytest.mark.slow
 def test_the_recorded_one_of_two_identical_controls_is_chosen(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -916,6 +933,7 @@ def test_the_recorded_one_of_two_identical_controls_is_chosen(
     )
 
 
+@pytest.mark.slow
 def test_a_generated_id_that_changes_between_loads_is_still_resolved() -> None:
     async def check(page: Page, executor: BrowserActionExecutor, load: Load) -> None:
         await load('<body><input id="mat-input-0" type="email" name="email"></body>')
@@ -937,6 +955,7 @@ def test_a_generated_id_that_changes_between_loads_is_still_resolved() -> None:
     )
 
 
+@pytest.mark.slow
 def test_an_action_saved_without_a_fingerprint_is_resolved_by_position() -> None:
     async def check(page: Page, executor: BrowserActionExecutor, load: Load) -> None:
         await load(f"<body>{LOGIN_FORM}</body>")
@@ -958,6 +977,7 @@ def test_an_action_saved_without_a_fingerprint_is_resolved_by_position() -> None
     )
 
 
+@pytest.mark.slow
 def test_fingerprints_never_hold_what_a_field_contains() -> None:
     async def check(page: Page, executor: BrowserActionExecutor, load: Load) -> None:
         await load(f"<body>{LOGIN_FORM}</body>")
@@ -977,6 +997,7 @@ def test_fingerprints_never_hold_what_a_field_contains() -> None:
     asyncio.run(run_on_pages(RuntimeSecrets({}), frozenset(), check))
 
 
+@pytest.mark.slow
 def test_a_briefly_disabled_field_is_filled_once_it_is_enabled() -> None:
     async def check(page: Page, executor: BrowserActionExecutor) -> None:
         await executor.execute(fill("control-1", "username"))
@@ -997,6 +1018,7 @@ def test_a_briefly_disabled_field_is_filled_once_it_is_enabled() -> None:
     )
 
 
+@pytest.mark.slow
 def test_a_field_that_stays_disabled_is_refused() -> None:
     async def check(page: Page, executor: BrowserActionExecutor) -> None:
         with pytest.raises(UnsafeControlError) as caught:

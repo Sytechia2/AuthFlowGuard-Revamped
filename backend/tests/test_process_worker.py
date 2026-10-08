@@ -128,6 +128,7 @@ def _controlled_execution(origin: str) -> ScanExecutionInput:
     )
 
 
+@pytest.mark.slow
 def test_process_worker_keeps_api_responsive_and_releases_slot_after_cancel(
     tmp_path: Path,
 ) -> None:
@@ -190,6 +191,7 @@ def test_process_worker_keeps_api_responsive_and_releases_slot_after_cancel(
         unrelated.wait(timeout=5)
 
 
+@pytest.mark.slow
 def test_abrupt_worker_exit_becomes_safe_failed_state(tmp_path: Path) -> None:
     manager = ScanManager(tmp_path, cancellation_grace_seconds=0.2)
     record = manager.create_scan(_request())
@@ -212,6 +214,7 @@ def test_abrupt_worker_exit_becomes_safe_failed_state(tmp_path: Path) -> None:
         manager.shutdown()
 
 
+@pytest.mark.slow
 def test_unresponsive_worker_is_force_terminated_after_grace_deadline(
     tmp_path: Path,
 ) -> None:
@@ -252,6 +255,7 @@ def test_unresponsive_worker_is_force_terminated_after_grace_deadline(
     assert supervisor.is_active(scan_id, 1) is False
 
 
+@pytest.mark.slow
 def test_manager_shutdown_reaps_its_active_worker(tmp_path: Path) -> None:
     manager = ScanManager(tmp_path, cancellation_grace_seconds=0.2)
     record = manager.create_scan(_request())
@@ -269,6 +273,7 @@ def test_manager_shutdown_reaps_its_active_worker(tmp_path: Path) -> None:
     assert record.state is ScanState.CANCELLED
 
 
+@pytest.mark.slow
 def test_worker_start_does_not_wait_and_startup_timeout_fails_safely(
     tmp_path: Path,
 ) -> None:
@@ -298,6 +303,7 @@ def test_worker_start_does_not_wait_and_startup_timeout_fails_safely(
         manager.shutdown()
 
 
+@pytest.mark.slow
 def test_hung_worker_is_stopped_at_its_runtime_limit(tmp_path: Path) -> None:
     manager = ScanManager(tmp_path, worker_timeout=1.0)
     manager._supervisor = WorkerSupervisor(
@@ -493,6 +499,7 @@ def test_worker_side_state_changes_publish_full_progress(tmp_path: Path) -> None
     assert message.progress.provenance.actual_engine == "bedrock"
 
 
+@pytest.mark.slow
 def test_complete_scan_runs_and_persists_outside_api_process(tmp_path: Path) -> None:
     with run_controlled_server() as origin:
         manager = ScanManager(tmp_path)
@@ -525,6 +532,7 @@ def test_complete_scan_runs_and_persists_outside_api_process(tmp_path: Path) -> 
             manager.shutdown()
 
 
+@pytest.mark.slow
 def test_guidance_observation_and_replay_use_spawned_workers(tmp_path: Path) -> None:
     with run_controlled_server() as origin:
         manager = ScanManager(tmp_path)
@@ -563,6 +571,7 @@ def test_guidance_observation_and_replay_use_spawned_workers(tmp_path: Path) -> 
             manager.shutdown()
 
 
+@pytest.mark.slow
 def test_unsafe_control_reason_crosses_the_worker_boundary(tmp_path: Path) -> None:
     # A guided flow whose second step points the username at the submit
     # button, as a replay against the wrong page would.
@@ -629,6 +638,7 @@ def _completes_then_lingers_worker(
     time.sleep(30)
 
 
+@pytest.mark.slow
 def test_worker_that_lingers_after_its_result_is_reaped_and_result_kept(
     tmp_path: Path,
 ) -> None:

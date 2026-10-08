@@ -117,6 +117,7 @@ def run_check(origin: str, check: CheckId) -> tuple[AuthProfile, Any]:
     return profile, run
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     ("check", "analyser", "vulnerable", "secure"),
     [
@@ -154,6 +155,7 @@ def test_session_checks_cover_secure_and_vulnerable_modes(
     assert result == analyser(run.evidence, profile, SecurityPolicy())
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "check", [CheckId.SESSION_FIXATION, CheckId.LOGOUT_INVALIDATION]
 )
@@ -172,6 +174,7 @@ def test_session_check_malformed_evidence_is_inconclusive(check: CheckId) -> Non
     )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "check", [CheckId.SESSION_FIXATION, CheckId.LOGOUT_INVALIDATION]
 )
@@ -462,6 +465,7 @@ def create_client_logout_app() -> FastAPI:
     return application
 
 
+@pytest.mark.slow
 def test_client_side_menu_logout_is_found_and_reported() -> None:
     with serve(create_client_logout_app()) as origin:
         base_profile = profile_for(origin)
@@ -513,6 +517,7 @@ async def _search_for_logout(html: str) -> tuple[str | None, list[str]]:
             await browser.close()
 
 
+@pytest.mark.slow
 def test_logout_search_never_clicks_destructive_or_navigating_controls() -> None:
     """Controls whose labels mention the account, but that act or navigate
     rather than open a menu, sit before the real account menu."""
@@ -541,6 +546,7 @@ def test_logout_search_never_clicks_destructive_or_navigating_controls() -> None
     assert clicked == ["menu"]
 
 
+@pytest.mark.slow
 def test_logout_search_stops_when_a_toggle_navigates() -> None:
     found, clicked = asyncio.run(
         _search_for_logout(

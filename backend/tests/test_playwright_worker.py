@@ -7,9 +7,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from uuid import uuid4
 
+import pytest
 from authflowguard.models import EvidenceKind, TargetScope
 from authflowguard.playwright_worker import PlaywrightWorker
 from playwright.async_api import async_playwright
+
+pytestmark = pytest.mark.slow
 
 TEST_COOKIE_VALUE = "live-cookie-secret-value"
 TEST_STORAGE_VALUE = "live-storage-secret-value"

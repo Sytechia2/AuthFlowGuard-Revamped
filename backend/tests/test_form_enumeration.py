@@ -136,6 +136,7 @@ async def run_check(
         secrets.discard_all()
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("check", CHECKS)
 @pytest.mark.parametrize("mode", list(EvaluationMode))
 def test_browser_outcomes_use_fresh_csrf_and_sessions_and_redact_evidence(
@@ -367,6 +368,7 @@ def custom_form_app(check: CheckId, problem: str = "") -> FastAPI:
     return app
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("check", CHECKS)
 @pytest.mark.parametrize(
     "problem", ["missing_form", "missing_username", "timeout", "unexpected_response"]
@@ -387,6 +389,7 @@ def test_browser_failures_produce_execution_error(
     )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("check", CHECKS)
 def test_navigation_failure_is_an_execution_error(check: CheckId) -> None:
     with socket.socket() as unavailable:
@@ -401,6 +404,7 @@ def test_navigation_failure_is_an_execution_error(check: CheckId) -> None:
     )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("check", CHECKS)
 def test_browser_normalizes_dynamic_tokens_without_leaking_values(
     check: CheckId,
@@ -440,6 +444,7 @@ def test_dynamic_normalization_preserves_account_state_difference() -> None:
     )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("check", CHECKS)
 def test_cancellation_stops_before_second_submission(check: CheckId) -> None:
     app = custom_form_app(check)
@@ -461,6 +466,7 @@ def test_cancellation_stops_before_second_submission(check: CheckId) -> None:
     )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("check", CHECKS)
 def test_missing_form_link_and_out_of_scope_form_url_are_not_guessed(
     check: CheckId,
@@ -484,6 +490,7 @@ def test_analyser_rejects_the_other_check_evidence(check: CheckId) -> None:
         )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("check", CHECKS)
 def test_discovers_nonstandard_route_from_visible_link(check: CheckId) -> None:
     app = custom_form_app(check)
@@ -597,6 +604,7 @@ render();
 </script>"""
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     ("check", "vulnerable", "expected"),
     [

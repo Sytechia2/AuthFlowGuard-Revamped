@@ -18,6 +18,8 @@ from authflowguard.secrets import RuntimeSecrets
 from playwright.async_api import Page, async_playwright
 from test_automatic_actions import FakeActionClient, run_controlled_server
 
+pytestmark = pytest.mark.slow
+
 
 class ModelServiceUnavailableError(RuntimeError):
     """Stands in for Bedrock being unreachable or refusing the request."""

@@ -198,6 +198,7 @@ async def run_check(profile: AuthProfile) -> LoginEnumerationRun:
     )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     ("mode", "expected_outcome"),
     [
@@ -385,6 +386,7 @@ def run_two_step_check(
     return profile, run
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     ("mode", "expected_outcome"),
     [
@@ -404,6 +406,7 @@ def test_two_step_login_records_an_early_rejection(
     assert result.outcome is expected_outcome
 
 
+@pytest.mark.slow
 def test_known_identifier_attempt_must_complete_every_step() -> None:
     # An identifier the app rejects at the first step, used as the known one:
     # the flow cannot be completed, which must be an error, never "no issue".

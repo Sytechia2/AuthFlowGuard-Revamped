@@ -177,6 +177,7 @@ def test_selected_checks_only_are_run_persisted_and_reanalysed_offline(
             assert code in html and check.value in html
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("mode", list(EvaluationMode))
 @pytest.mark.parametrize("guided", [False, True])
 def test_real_scan_runs_both_checks_with_automatic_or_guided_profile(
