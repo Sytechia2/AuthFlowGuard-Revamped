@@ -2378,6 +2378,32 @@ class ScanManager:
     def _read_datetime(cls, value: Any, fallback: datetime) -> datetime:
         return cls._read_optional_datetime(value) or fallback
 
+    @staticmethod
+    def _verification_settings(record: ScanRecord) -> dict[str, str | None] | None:
+        """The non-secret login proof settings, while they are known.
+
+        A paused scan still holds its execution input, so the guidance form
+        can show and keep the values the scan was started with. Afterwards
+        only the verified profile's resource and description remain; the
+        selector is not saved. Runtime secrets are never included.
+        """
+
+        execution = record.pending_execution
+        if execution is not None:
+            return {
+                "protected_resource": str(execution.protected_resource),
+                "account_marker_selector": execution.account_marker_selector,
+                "account_marker_description": execution.account_marker_description,
+            }
+        check = record.profile.protected_resource_check if record.profile else None
+        if check is not None:
+            return {
+                "protected_resource": check.resource,
+                "account_marker_selector": None,
+                "account_marker_description": check.account_marker_description,
+            }
+        return None
+
     def snapshot(self, record: ScanRecord) -> dict[str, Any]:
         scan_directory = self._store.scan_directory(record.scan_id)
         return {
@@ -2401,6 +2427,7 @@ class ScanManager:
             ),
             "cancel_requested": record.cancel_requested,
             "target_url": str(record.request.target.target_url),
+            "verification": self._verification_settings(record),
             "event_count": len(record.events),
             "evidence_count": len(record.evidence),
             "result_count": len(record.results),
