@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from threading import Thread
 
+import pytest
 import uvicorn
 from authflowguard.evaluation_targets.controlled_app import (
     KNOWN_PASSWORD,
@@ -15,6 +16,8 @@ from authflowguard.evaluation_targets.controlled_app import (
     create_controlled_app,
 )
 from playwright.sync_api import sync_playwright
+
+pytestmark = pytest.mark.slow
 
 
 @contextmanager

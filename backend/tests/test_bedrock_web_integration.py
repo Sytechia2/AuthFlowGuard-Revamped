@@ -175,6 +175,7 @@ def create_multipage_app() -> FastAPI:
     return app
 
 
+@pytest.mark.slow
 def test_full_api_bedrock_scan_against_application_a(tmp_path: Path) -> None:
     """Test 1: Full API scan using DeterministicModelDouble against Application A."""
     with run_app_server(create_controlled_app(EvaluationMode.SECURE)) as origin:
@@ -258,6 +259,7 @@ def test_full_api_bedrock_scan_against_application_a(tmp_path: Path) -> None:
         assert len(reservations) == len(reconciliations)
 
 
+@pytest.mark.slow
 def test_multipage_navigation_discovery_and_replay() -> None:
     """Test 2: Multi-page navigation discovery & replay with step_control_signatures."""
     with run_app_server(create_multipage_app()) as origin:
@@ -326,6 +328,7 @@ def test_multipage_navigation_discovery_and_replay() -> None:
         )
 
 
+@pytest.mark.slow
 def test_failed_action_is_excluded_from_saved_replay() -> None:
     with run_app_server(create_controlled_app(EvaluationMode.SECURE)) as origin:
         target = TargetScope(target_url=f"{origin}/login", permitted_origins=[origin])
@@ -370,6 +373,7 @@ def test_failed_action_is_excluded_from_saved_replay() -> None:
         )
 
 
+@pytest.mark.slow
 def test_application_c_two_form_disambiguation_with_model_double() -> None:
     """Test 3: Application C two-form disambiguation using model double."""
     with run_app_server(create_site_app(EvaluationMode.SECURE)) as origin:
@@ -410,6 +414,7 @@ def test_application_c_two_form_disambiguation_with_model_double() -> None:
         assert BrowserActionType.CLICK in step_types
 
 
+@pytest.mark.slow
 def test_proof_rejection_halts_when_marker_visible_anonymously() -> None:
     """Test 4: Proof rejection test (account marker visible anonymously halts)."""
     with run_app_server(create_controlled_app(EvaluationMode.SECURE)) as origin:
@@ -447,6 +452,7 @@ def test_proof_rejection_halts_when_marker_visible_anonymously() -> None:
         )
 
 
+@pytest.mark.slow
 def test_replay_control_signature_validation_rejects_tampered_control() -> None:
     """Test 5: Replay control signature validation (tampered control rejects replay)."""
     with run_app_server(create_controlled_app(EvaluationMode.SECURE)) as origin:
@@ -521,6 +527,7 @@ def test_replay_control_signature_validation_rejects_tampered_control() -> None:
             )
 
 
+@pytest.mark.slow
 def test_durable_accounting_persistence_and_write_failure(tmp_path: Path) -> None:
     """Test 6: Durable accounting reservation persistence and safe failure handling."""
     ledger_path = tmp_path / "test-ledger.ndjson"
@@ -731,6 +738,7 @@ def test_evaluation_budget_counts_outstanding_reservations(tmp_path: Path) -> No
     assert budget.remaining_usd == pytest.approx(0.1)
 
 
+@pytest.mark.slow
 def test_secret_redaction_in_outbound_observation() -> None:
     """Test 7: Secret redaction in outbound prompt / model observation."""
     with run_app_server(create_controlled_app(EvaluationMode.SECURE)) as origin:
@@ -882,6 +890,7 @@ def test_bedrock_server_caps_reject_before_worker_starts(
     assert app.state.scan_manager.get_scan(UUID(scan_id)).future is None
 
 
+@pytest.mark.slow
 def test_failed_discovery_keeps_events_and_model_usage(tmp_path: Path) -> None:
     with run_app_server(create_controlled_app(EvaluationMode.SECURE)) as origin:
         errors = [
@@ -940,6 +949,7 @@ def test_failed_discovery_keeps_events_and_model_usage(tmp_path: Path) -> None:
         assert any(event["kind"] == "error" for event in events)
 
 
+@pytest.mark.slow
 def test_reload_persisted_scan_with_cost_ledger_and_provenance(tmp_path: Path) -> None:
     """Test 9: Reload persisted scan from disk with cost ledger and provenance."""
     with run_app_server(create_controlled_app(EvaluationMode.SECURE)) as origin:

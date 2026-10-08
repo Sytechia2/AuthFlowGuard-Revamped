@@ -136,6 +136,7 @@ async def run_check(
         secrets.discard_all()
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("check", CHECKS)
 @pytest.mark.parametrize("mode", list(EvaluationMode))
 def test_browser_outcomes_use_fresh_csrf_and_sessions_and_redact_evidence(
@@ -367,6 +368,7 @@ def custom_form_app(check: CheckId, problem: str = "") -> FastAPI:
     return app
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("check", CHECKS)
 @pytest.mark.parametrize(
     "problem", ["missing_form", "missing_username", "timeout", "unexpected_response"]
@@ -387,6 +389,7 @@ def test_browser_failures_produce_execution_error(
     )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("check", CHECKS)
 def test_navigation_failure_is_an_execution_error(check: CheckId) -> None:
     with socket.socket() as unavailable:
@@ -401,6 +404,7 @@ def test_navigation_failure_is_an_execution_error(check: CheckId) -> None:
     )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("check", CHECKS)
 def test_browser_normalizes_dynamic_tokens_without_leaking_values(
     check: CheckId,
@@ -440,6 +444,7 @@ def test_dynamic_normalization_preserves_account_state_difference() -> None:
     )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("check", CHECKS)
 def test_cancellation_stops_before_second_submission(check: CheckId) -> None:
     app = custom_form_app(check)
@@ -461,6 +466,7 @@ def test_cancellation_stops_before_second_submission(check: CheckId) -> None:
     )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("check", CHECKS)
 def test_missing_form_link_and_out_of_scope_form_url_are_not_guessed(
     check: CheckId,
@@ -484,6 +490,7 @@ def test_analyser_rejects_the_other_check_evidence(check: CheckId) -> None:
         )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("check", CHECKS)
 def test_discovers_nonstandard_route_from_visible_link(check: CheckId) -> None:
     app = custom_form_app(check)
@@ -597,25 +604,30 @@ render();
 </script>"""
 
 
-@pytest.mark.parametrize("check", CHECKS)
+@pytest.mark.slow
 @pytest.mark.parametrize(
-    ("vulnerable", "noisy", "expected"),
+    ("check", "vulnerable", "expected"),
     [
-        (True, False, CheckOutcome.FINDING_CONFIRMED),
-        (False, False, CheckOutcome.NO_ISSUE_OBSERVED),
-        # Account state still shows through the volatile content.
-        (True, True, CheckOutcome.FINDING_CONFIRMED),
-        # Volatile content alone must not read as enumeration.
-        (False, True, CheckOutcome.INCONCLUSIVE),
+        # New record ids and volatile content alone must not read as
+        # enumeration.
+        (CheckId.REGISTRATION_ENUMERATION, False, CheckOutcome.INCONCLUSIVE),
+        # The debounced lookup's account state still shows through the
+        # volatile content.
+        (CheckId.RESET_REQUEST_ENUMERATION, True, CheckOutcome.FINDING_CONFIRMED),
     ],
 )
 def test_client_rendered_forms_are_compared(
-    check: CheckId, vulnerable: bool, noisy: bool, expected: CheckOutcome
+    check: CheckId, vulnerable: bool, expected: CheckOutcome
 ) -> None:
+    """Both checks capture a noisy single-page app in a real browser.
+
+    Every vulnerable/noisy combination is covered offline by the client form
+    analysis tests below, so the browser runs only one case per check.
+    """
     route = (
         "register" if check is CheckId.REGISTRATION_ENUMERATION else "forgot-password"
     )
-    with serve(client_form_app(vulnerable, noisy)) as origin:
+    with serve(client_form_app(vulnerable, noisy=True)) as origin:
         profile = profile_for(origin)
         run = asyncio.run(run_check(check, profile, form_url=f"{origin}/app#/{route}"))
 
@@ -632,7 +644,10 @@ def test_client_rendered_forms_are_compared(
 
 
 def client_signature(
-    responses: list[list[Any]], submitted: list[list[Any]] | None = None
+    responses: list[list[Any]],
+    submitted: list[list[Any]] | None = None,
+    *,
+    control: str = "a" * 64,
 ) -> dict[str, Any]:
     def state(background: list[list[Any]]) -> dict[str, Any]:
         return {
@@ -642,7 +657,7 @@ def client_signature(
 
     return {
         "interaction": "client",
-        "reaction": state(responses),
+        "reaction": {**state(responses), "control_fingerprint": control},
         "submission_observed": submitted is not None,
         "submission": state(submitted) if submitted is not None else None,
         "safe_visible_messages": [],
@@ -708,42 +723,103 @@ def test_client_form_analysis_requires_an_exercised_form(
 
 
 REGISTERED = ["POST", "b" * 64, 201, "c" * 64]
+REGISTRATION = CheckId.REGISTRATION_ENUMERATION
+RESET = CheckId.RESET_REQUEST_ENUMERATION
+# A vulnerable reset form enables its next field for a known account.
+ENABLED = "e" * 64
+
+
+def lookup(body: str) -> list[Any]:
+    return ["GET", "b" * 64, 200, body * 64]
 
 
 @pytest.mark.parametrize(
-    ("known", "repeat", "expected"),
+    ("check", "known", "unknown", "repeat", "expected"),
     [
+        # Registration: a secure, quiet app answers every identifier alike.
+        (
+            REGISTRATION,
+            client_signature([], [REGISTERED]),
+            client_signature([], [REGISTERED]),
+            client_signature([], [REGISTERED]),
+            CheckOutcome.NO_ISSUE_OBSERVED,
+        ),
         # Only the body differs, and it differs between nonexistent
         # identifiers too: volatile content, not account state.
         (
+            REGISTRATION,
             client_signature([], [["POST", "b" * 64, 201, "d" * 64]]),
+            client_signature([], [REGISTERED]),
             client_signature([], [["POST", "b" * 64, 201, "e" * 64]]),
             CheckOutcome.INCONCLUSIVE,
         ),
         # The body is volatile, but the status differs only for the known
         # identifier.
         (
+            REGISTRATION,
             client_signature([], [["POST", "b" * 64, 400, "d" * 64]]),
+            client_signature([], [REGISTERED]),
             client_signature([], [["POST", "b" * 64, 201, "e" * 64]]),
             CheckOutcome.FINDING_CONFIRMED,
         ),
         # The nonexistent attempts agree, so the known difference is stable.
         (
+            REGISTRATION,
             client_signature([], [["POST", "b" * 64, 201, "d" * 64]]),
+            client_signature([], [REGISTERED]),
             client_signature([], [REGISTERED]),
             CheckOutcome.FINDING_CONFIRMED,
         ),
         (
+            REGISTRATION,
+            client_signature([], [REGISTERED]),
             client_signature([], [REGISTERED]),
             {"interaction": "client"},
+            CheckOutcome.INCONCLUSIVE,
+        ),
+        # Reset: a vulnerable, quiet app answers the known account's lookup
+        # differently, and the nonexistent lookups agree.
+        (
+            RESET,
+            client_signature([lookup("c")], control=ENABLED),
+            client_signature([lookup("d")]),
+            client_signature([lookup("d")]),
+            CheckOutcome.FINDING_CONFIRMED,
+        ),
+        # A secure, quiet app answers every lookup alike.
+        (
+            RESET,
+            client_signature([lookup("d")]),
+            client_signature([lookup("d")]),
+            client_signature([lookup("d")]),
+            CheckOutcome.NO_ISSUE_OBSERVED,
+        ),
+        # Every lookup body is volatile, but only the known account enables
+        # the next field.
+        (
+            RESET,
+            client_signature([lookup("c")], control=ENABLED),
+            client_signature([lookup("d")]),
+            client_signature([lookup("e")]),
+            CheckOutcome.FINDING_CONFIRMED,
+        ),
+        # Volatile lookup bodies alone must not read as enumeration.
+        (
+            RESET,
+            client_signature([lookup("c")]),
+            client_signature([lookup("d")]),
+            client_signature([lookup("e")]),
             CheckOutcome.INCONCLUSIVE,
         ),
     ],
 )
 def test_client_form_analysis_ignores_volatile_differences(
-    known: dict[str, Any], repeat: dict[str, Any], expected: CheckOutcome
+    check: CheckId,
+    known: dict[str, Any],
+    unknown: dict[str, Any],
+    repeat: dict[str, Any],
+    expected: CheckOutcome,
 ) -> None:
-    check = CheckId.REGISTRATION_ENUMERATION
     evidence = models.TestRunEvidence(
         evidence_id=uuid4(),
         scan_id=uuid4(),
@@ -751,7 +827,7 @@ def test_client_form_analysis_ignores_volatile_differences(
         profile_version="1.0",
         observations={
             LABELS[0]: known,
-            LABELS[1]: client_signature([], [REGISTERED]),
+            LABELS[1]: unknown,
             REPEAT_LABEL: repeat,
         },
         coverage={"limitations": ["Fixture evidence."]},

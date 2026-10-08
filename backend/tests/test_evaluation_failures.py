@@ -18,6 +18,8 @@ from authflowguard.secrets import RuntimeSecrets
 from playwright.async_api import Page, async_playwright
 from test_automatic_actions import FakeActionClient, run_controlled_server
 
+pytestmark = pytest.mark.slow
+
 
 class ModelServiceUnavailableError(RuntimeError):
     """Stands in for Bedrock being unreachable or refusing the request."""
@@ -145,16 +147,27 @@ def test_a_recovering_model_service_does_not_strand_the_scan(failures: int) -> N
     assert asyncio.run(scenario()) >= 1
 
 
-def test_a_target_that_stops_responding_never_reports_a_security_pass() -> None:
+def test_a_target_that_stops_responding_never_reports_a_security_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A protected resource that hangs must not be read as a clean result.
 
     EVA-006 requires a timeout to produce an explicit outcome. The dangerous
     failure is a navigation that never settles being treated as "nothing
     observed", which would read as no_issue_observed.
+
+    The scan runs in a thread rather than a worker process, so the test can
+    shorten the browser's 30-second default timeout. The hang still outlasts
+    that timeout, so the scan meets the same never-settling navigation in
+    seconds rather than half a minute.
     """
 
+    import functools
     from pathlib import Path
 
+    from authflowguard import authentication
+    from authflowguard.app import create_app
+    from authflowguard.evaluation import case_runner
     from authflowguard.evaluation.case_runner import (
         FaultSpec,
         fixture_for,
@@ -164,6 +177,22 @@ def test_a_target_that_stops_responding_never_reports_a_security_pass() -> None:
         with_injected_fault,
     )
     from authflowguard.models import CheckOutcome
+    from playwright.async_api import Browser, BrowserContext
+
+    browser_timeout_ms = 3_000
+    open_context = authentication._new_context
+
+    async def short_timeout_context(browser: Browser) -> BrowserContext:
+        context = await open_context(browser)
+        context.set_default_timeout(browser_timeout_ms)
+        return context
+
+    monkeypatch.setattr(authentication, "_new_context", short_timeout_context)
+    monkeypatch.setattr(
+        case_runner,
+        "create_app",
+        functools.partial(create_app, worker_backend="thread"),
+    )
 
     case = next(
         c
@@ -178,7 +207,7 @@ def test_a_target_that_stops_responding_never_reports_a_security_pass() -> None:
         0,
         "route",
         "Protected resource stops responding.",
-        delay_seconds=45.0,
+        delay_seconds=2 * browser_timeout_ms / 1000,
     )
 
     import tempfile
@@ -193,3 +222,5 @@ def test_a_target_that_stops_responding_never_reports_a_security_pass() -> None:
     )
     assert result.actual_outcome in (None, CheckOutcome.EXECUTION_ERROR.value)
     assert result.detail, "A timeout must be explained, not left silent"
+    # The browser's own time limit ended the scan, not some unrelated failure.
+    assert "time limit" in result.detail

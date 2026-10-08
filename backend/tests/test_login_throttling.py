@@ -101,6 +101,7 @@ def run_check(
         secrets.discard_all()
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [
@@ -121,6 +122,7 @@ def test_runner_and_analyser_detect_secure_and_vulnerable_lockout(
     assert len(run.evidence.observations["failed_attempts"]) == 4
 
 
+@pytest.mark.slow
 def test_explicit_policy_threshold_is_used_in_evidence() -> None:
     with serve(create_controlled_app(EvaluationMode.SECURE)) as origin:
         profile = profile_for(origin)
@@ -150,6 +152,7 @@ def test_explicit_policy_threshold_is_used_in_evidence() -> None:
     )
 
 
+@pytest.mark.slow
 def test_analyser_is_deterministic_and_offline() -> None:
     with serve(create_controlled_app(EvaluationMode.SECURE)) as origin:
         profile, run = run_check(origin)
@@ -159,6 +162,7 @@ def test_analyser_is_deterministic_and_offline() -> None:
     assert first.result_id == second.result_id
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("malformed", ["missing", "wrong_shape", "missing_status"])
 def test_ambiguous_evidence_is_inconclusive(malformed: str) -> None:
     with serve(create_controlled_app(EvaluationMode.SECURE)) as origin:
@@ -176,6 +180,7 @@ def test_ambiguous_evidence_is_inconclusive(malformed: str) -> None:
     assert result.outcome is CheckOutcome.INCONCLUSIVE
 
 
+@pytest.mark.slow
 def test_execution_failure_is_not_reported_as_secure() -> None:
     profile = profile_for("http://127.0.0.1:1")
     secrets = RuntimeSecrets(
@@ -201,6 +206,7 @@ def test_execution_failure_is_not_reported_as_secure() -> None:
     )
 
 
+@pytest.mark.slow
 def test_unexpected_server_status_is_execution_error() -> None:
     with serve(create_controlled_app(EvaluationMode.SECURE)) as origin:
         profile, run = run_check(origin)
@@ -209,6 +215,7 @@ def test_unexpected_server_status_is_execution_error() -> None:
     assert result.outcome is CheckOutcome.EXECUTION_ERROR
 
 
+@pytest.mark.slow
 def test_cancellation_produces_execution_error() -> None:
     with serve(create_controlled_app(EvaluationMode.SECURE)) as origin:
         profile = profile_for(origin)

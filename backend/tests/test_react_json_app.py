@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from threading import Thread
 from uuid import uuid4
 
+import pytest
 import uvicorn
 from authflowguard.authentication import execute_verified_login_flow
 from authflowguard.evaluation_targets.react_json_app import (
@@ -112,6 +113,7 @@ def test_react_json_secure_mode_answers_every_email_alike() -> None:
     assert rejected[0].json() == rejected[1].json()
 
 
+@pytest.mark.slow
 def test_automatic_flow_supports_two_step_json_and_bearer_sessions() -> None:
     with run_react_json_server() as origin:
         result = asyncio.run(

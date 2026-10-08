@@ -173,6 +173,7 @@ async def run_controller(
             await browser.close()
 
 
+@pytest.mark.slow
 def test_bedrock_decisions_drive_browser_actions_until_completion() -> None:
     client = FakeActionClient(login_actions())
     with run_controlled_server() as origin:
@@ -263,6 +264,7 @@ def test_model_observation_redacts_credentials_echoed_by_the_page() -> None:
     assert observation.credential_references == ["username"]
 
 
+@pytest.mark.slow
 def test_failed_action_is_retried_with_a_fresh_decision() -> None:
     invalid_action = BrowserAction(
         action_type=BrowserActionType.CLICK,
@@ -300,6 +302,7 @@ def test_failed_action_is_retried_with_a_fresh_decision() -> None:
     assert failure.redacted_details["failure_phase"] == "browser_execution"
 
 
+@pytest.mark.slow
 def test_three_failed_attempts_request_guidance_without_exposing_errors() -> None:
     client = FakeActionClient([RuntimeError("secret one-time value")] * 3)
     with run_controlled_server() as origin:
@@ -333,6 +336,7 @@ def test_three_failed_attempts_request_guidance_without_exposing_errors() -> Non
     )
 
 
+@pytest.mark.slow
 def test_decision_limit_stops_additional_model_calls() -> None:
     client = FakeActionClient(login_actions())
     with run_controlled_server() as origin:
@@ -352,6 +356,7 @@ def test_decision_limit_stops_additional_model_calls() -> None:
     assert client.choose_calls == 1
 
 
+@pytest.mark.slow
 def test_cost_limit_is_checked_before_calling_the_model() -> None:
     client = FakeActionClient(login_actions(), reserved_cost=0.3)
     with run_controlled_server() as origin:
@@ -371,6 +376,7 @@ def test_cost_limit_is_checked_before_calling_the_model() -> None:
     assert client.choose_calls == 0
 
 
+@pytest.mark.slow
 def test_active_time_limit_stops_a_slow_model_request() -> None:
     client = FakeActionClient(login_actions(), delay_seconds=1.2)
     with run_controlled_server() as origin:
@@ -393,6 +399,7 @@ def test_active_time_limit_stops_a_slow_model_request() -> None:
     )
 
 
+@pytest.mark.slow
 def test_cancellation_interrupts_model_wait_before_action() -> None:
     client = FakeActionClient(login_actions(), delay_seconds=2.0)
     cancelled = Event()

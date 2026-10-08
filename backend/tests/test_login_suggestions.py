@@ -445,6 +445,7 @@ def test_an_invalid_model_answer_is_reconciled_with_its_usage(
     assert record.total_input_tokens == 250
 
 
+@pytest.mark.slow
 def test_a_slow_model_times_out_without_blocking_the_observation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -691,6 +692,7 @@ def control_with(controls: list[dict[str, Any]], **attributes: Any) -> dict[str,
     return matches[0]
 
 
+@pytest.mark.slow
 def test_real_browser_juice_shop_like_page_gets_the_right_suggestions(
     tmp_path: Path,
 ) -> None:
@@ -729,6 +731,7 @@ def test_real_browser_juice_shop_like_page_gets_the_right_suggestions(
     assert subscribe["form_index"] == 0
 
 
+@pytest.mark.slow
 def test_real_browser_juice_shop_like_page_rejects_a_malicious_answer(
     tmp_path: Path,
 ) -> None:

@@ -32,6 +32,9 @@ where = ["backend"]
 addopts = "--basetemp=.pytest-tmp"
 testpaths = ["backend/tests"]
 pythonpath = ["backend"]
+markers = [
+    "slow: launches a browser, runs a whole scan or starts worker processes (deselect with -m \"not slow\")",
+]
 
 [tool.ruff]
 line-length = 88
